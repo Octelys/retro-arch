@@ -28,9 +28,15 @@
 #include <rthreads/rthreads.h>
 #include <compat/strl.h>
 #include <string/stdstring.h>
+#include <file/file_path.h>
+
+#include "../playlist.h"
 
 #include <string.h>
 #include <stdio.h>
+
+
+#define GAME_STATE_TAG "[game_state] "
 
 #ifdef HAVE_CHEEVOS
 #include "../deps/rcheevos/include/rc_client.h"
@@ -218,11 +224,11 @@ size_t game_state_to_json(char *buf, size_t buf_size)
       return 0;
    pos = (size_t)n;
 
-   json_append_field(buf, &pos, buf_size, "game_id",      snap.game_id);
-   json_append_field(buf, &pos, buf_size, "game_name",    snap.game_name);
-   json_append_field(buf, &pos, buf_size, "console_id",   snap.console_id);
-   json_append_field(buf, &pos, buf_size, "console_name", snap.console_name);
-   json_append_field(buf, &pos, buf_size, "cover_url",    snap.cover_url);
+   json_append_field(buf, &pos, buf_size, "game_id",        snap.game_id);
+   json_append_field(buf, &pos, buf_size, "game_name",      snap.game_name);
+   json_append_field(buf, &pos, buf_size, "console_id",     snap.console_id);
+   json_append_field(buf, &pos, buf_size, "console_name",   snap.console_name);
+   json_append_field(buf, &pos, buf_size, "cover_url", snap.cover_url);
 
    /* Close object */
    if (pos + 1 < buf_size)
@@ -241,17 +247,19 @@ size_t game_state_to_json(char *buf, size_t buf_size)
  * Sole entry-point for populating and broadcasting the WebSocket game
  * state.  Called from rcheevos_client_load_game_callback() once the
  * async RetroAchievements lookup has completed.  Builds a fresh
- * ra_game_state_t entirely from RA data:
+ * ra_game_state_t from RA data:
  *
  *   id         → game_id      (authoritative numeric RA game ID)
  *   title      → game_name    (RA-canonical title)
  *   console_id → console_name (human-readable via rc_console_name())
- *   badge_url  → cover_url    (game cover image URL)
+ *   playlist entry → cover_url (libretro thumbnails boxart URL from label + db_name)
  */
 void game_state_update_from_cheevos(const rc_client_game_t *game,
       const char *game_path)
 {
-   ra_game_state_t state;
+   ra_game_state_t               state;
+   const struct playlist_entry  *entry  = NULL;
+   const char                   *db_src = NULL;
 
    if (!game || game->id == 0)
       return;
@@ -273,9 +281,75 @@ void game_state_update_from_cheevos(const rc_client_game_t *game,
          strlcpy(state.console_name, con, sizeof(state.console_name));
    }
 
-   /* Game cover/badge URL from RetroAchievements */
-   if (!string_is_empty(game->badge_url))
-      strlcpy(state.cover_url, game->badge_url, sizeof(state.cover_url));
+   /* Look up the playlist entry for this ROM to get the label and
+    * db_name used by the libretro thumbnail server. */
+   if (!string_is_empty(game_path))
+   {
+      playlist_t *pl = playlist_get_cached();
+      fprintf(stderr, GAME_STATE_TAG "game_path: \"%s\"\n", game_path);
+      fprintf(stderr, GAME_STATE_TAG "cached playlist: %s\n", pl ? "found" : "NULL");
+      if (pl)
+      {
+         playlist_get_index_by_path(pl, game_path, &entry);
+         fprintf(stderr, GAME_STATE_TAG "playlist entry: %s\n", entry ? "found" : "not found");
+         if (entry)
+         {
+            fprintf(stderr, GAME_STATE_TAG "  entry->label:   \"%s\"\n",
+                  entry->label   ? entry->label   : "(null)");
+            fprintf(stderr, GAME_STATE_TAG "  entry->db_name: \"%s\"\n",
+                  entry->db_name ? entry->db_name : "(null)");
+         }
+      }
+   }
+   else
+      fprintf(stderr, GAME_STATE_TAG "game_path: (empty)\n");
+
+   /* System folder = db_name without ".lpl" extension.
+    * Falls back to the RA console name when no playlist entry exists. */
+   if (entry && !string_is_empty(entry->db_name))
+      db_src = entry->db_name;
+   else
+      db_src = state.console_name;
+
+   fprintf(stderr, GAME_STATE_TAG "db_src: \"%s\"\n", db_src ? db_src : "(null)");
+
+   /* Build the cover URL from the playlist label and db_name:
+    *   https://thumbnails.libretro.com/<db_name>/Named_Boxarts/<label>.png
+    * Characters not allowed in No-Intro filenames are replaced with '_',
+    * matching gfx_thumbnail_fill_content_img(). */
+   if (!string_is_empty(db_src))
+   {
+      static const char scrub_chars[] = {
+         '&', '*', '/', ':', '`', '"', '<', '>', '?', '\\', '|', '\0'
+      };
+      char db_name   [GAME_STATE_CONSOLE_NAME_LEN];
+      char name_label[GAME_STATE_GAME_NAME_LEN];
+      char *p;
+
+      /* Scrub the system folder name (strip .lpl extension) */
+      fill_pathname(db_name, db_src, "", sizeof(db_name));
+      while ((p = strpbrk(db_name, scrub_chars)))
+         *p = '_';
+
+      /* Playlist label, or fall back to ROM basename */
+      name_label[0] = '\0';
+      if (entry && !string_is_empty(entry->label))
+         strlcpy(name_label, entry->label, sizeof(name_label));
+      else if (!string_is_empty(game_path))
+         fill_pathname(name_label, path_basename(game_path), "", sizeof(name_label));
+
+      while ((p = strpbrk(name_label, scrub_chars)))
+         *p = '_';
+
+      fprintf(stderr, GAME_STATE_TAG "name_label: \"%s\"\n", name_label);
+
+      if (!string_is_empty(name_label))
+         snprintf(state.cover_url, sizeof(state.cover_url),
+               "https://thumbnails.libretro.com/%s/Named_Boxarts/%s.png",
+               db_name, name_label);
+
+      fprintf(stderr, GAME_STATE_TAG "cover_url: \"%s\"\n", state.cover_url);
+   }
 
    game_state_set(&state);
    ws_server_notify_game_changed();

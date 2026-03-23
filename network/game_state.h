@@ -57,15 +57,15 @@ extern "C" {
  *
  * Describes the game that is currently loaded in RetroArch.
  *
- *   game_id       – CRC-32 checksum of the ROM as a hex string (may be
- *                   empty if unknown).
- *   game_name     – Base filename of the ROM without extension.
+ *   game_id       – Numeric RetroAchievements game ID.
+ *   game_name     – RA-canonical title of the game.
  *   console_id    – Short system/platform identifier supplied by the
  *                   core info database (e.g. "snes", "megadrive").
  *   console_name  – Human-readable platform name (e.g.
  *                   "Super Nintendo Entertainment System").
- *   cover_url     – URL of the game cover/badge image from
- *                   RetroAchievements (may be empty if unavailable).
+ *   cover_url     – Libretro thumbnails boxart URL built from the
+ *                   playlist label and db_name:
+ *                   https://thumbnails.libretro.com/<db_name>/Named_Boxarts/<label>.png.
  */
 typedef struct
 {
