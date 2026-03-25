@@ -831,6 +831,12 @@ bool rcheevos_unload(void)
             rcheevos_locals.menuitem_count      = 0;
       }
 #endif
+
+#ifdef HAVE_WEBSOCKET_SERVER
+      /* Force connected clients to refresh after unload so any queued
+       * pre-unload broadcast is corrected with an empty achievements list. */
+      ws_server_notify_achievements_changed();
+#endif
    }
 
 #ifdef HAVE_THREADS

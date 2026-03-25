@@ -206,6 +206,9 @@ size_t game_state_user_to_json(char *buf, size_t buf_size);
  * "status" is "unlocked" when the achievement has been earned (softcore
  * or hardcore), "locked" otherwise.
  * "badge_url" is the unlocked badge URL when available, otherwise omitted.
+ * When no achievements client is available or no game is loaded, the
+ * function returns an empty achievements list
+ * ({"type":"achievements","items":[]}) so callers can clear stale state.
  *
  * Returns the number of bytes written (excluding NUL), or 0 on error.
  */

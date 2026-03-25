@@ -3676,12 +3676,6 @@ bool command_event(enum event_command cmd, void *data)
 
             runloop_st->flags              &= ~RUNLOOP_FLAG_CORE_RUNNING;
 
-#ifdef HAVE_WEBSOCKET_SERVER
-            /* Notify WebSocket clients that no game is running. */
-            game_state_clear();
-            ws_server_notify_game_changed();
-#endif
-
             /* The platform that uses ram_state_save calls it when the content
              * ends and writes it to a file */
             ram_state_to_file();
@@ -4295,7 +4289,7 @@ bool command_event(enum event_command cmd, void *data)
             video_driver_state_t
                *video_st                         = video_state_get_ptr();
             rarch_system_info_t *sys_info        = &runloop_st->system;
-            
+
             /* Restore unpaused state */
             runloop_st->paused_hotkey = false;
             command_event(CMD_EVENT_UNPAUSE, NULL);
@@ -4327,6 +4321,13 @@ bool command_event(enum event_command cmd, void *data)
             hwr = VIDEO_DRIVER_GET_HW_CONTEXT_INTERNAL(video_st);
 #ifdef HAVE_CHEEVOS
             rcheevos_unload();
+#endif
+#ifdef HAVE_WEBSOCKET_SERVER
+            /* Notify WebSocket clients only after achievements have been
+             * unloaded so the follow-up achievements payload cannot contain
+             * stale data from the previous game. */
+            game_state_clear();
+            ws_server_notify_game_changed();
 #endif
             runloop_event_deinit_core();
 
@@ -5955,6 +5956,10 @@ void main_exit(void *args)
       menu_st->flags &= ~MENU_ST_FLAG_DATA_OWN;
 #endif
 #ifdef HAVE_WEBSOCKET_SERVER
+   /* Notify clients before tearing down the server so they receive
+    * a clean "no_game" event instead of just a dropped connection. */
+   game_state_clear();
+   ws_server_notify_game_changed();
    ws_server_destroy();
    game_state_deinit();
 #endif

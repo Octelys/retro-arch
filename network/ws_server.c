@@ -171,16 +171,15 @@ static void ws_write_achievements(struct lws *wsi)
    size_t         len;
 
    buf = (unsigned char *)malloc(LWS_PRE + WS_ACH_MSG_MAX_BYTES);
+
    if (!buf)
       return;
 
-   {
-      const rcheevos_locals_t *locals = get_rcheevos_locals();
-      len = game_state_achievements_to_json(
-               locals ? locals->client : NULL,
-               (char *)(buf + LWS_PRE),
-               WS_ACH_MSG_MAX_BYTES);
-   }
+   const rcheevos_locals_t *locals = get_rcheevos_locals();
+   len = game_state_achievements_to_json(
+            locals ? locals->client : NULL,
+            (char *)(buf + LWS_PRE),
+            WS_ACH_MSG_MAX_BYTES);
 
    if (len > 0)
       lws_write(wsi, buf + LWS_PRE, len, LWS_WRITE_TEXT);

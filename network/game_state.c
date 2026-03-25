@@ -378,8 +378,17 @@ size_t game_state_achievements_to_json(const rc_client_t *client,
    uint32_t  bi, ai;
    bool      first          = true;
 
-   if (!client || !buf || buf_size < 2)
+   if (!buf || buf_size < 2)
       return 0;
+
+   /* When there is no achievements client or no game is loaded, return an
+    * empty achievements list so callers can clear any stale UI state instead
+    * of reusing the previous game. */
+   if (!client || !rc_client_is_game_loaded(client))
+   {
+      n = snprintf(buf, buf_size, "{\"type\":\"achievements\",\"items\":[]}");
+      return (n > 0) ? (size_t)n : 0;
+   }
 
    /* Determine the core subset id deterministically.
     * rc_client_create_subset_list always places the core (base) set at
@@ -423,7 +432,7 @@ size_t game_state_achievements_to_json(const rc_client_t *client,
           * When there is only one subset, rcheevos sets subset_id=0 for all
           * buckets regardless of the real subset id, so accept both 0 and
           * the actual base subset id. */
-         if (bucket->subset_id != base_subset_id)
+         if (bucket->subset_id != 0 && bucket->subset_id != base_subset_id)
             continue;
 
          for (ai = 0; ai < bucket->num_achievements; ai++)
