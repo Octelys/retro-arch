@@ -48,6 +48,7 @@
 #include "menu_cbs.h"
 #include "../driver.h"
 #include "../list_special.h"
+#include "../msg_hash_lbl_str.h"
 #include "../paths.h"
 #include "../tasks/task_content.h"
 #include "../tasks/task_powerstate.h"
@@ -354,12 +355,12 @@ struct menu_state *menu_state_get_ptr(void)
 static bool menu_should_pop_stack(const char *label)
 {
    /* > Info box */
-   if (string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_INFO_SCREEN)))
+   if (string_is_equal(label, MENU_ENUM_LABEL_INFO_SCREEN_STR))
       return true;
    /* > Help box */
    if (string_starts_with_size(label, "help", STRLEN_CONST("help")))
       if (
-               string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_HELP))
+               string_is_equal(label, MENU_ENUM_LABEL_HELP_STR)
             || string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_CHEEVOS_DESCRIPTION)))
          return true;
    if (
@@ -1062,7 +1063,7 @@ size_t menu_entries_get_title(char *s, size_t len)
       const char *label       = (list->size) ? list->list[list->size - 1].label : NULL;
 
       /* Show playlist entry instead of "Quick Menu" */
-      if (string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_DEFERRED_RPL_ENTRY_ACTIONS)))
+      if (string_is_equal(label, MENU_ENUM_LABEL_DEFERRED_RPL_ENTRY_ACTIONS_STR))
       {
          playlist_t *playlist  = playlist_get_cached();
          if (playlist)
@@ -1087,7 +1088,7 @@ size_t menu_entries_get_title(char *s, size_t len)
          const char *path      = NULL;
          unsigned menu_type    = 0;
 
-         if (     string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_CONTENT_SETTINGS))
+         if (     string_is_equal(label, MENU_ENUM_LABEL_CONTENT_SETTINGS_STR)
                && !path_is_empty(RARCH_PATH_CONTENT))
          {
             char content_label[NAME_MAX_LENGTH];
@@ -1475,8 +1476,7 @@ static int menu_input_key_bind_set_mode_common(struct menu_state *menu_st,
             info.type                = MENU_SETTINGS_CUSTOM_BIND_KEYBOARD;
             info.directory_ptr       = selection;
             info.enum_idx            = MENU_ENUM_LABEL_CUSTOM_BIND;
-            info.label               = strdup(
-                  msg_hash_to_str(MENU_ENUM_LABEL_CUSTOM_BIND));
+            info.label               = strdup(MENU_ENUM_LABEL_CUSTOM_BIND_STR);
             if (menu_displaylist_ctl(DISPLAYLIST_INFO, &info, settings))
                menu_displaylist_process(&info);
             menu_displaylist_info_free(&info);
@@ -1503,8 +1503,7 @@ static int menu_input_key_bind_set_mode_common(struct menu_state *menu_st,
             info.type                = MENU_SETTINGS_CUSTOM_BIND_KEYBOARD;
             info.directory_ptr       = selection;
             info.enum_idx            = MENU_ENUM_LABEL_CUSTOM_BIND_ALL;
-            info.label               = strdup(
-                  msg_hash_to_str(MENU_ENUM_LABEL_CUSTOM_BIND_ALL));
+            info.label               = strdup(MENU_ENUM_LABEL_CUSTOM_BIND_ALL_STR);
             if (menu_displaylist_ctl(DISPLAYLIST_INFO, &info, settings))
                menu_displaylist_process(&info);
             menu_displaylist_info_free(&info);
@@ -2282,17 +2281,17 @@ static bool menu_driver_displaylist_push_internal(
       menu_displaylist_info_t *info,
       settings_t *settings)
 {
-   if (string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_HISTORY_TAB)))
+   if (string_is_equal(label, MENU_ENUM_LABEL_HISTORY_TAB_STR))
       return menu_displaylist_ctl(DISPLAYLIST_HISTORY, info, settings);
-   else if (string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_FAVORITES_TAB)))
+   else if (string_is_equal(label, MENU_ENUM_LABEL_FAVORITES_TAB_STR))
       return menu_displaylist_ctl(DISPLAYLIST_FAVORITES, info, settings);
-   else if (string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_SETTINGS_TAB)))
+   else if (string_is_equal(label, MENU_ENUM_LABEL_SETTINGS_TAB_STR))
       return menu_displaylist_ctl(DISPLAYLIST_SETTINGS_ALL, info, settings);
 #ifdef HAVE_CHEATS
    else if (string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_CHEAT_SEARCH_SETTINGS)))
       return menu_displaylist_ctl(DISPLAYLIST_CHEAT_SEARCH_SETTINGS_LIST, info, settings);
 #endif
-   else if (string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_MUSIC_TAB)))
+   else if (string_is_equal(label, MENU_ENUM_LABEL_MUSIC_TAB_STR))
    {
       filebrowser_clear_type();
       info->type = 42;
@@ -2303,13 +2302,12 @@ static bool menu_driver_displaylist_push_internal(
          free(info->label);
 
       info->exts  = strldup("lpl", sizeof("lpl"));
-      info->label = strdup(
-            msg_hash_to_str(MENU_ENUM_LABEL_PLAYLISTS_TAB));
+      info->label = strdup(MENU_ENUM_LABEL_PLAYLISTS_TAB_STR);
 
       menu_entries_clear(info->list);
       return menu_displaylist_ctl(DISPLAYLIST_MUSIC_HISTORY, info, settings);
    }
-   else if (string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_VIDEO_TAB)))
+   else if (string_is_equal(label, MENU_ENUM_LABEL_VIDEO_TAB_STR))
    {
       filebrowser_clear_type();
       info->type = 42;
@@ -2320,13 +2318,12 @@ static bool menu_driver_displaylist_push_internal(
          free(info->label);
 
       info->exts  = strldup("lpl", sizeof("lpl"));
-      info->label = strdup(
-            msg_hash_to_str(MENU_ENUM_LABEL_PLAYLISTS_TAB));
+      info->label = strdup(MENU_ENUM_LABEL_PLAYLISTS_TAB_STR);
 
       menu_entries_clear(info->list);
       return menu_displaylist_ctl(DISPLAYLIST_VIDEO_HISTORY, info, settings);
    }
-   else if (string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_IMAGES_TAB)))
+   else if (string_is_equal(label, MENU_ENUM_LABEL_IMAGES_TAB_STR))
    {
       filebrowser_clear_type();
       info->type = 42;
@@ -2337,13 +2334,12 @@ static bool menu_driver_displaylist_push_internal(
          free(info->label);
 
       info->exts  = strldup("lpl", sizeof("lpl"));
-      info->label = strdup(
-            msg_hash_to_str(MENU_ENUM_LABEL_PLAYLISTS_TAB));
+      info->label = strdup(MENU_ENUM_LABEL_PLAYLISTS_TAB_STR);
 
       menu_entries_clear(info->list);
       return menu_displaylist_ctl(DISPLAYLIST_IMAGES_HISTORY, info, settings);
    }
-   else if (string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_PLAYLISTS_TAB)))
+   else if (string_is_equal(label, MENU_ENUM_LABEL_PLAYLISTS_TAB_STR))
    {
       const char *dir_playlist    = settings->paths.directory_playlist;
 
@@ -2356,8 +2352,7 @@ static bool menu_driver_displaylist_push_internal(
          free(info->label);
 
       info->exts  = strldup("lpl", sizeof("lpl"));
-      info->label = strdup(
-            msg_hash_to_str(MENU_ENUM_LABEL_PLAYLISTS_TAB));
+      info->label = strdup(MENU_ENUM_LABEL_PLAYLISTS_TAB_STR);
 
       if (string_is_empty(dir_playlist))
       {
@@ -2376,17 +2371,17 @@ static bool menu_driver_displaylist_push_internal(
       return menu_displaylist_ctl(
                DISPLAYLIST_DATABASE_PLAYLISTS, info, settings);
    }
-   else if (string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_ADD_TAB)))
+   else if (string_is_equal(label, MENU_ENUM_LABEL_ADD_TAB_STR))
       return menu_displaylist_ctl(DISPLAYLIST_SCAN_DIRECTORY_LIST, info, settings);
 #if defined(HAVE_LIBRETRODB)
-   else if (string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_EXPLORE_TAB)))
+   else if (string_is_equal(label, MENU_ENUM_LABEL_EXPLORE_TAB_STR))
       return menu_displaylist_ctl(DISPLAYLIST_EXPLORE, info, settings);
 #endif
-   else if (string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_CONTENTLESS_CORES_TAB)))
+   else if (string_is_equal(label, MENU_ENUM_LABEL_CONTENTLESS_CORES_TAB_STR))
       return menu_displaylist_ctl(DISPLAYLIST_CONTENTLESS_CORES, info, settings);
-   else if (string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_NETPLAY_TAB)))
+   else if (string_is_equal(label, MENU_ENUM_LABEL_NETPLAY_TAB_STR))
       return menu_displaylist_ctl(DISPLAYLIST_NETPLAY_ROOM_LIST, info, settings);
-   else if (string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_HORIZONTAL_MENU)))
+   else if (string_is_equal(label, MENU_ENUM_LABEL_HORIZONTAL_MENU_STR))
       return menu_displaylist_ctl(DISPLAYLIST_HORIZONTAL, info, settings);
    return false;
 }
@@ -3326,23 +3321,20 @@ bool menu_shader_manager_save_auto_preset(
 
 static enum action_iterate_type action_iterate_type(const char *label)
 {
-   if (string_is_equal(label, "info_screen"))
+   if (memcmp(label, "info_screen", sizeof("info_screen")) == 0)
       return ITERATE_TYPE_INFO;
    if (string_starts_with_size(label, "help", STRLEN_CONST("help")))
-      if (
-               string_is_equal(label, "help")
-         )
+      if (memcmp(label, "help", sizeof("help")) == 0)
          return ITERATE_TYPE_HELP;
-   if (string_is_equal(label, "cheevos_description"))
+   if (memcmp(label, "cheevos_description", sizeof("cheevos_description")) == 0)
          return ITERATE_TYPE_HELP;
    if (string_starts_with_size(label, "custom_bind", STRLEN_CONST("custom_bind")))
       if (
-               string_is_equal(label, "custom_bind")
-            || string_is_equal(label, "custom_bind_all")
-            || string_is_equal(label, "custom_bind_defaults")
+               memcmp(label, "custom_bind", sizeof("custom_bind")) == 0
+            || memcmp(label, "custom_bind_all", sizeof("custom_bind_all")) == 0
+            || memcmp(label, "custom_bind_defaults", sizeof("custom_bind_defaults")) == 0
          )
          return ITERATE_TYPE_BIND;
-
    return ITERATE_TYPE_DEFAULT;
 }
 
@@ -3362,29 +3354,29 @@ bool menu_driver_search_filter_enabled(const char *label, unsigned type)
                     || (type == FILE_TYPE_PLAYLIST_COLLECTION);
 
    if (!filter_enabled && !string_is_empty(label))
-      filter_enabled =    string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_LOAD_CONTENT_HISTORY))
-                       || string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_DEFERRED_FAVORITES_LIST))
-                       || string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_DEFERRED_IMAGES_LIST))
-                       || string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_DEFERRED_MUSIC_LIST))
-                       || string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_DEFERRED_VIDEO_LIST))
+      filter_enabled =    string_is_equal(label, MENU_ENUM_LABEL_LOAD_CONTENT_HISTORY_STR)
+                       || string_is_equal(label, MENU_ENUM_LABEL_DEFERRED_FAVORITES_LIST_STR)
+                       || string_is_equal(label, MENU_ENUM_LABEL_DEFERRED_IMAGES_LIST_STR)
+                       || string_is_equal(label, MENU_ENUM_LABEL_DEFERRED_MUSIC_LIST_STR)
+                       || string_is_equal(label, MENU_ENUM_LABEL_DEFERRED_VIDEO_LIST_STR)
                        /* > Core updater */
-                       || string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_DEFERRED_CORE_UPDATER_LIST))
+                       || string_is_equal(label, MENU_ENUM_LABEL_DEFERRED_CORE_UPDATER_LIST_STR)
                        /* > File browser (Load Content) */
-                       || string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_FAVORITES))
+                       || string_is_equal(label, MENU_ENUM_LABEL_FAVORITES_STR)
                        /* > Shader presets/passes */
-                       || string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_VIDEO_SHADER_PRESET))
-                       || string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_VIDEO_SHADER_PRESET_PREPEND))
-                       || string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_VIDEO_SHADER_PRESET_APPEND))
-                       || string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_VIDEO_SHADER_PASS))
+                       || string_is_equal(label, MENU_ENUM_LABEL_VIDEO_SHADER_PRESET_STR)
+                       || string_is_equal(label, MENU_ENUM_LABEL_VIDEO_SHADER_PRESET_PREPEND_STR)
+                       || string_is_equal(label, MENU_ENUM_LABEL_VIDEO_SHADER_PRESET_APPEND_STR)
+                       || string_is_equal(label, MENU_ENUM_LABEL_VIDEO_SHADER_PASS_STR)
                        /* > Cheat files */
-                       || string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_CHEAT_FILE_LOAD))
-                       || string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_CHEAT_FILE_LOAD_APPEND))
+                       || string_is_equal(label, MENU_ENUM_LABEL_CHEAT_FILE_LOAD_STR)
+                       || string_is_equal(label, MENU_ENUM_LABEL_CHEAT_FILE_LOAD_APPEND_STR)
                        /* > Cheats */
-                       || string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_CORE_CHEAT_OPTIONS))
+                       || string_is_equal(label, MENU_ENUM_LABEL_CORE_CHEAT_OPTIONS_STR)
                        /* > Overlays */
-                       || string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_INPUT_OVERLAY))
+                       || string_is_equal(label, MENU_ENUM_LABEL_INPUT_OVERLAY_STR)
                        /* > Manage Cores */
-                       || string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_DEFERRED_CORE_MANAGER_LIST));
+                       || string_is_equal(label, MENU_ENUM_LABEL_DEFERRED_CORE_MANAGER_LIST_STR);
 
    return filter_enabled;
 }
@@ -3825,19 +3817,19 @@ static enum menu_driver_id_type menu_driver_set_id(
    if (!string_is_empty(driver_name))
    {
 #ifdef HAVE_RGUI
-      if (string_is_equal(driver_name, "rgui"))
+      if (memcmp(driver_name, "rgui", 5) == 0)
          return MENU_DRIVER_ID_RGUI;
 #endif
 #ifdef HAVE_OZONE
-      if (string_is_equal(driver_name, "ozone"))
+      if (memcmp(driver_name, "ozone", 6) == 0)
          return MENU_DRIVER_ID_OZONE;
 #endif
 #ifdef HAVE_MATERIALUI
-      if (string_is_equal(driver_name, "glui"))
+      if (memcmp(driver_name, "glui", 5) == 0)
          return MENU_DRIVER_ID_GLUI;
 #endif
 #ifdef HAVE_XMB
-      if (string_is_equal(driver_name, "xmb"))
+      if (memcmp(driver_name, "xmb", 4) == 0)
          return MENU_DRIVER_ID_XMB;
 #endif
    }
@@ -4474,8 +4466,10 @@ static const char * msvc_vercode_to_str(const unsigned vercode)
             return " msvc2017";
          else if (vercode >= 1920 && vercode < 1930)
             return " msvc2019";
-         else if (vercode >= 1930)
+         else if (vercode >= 1930 && vercode < 1950)
             return " msvc2022";
+         else if (vercode >= 1950)
+            return " msvc2026";
          break;
    }
 
@@ -7483,18 +7477,14 @@ static int generic_menu_iterate(
             /* Have to defer it so we let settings refresh. */
             if (menu_st->dialog_st.pending_push)
             {
-               const char *label;
                menu_displaylist_info_t info;
-
                menu_displaylist_info_init(&info);
 
                info.list                 = menu_list ? MENU_LIST_GET(menu_list, (unsigned)0) : NULL;
                info.enum_idx             = MENU_ENUM_LABEL_HELP;
 
                /* Set the label string, if it exists. */
-               label                     = msg_hash_to_str(MENU_ENUM_LABEL_HELP);
-               if (label)
-                  info.label             = strdup(label);
+               info.label             = strdup(MENU_ENUM_LABEL_HELP_STR);
 
                menu_displaylist_ctl(DISPLAYLIST_HELP, &info, settings);
             }
@@ -7531,7 +7521,7 @@ static int generic_menu_iterate(
          bool        audio_enable_menu = settings->bools.audio_enable_menu;
          bool audio_enable_menu_notice = settings->bools.audio_enable_menu_notice;
          if (audio_enable_menu && audio_enable_menu_notice &&
-               string_is_equal(label, msg_hash_to_str(MENU_ENUM_LABEL_INFO_SCREEN)))
+               string_is_equal(label, MENU_ENUM_LABEL_INFO_SCREEN_STR))
             audio_driver_mixer_play_menu_sound(AUDIO_MIXER_SYSTEM_SLOT_NOTICE_BACK);
       }
 #endif
@@ -7893,7 +7883,7 @@ int generic_menu_entry_action(
             break;
          case MENU_ACTION_START:
             /* if equal to '..' we break, else we fall-through */
-            if (string_is_equal(current_value, "..."))
+            if (memcmp(current_value, "...", 3) == 0)
                break;
             /* fall-through */
          case MENU_ACTION_ACCESSIBILITY_SPEAK_TITLE_LABEL:
@@ -7927,7 +7917,7 @@ int generic_menu_entry_action(
                menu_st,
                speak_string + _len,
                sizeof(speak_string) - _len);
-         if (!string_is_equal(current_value, "..."))
+         if (memcmp(current_value, "...", 4) != 0)
          {
             speak_string[  _len] = ' ';
             speak_string[++_len] = '\0';
@@ -7942,7 +7932,7 @@ int generic_menu_entry_action(
                menu_st,
                speak_string,
                sizeof(speak_string));
-         if (!string_is_equal(current_value, "..."))
+         if (memcmp(current_value, "...", 4) != 0)
          {
             speak_string[  _len] = ' ';
             speak_string[++_len] = '\0';
@@ -7964,7 +7954,7 @@ int generic_menu_entry_action(
        || (menu_st->flags & MENU_ST_FLAG_PENDING_ENV_SHUTDOWN_FLUSH))
    {
       const char *deferred_path = menu ? menu->deferred_path : NULL;
-      const char *flush_target  = msg_hash_to_str(MENU_ENUM_LABEL_MAIN_MENU);
+      const char *flush_target  = MENU_ENUM_LABEL_MAIN_MENU_STR;
       size_t stack_offset       = 1;
       unsigned i                = 0;
       bool reset_navigation     = true;
@@ -7981,23 +7971,23 @@ int generic_menu_entry_action(
 
          /* If core was launched via a playlist or Explore, flush
           * to playlist entry menu */
-         if (     (  string_is_equal(parent_label, msg_hash_to_str(MENU_ENUM_LABEL_DEFERRED_RPL_ENTRY_ACTIONS))
-                  || string_is_equal(parent_label, msg_hash_to_str(MENU_ENUM_LABEL_EXPLORE_TAB)))
+         if (     (  string_is_equal(parent_label, MENU_ENUM_LABEL_DEFERRED_RPL_ENTRY_ACTIONS_STR)
+                  || string_is_equal(parent_label, MENU_ENUM_LABEL_EXPLORE_TAB_STR))
                && !string_is_empty(deferred_path)
             )
          {
-            if (string_is_equal(parent_label, msg_hash_to_str(MENU_ENUM_LABEL_EXPLORE_TAB)))
-               flush_target = msg_hash_to_str(MENU_ENUM_LABEL_EXPLORE_TAB);
+            if (string_is_equal(parent_label, MENU_ENUM_LABEL_EXPLORE_TAB_STR))
+               flush_target = MENU_ENUM_LABEL_EXPLORE_TAB_STR;
             else
-               flush_target = msg_hash_to_str(MENU_ENUM_LABEL_DEFERRED_RPL_ENTRY_ACTIONS);
+               flush_target = MENU_ENUM_LABEL_DEFERRED_RPL_ENTRY_ACTIONS_STR;
             break;
          }
          /* If core was launched via 'Contentless Cores' menu,
           * flush to 'Contentless Cores' menu */
          else if (   string_is_equal(parent_label,
-                        msg_hash_to_str(MENU_ENUM_LABEL_CONTENTLESS_CORES_TAB))
+                        MENU_ENUM_LABEL_CONTENTLESS_CORES_TAB_STR)
                   || string_is_equal(parent_label,
-                        msg_hash_to_str(MENU_ENUM_LABEL_DEFERRED_CONTENTLESS_CORES_LIST)))
+                        MENU_ENUM_LABEL_DEFERRED_CONTENTLESS_CORES_LIST_STR))
          {
             flush_target     = parent_label;
             reset_navigation = false;
@@ -8239,9 +8229,9 @@ size_t menu_update_fullscreen_thumbnail_label(
    /* > State slot label */
    else if (   is_quick_menu
             && (
-               string_is_equal(selected_entry.label, msg_hash_to_str(MENU_ENUM_LABEL_STATE_SLOT))
-            || string_is_equal(selected_entry.label, msg_hash_to_str(MENU_ENUM_LABEL_LOAD_STATE))
-            || string_is_equal(selected_entry.label, msg_hash_to_str(MENU_ENUM_LABEL_SAVE_STATE))
+               string_is_equal(selected_entry.label, MENU_ENUM_LABEL_STATE_SLOT_STR)
+            || string_is_equal(selected_entry.label, MENU_ENUM_LABEL_LOAD_STATE_STR)
+            || string_is_equal(selected_entry.label, MENU_ENUM_LABEL_SAVE_STATE_STR)
                )
            )
    {
@@ -8282,8 +8272,8 @@ bool menu_is_running_quick_menu(void)
    entry.flags |= MENU_ENTRY_FLAG_LABEL_ENABLED
                 | MENU_ENTRY_FLAG_RICH_LABEL_ENABLED;
    menu_entry_get(&entry, 0, 0, NULL, true);
-   return    string_is_equal(entry.label, "resume_content")
-          || string_is_equal(entry.label, "state_slot");
+   return    memcmp(entry.label, "resume_content", sizeof("resume_content")) == 0
+          || memcmp(entry.label, "state_slot", sizeof("state_slot")) == 0;
 }
 
 #ifdef HAVE_RUNAHEAD

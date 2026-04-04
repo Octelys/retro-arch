@@ -100,13 +100,13 @@ bool fill_pathname_application_data(char *s, size_t len)
 #endif
 
 #elif defined(OSX)
+   CFStringRef parent_path;
+   CFURLRef bundle_url, parent_url;
    CFBundleRef bundle = CFBundleGetMainBundle();
    if (!bundle)
       return false;
 
    /* get the directory containing the app */
-   CFStringRef parent_path;
-   CFURLRef bundle_url, parent_url;
    bundle_url  = CFBundleCopyBundleURL(bundle);
    parent_url  = CFURLCreateCopyDeletingLastPathComponent(NULL, bundle_url);
    parent_path = CFURLCopyFileSystemPath(parent_url, kCFURLPOSIXPathStyle);
@@ -251,7 +251,7 @@ size_t fill_pathname_application_special(char *s,
             const char *dir_assets = settings->paths.directory_assets;
 
 #ifdef HAVE_XMB
-            if (string_is_equal(menu_ident, "xmb"))
+            if (memcmp(menu_ident, "xmb", 3) == 0)
             {
                char tmp_dir[DIR_MAX_LENGTH];
                char tmp_path[PATH_MAX_LENGTH];
@@ -262,8 +262,8 @@ size_t fill_pathname_application_special(char *s,
             else
 #endif
 #if defined(HAVE_MATERIALUI) || defined(HAVE_OZONE)
-            if (     string_is_equal(menu_ident, "glui")
-                  || string_is_equal(menu_ident, "ozone"))
+            if (     memcmp(menu_ident, "glui", STRLEN_CONST("glui")) == 0
+                  || memcmp(menu_ident, "ozone", STRLEN_CONST("ozone")) == 0)
             {
                char tmp_dir[DIR_MAX_LENGTH];
                fill_pathname_join_special(tmp_dir, dir_assets, menu_ident, sizeof(tmp_dir));
@@ -288,7 +288,7 @@ size_t fill_pathname_application_special(char *s,
 #endif
 
 #ifdef HAVE_XMB
-            if (string_is_equal(menu_ident, "xmb"))
+            if (memcmp(menu_ident, "xmb", 4) == 0)
             {
                char tmp_dir[DIR_MAX_LENGTH];
                char tmp_path[PATH_MAX_LENGTH];
@@ -300,8 +300,8 @@ size_t fill_pathname_application_special(char *s,
             else
 #endif
 #if defined(HAVE_OZONE) || defined(HAVE_MATERIALUI)
-		    if (    string_is_equal(menu_ident, "ozone")
-               || string_is_equal(menu_ident, "glui"))
+          if (    memcmp(menu_ident, "glui", STRLEN_CONST("glui")) == 0
+               || memcmp(menu_ident, "ozone", STRLEN_CONST("ozone")) == 0)
             {
                char tmp_dir[DIR_MAX_LENGTH];
                char tmp_path[PATH_MAX_LENGTH];

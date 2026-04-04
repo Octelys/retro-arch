@@ -113,6 +113,7 @@
 #include "camera/camera_driver.h"
 #include "location_driver.h"
 #include "record/record_driver.h"
+#include "msg_hash_lbl_str.h"
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -726,15 +727,16 @@ static bool dynamic_verify_hw_context(
 {
    if (!driver_switch_enable)
    {
+      size_t len = strlen(video_ident);
       switch (type)
       {
          case RETRO_HW_CONTEXT_VULKAN:
-            if (!string_is_equal(video_ident, "vulkan"))
+            if (!(len == 6 && memcmp(video_ident, "vulkan", 6) == 0))
                return false;
             break;
 #if defined(HAVE_OPENGL_CORE)
          case RETRO_HW_CONTEXT_OPENGL_CORE:
-            if (!string_is_equal(video_ident, "glcore"))
+            if (!(len == 6 && memcmp(video_ident, "glcore", 6) == 0))
                return false;
             break;
 #else
@@ -744,27 +746,26 @@ static bool dynamic_verify_hw_context(
          case RETRO_HW_CONTEXT_OPENGLES3:
          case RETRO_HW_CONTEXT_OPENGLES_VERSION:
          case RETRO_HW_CONTEXT_OPENGL:
-            if (     !string_is_equal(video_ident, "gl")
-                  && !string_is_equal(video_ident, "glcore"))
+            if (  !(len == 2 && memcmp(video_ident, "gl", 2) == 0)
+                && !(len == 6 && memcmp(video_ident, "glcore", 6) == 0))
                return false;
             break;
          case RETRO_HW_CONTEXT_D3D10:
-            if (!string_is_equal(video_ident, "d3d10"))
+            if (!(len == 5 && memcmp(video_ident, "d3d10", 5) == 0))
                return false;
             break;
          case RETRO_HW_CONTEXT_D3D11:
-            if (!string_is_equal(video_ident, "d3d11"))
+            if (!(len == 5 && memcmp(video_ident, "d3d11", 5) == 0))
                return false;
             break;
          case RETRO_HW_CONTEXT_D3D12:
-            if (!string_is_equal(video_ident, "d3d12"))
+            if (!(len == 5 && memcmp(video_ident, "d3d12", 5) == 0))
                return false;
             break;
          default:
             break;
       }
    }
-
    return true;
 }
 
@@ -2209,52 +2210,49 @@ bool runloop_environment_cb(unsigned cmd, void *data)
          break;
 
       case RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER:
-      {
-         unsigned *cb = (unsigned*)data;
-         settings_t *settings          = config_get_ptr();
-         const char *video_driver_name = settings->arrays.video_driver;
-         bool driver_switch_enable     = settings->bools.driver_switch_enable;
-
-         RARCH_LOG("[Environ] GET_PREFERRED_HW_RENDER, video driver: \"%s\"...\n", video_driver_name);
-
-         if (string_is_equal(video_driver_name, "glcore"))
          {
-             *cb = RETRO_HW_CONTEXT_OPENGL_CORE;
-             RARCH_LOG("[Environ] GET_PREFERRED_HW_RENDER: RETRO_HW_CONTEXT_OPENGL_CORE.\n");
+            unsigned *cb = (unsigned*)data;
+            settings_t *settings          = config_get_ptr();
+            const char *video_driver_name = settings->arrays.video_driver;
+            bool driver_switch_enable     = settings->bools.driver_switch_enable;
+            RARCH_LOG("[Environ] GET_PREFERRED_HW_RENDER, video driver: \"%s\"...\n", video_driver_name);
+            if (memcmp(video_driver_name, "glcore", sizeof("glcore")) == 0)
+            {
+               *cb = RETRO_HW_CONTEXT_OPENGL_CORE;
+               RARCH_LOG("[Environ] GET_PREFERRED_HW_RENDER: RETRO_HW_CONTEXT_OPENGL_CORE.\n");
+            }
+            else if (memcmp(video_driver_name, "gl", sizeof("gl")) == 0)
+            {
+               *cb = RETRO_HW_CONTEXT_OPENGL;
+               RARCH_LOG("[Environ] GET_PREFERRED_HW_RENDER: RETRO_HW_CONTEXT_OPENGL.\n");
+            }
+            else if (memcmp(video_driver_name, "vulkan", sizeof("vulkan")) == 0)
+            {
+               *cb = RETRO_HW_CONTEXT_VULKAN;
+               RARCH_LOG("[Environ] GET_PREFERRED_HW_RENDER: RETRO_HW_CONTEXT_VULKAN.\n");
+            }
+            else if (memcmp(video_driver_name, "d3d11", sizeof("d3d11")) == 0)
+            {
+               *cb = RETRO_HW_CONTEXT_D3D11;
+               RARCH_LOG("[Environ] GET_PREFERRED_HW_RENDER: RETRO_HW_CONTEXT_D3D11.\n");
+            }
+            else if (memcmp(video_driver_name, "d3d12", sizeof("d3d12")) == 0)
+            {
+               *cb = RETRO_HW_CONTEXT_D3D12;
+               RARCH_LOG("[Environ] GET_PREFERRED_HW_RENDER: RETRO_HW_CONTEXT_D3D12.\n");
+            }
+            else
+            {
+               *cb = RETRO_HW_CONTEXT_NONE;
+               RARCH_LOG("[Environ] GET_PREFERRED_HW_RENDER: RETRO_HW_CONTEXT_NONE.\n");
+            }
+            if (!driver_switch_enable)
+            {
+               RARCH_LOG("[Environ] Driver switching disabled, GET_PREFERRED_HW_RENDER will be ignored.\n");
+               return false;
+            }
+            break;
          }
-         else if (string_is_equal(video_driver_name, "gl"))
-         {
-             *cb = RETRO_HW_CONTEXT_OPENGL;
-             RARCH_LOG("[Environ] GET_PREFERRED_HW_RENDER: RETRO_HW_CONTEXT_OPENGL.\n");
-         }
-         else if (string_is_equal(video_driver_name, "vulkan"))
-         {
-             *cb = RETRO_HW_CONTEXT_VULKAN;
-             RARCH_LOG("[Environ] GET_PREFERRED_HW_RENDER: RETRO_HW_CONTEXT_VULKAN.\n");
-         }
-         else if (string_is_equal(video_driver_name, "d3d11"))
-         {
-             *cb = RETRO_HW_CONTEXT_D3D11;
-             RARCH_LOG("[Environ] GET_PREFERRED_HW_RENDER: RETRO_HW_CONTEXT_D3D11.\n");
-         }
-         else if (string_is_equal(video_driver_name, "d3d12"))
-         {
-             *cb = RETRO_HW_CONTEXT_D3D12;
-             RARCH_LOG("[Environ] GET_PREFERRED_HW_RENDER: RETRO_HW_CONTEXT_D3D12.\n");
-         }
-         else
-         {
-             *cb = RETRO_HW_CONTEXT_NONE;
-             RARCH_LOG("[Environ] GET_PREFERRED_HW_RENDER: RETRO_HW_CONTEXT_NONE.\n");
-         }
-
-         if (!driver_switch_enable)
-         {
-            RARCH_LOG("[Environ] Driver switching disabled, GET_PREFERRED_HW_RENDER will be ignored.\n");
-            return false;
-         }
-         break;
-      }
 
       case RETRO_ENVIRONMENT_SET_HW_RENDER:
       case RETRO_ENVIRONMENT_SET_HW_RENDER | RETRO_ENVIRONMENT_EXPERIMENTAL:
@@ -3458,9 +3456,11 @@ bool runloop_environment_cb(unsigned cmd, void *data)
                return false;
             }
 
-            /* The core might request a mic before the mic driver is initialized,
-             * so we still have to see if the frontend intends to init a mic driver. */
-            if (!driver && string_is_equal(settings->arrays.microphone_driver, "null"))
+            /* The core might request a mic before the mic driver 
+             * is initialized, so we still have to see if the 
+             * frontend intends to init a mic driver. */
+            if (!driver && memcmp(settings->arrays.microphone_driver,
+                     "null", sizeof("null")) == 0)
             {
                RARCH_DBG("[Environ] Cannot initialize microphone interface, configured driver is null.\n");
                return false;
@@ -6003,7 +6003,7 @@ static enum runloop_state_enum runloop_check_state(
    {
       static bool old_pressed = false;
       bool pressed            = BIT256_GET(current_bits, RARCH_MENU_TOGGLE)
-            && !string_is_equal(settings->arrays.menu_driver, "null");
+         && memcmp(settings->arrays.menu_driver, "null", 5) != 0;
       bool core_type_is_dummy = runloop_st->current_core_type == CORE_TYPE_DUMMY;
 
       if (pressed && !old_pressed)
@@ -6178,7 +6178,7 @@ static enum runloop_state_enum runloop_check_state(
                generic_action_ok_displaylist_push(
                      msg_hash_to_str(MENU_ENUM_LABEL_VALUE_HISTORY_TAB),
                      NULL,
-                     msg_hash_to_str(MENU_ENUM_LABEL_LOAD_CONTENT_HISTORY),
+                     MENU_ENUM_LABEL_LOAD_CONTENT_HISTORY_STR,
                      MENU_SETTING_ACTION,
                      0, 0, ACTION_OK_DL_GENERIC);
                break;
@@ -6186,7 +6186,7 @@ static enum runloop_state_enum runloop_check_state(
                generic_action_ok_displaylist_push(
                      msg_hash_to_str(MENU_ENUM_LABEL_VALUE_FAVORITES_TAB),
                      NULL,
-                     msg_hash_to_str(MENU_ENUM_LABEL_FAVORITES_TAB),
+                     MENU_ENUM_LABEL_FAVORITES_TAB_STR,
                      MENU_SETTING_ACTION,
                      0, 0, ACTION_OK_DL_FAVORITES_LIST);
                break;
@@ -6194,7 +6194,7 @@ static enum runloop_state_enum runloop_check_state(
                generic_action_ok_displaylist_push(
                      msg_hash_to_str(MENU_ENUM_LABEL_VALUE_CONTENTLESS_CORES_TAB),
                      NULL,
-                     msg_hash_to_str(MENU_ENUM_LABEL_GOTO_CONTENTLESS_CORES),
+                     MENU_ENUM_LABEL_GOTO_CONTENTLESS_CORES_STR,
                      MENU_SETTING_ACTION,
                      0, 0, ACTION_OK_DL_CONTENTLESS_CORES_LIST);
                break;
@@ -6202,7 +6202,7 @@ static enum runloop_state_enum runloop_check_state(
                generic_action_ok_displaylist_push(
                      msg_hash_to_str(MENU_ENUM_LABEL_VALUE_EXPLORE_TAB),
                      NULL,
-                     msg_hash_to_str(MENU_ENUM_LABEL_GOTO_EXPLORE),
+                     MENU_ENUM_LABEL_GOTO_EXPLORE_STR,
                      MENU_EXPLORE_TAB,
                      0, 0, ACTION_OK_DL_EXPLORE_LIST);
                break;
@@ -6210,7 +6210,7 @@ static enum runloop_state_enum runloop_check_state(
                generic_action_ok_displaylist_push(
                      msg_hash_to_str(MENU_ENUM_LABEL_VALUE_PLAYLISTS_TAB),
                      NULL,
-                     msg_hash_to_str(MENU_ENUM_LABEL_PLAYLISTS_TAB),
+                     MENU_ENUM_LABEL_PLAYLISTS_TAB_STR,
                      MENU_SETTING_ACTION,
                      0, 0, ACTION_OK_DL_CONTENT_COLLECTION_LIST);
                break;
@@ -6218,7 +6218,7 @@ static enum runloop_state_enum runloop_check_state(
                generic_action_ok_displaylist_push(
                      msg_hash_to_str(MENU_ENUM_LABEL_VALUE_LOAD_CONTENT_LIST),
                      NULL,
-                     msg_hash_to_str(MENU_ENUM_LABEL_LOAD_CONTENT_LIST),
+                     MENU_ENUM_LABEL_LOAD_CONTENT_LIST_STR,
                      MENU_SETTING_ACTION,
                      0, 0, ACTION_OK_DL_GENERIC);
                break;
@@ -6226,7 +6226,7 @@ static enum runloop_state_enum runloop_check_state(
                generic_action_ok_displaylist_push(
                      msg_hash_to_str(MENU_ENUM_LABEL_VALUE_FAVORITES),
                      NULL,
-                     msg_hash_to_str(MENU_ENUM_LABEL_FAVORITES),
+                     MENU_ENUM_LABEL_FAVORITES_STR,
                      MENU_SETTING_ACTION_FAVORITES_DIR,
                      0, 0, ACTION_OK_DL_CONTENT_LIST);
                break;
@@ -6234,7 +6234,7 @@ static enum runloop_state_enum runloop_check_state(
                generic_action_ok_displaylist_push(
                      msg_hash_to_str(MENU_ENUM_LABEL_VALUE_DOWNLOADED_FILE_DETECT_CORE_LIST),
                      settings->paths.directory_core_assets,
-                     msg_hash_to_str(MENU_ENUM_LABEL_DOWNLOADED_FILE_DETECT_CORE_LIST),
+                     MENU_ENUM_LABEL_DOWNLOADED_FILE_DETECT_CORE_LIST_STR,
                      MENU_SETTING_ACTION,
                      0, 0, ACTION_OK_DL_CONTENT_LIST);
                break;

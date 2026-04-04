@@ -687,7 +687,18 @@ static bool core_option_manager_parse_variable(
       value                   = strdup(var->value);
 
    if (!string_is_empty(value))
-      desc_end                = strstr(value, "; ");
+   {
+      char *p = value;
+      while (*p)
+      {
+         if (p[0] == ';' && p[1] == ' ')
+         {
+            desc_end = p;
+            break;
+         }
+         p++;
+      }
+   }
 
    if (!desc_end)
       goto error;
@@ -1189,6 +1200,7 @@ core_option_manager_t *core_option_manager_new(
           * the map */
          const char *category_key = opt->opts[_len].category_key;
          char address[256];
+         size_t __len = 0;
 
          /* Address string is nominally:
           *    <category_key><delim><tag><option_key>
@@ -1196,20 +1208,15 @@ core_option_manager_t *core_option_manager_new(
           * key in order to avoid category/option key
           * collisions */
          if (string_is_empty(category_key))
-         {
-            size_t __len     = 0;
             address[  __len] = '#';
-            address[++__len] = '\0';
-            strlcpy(address + __len, option_def->key, sizeof(address) - __len);
-         }
          else
          {
-            size_t __len      = strlcpy(address, category_key, sizeof(address) - 3);
+            __len = strlcpy(address, category_key, sizeof(address) - 3);
             address[  __len]  = ':';
             address[++__len]  = '#';
-            address[++__len]  = '\0';
-            strlcpy(address + __len, option_def->key, sizeof(address) - __len);
          }
+	 address[++__len]  = '\0';
+	 strlcpy(address + __len, option_def->key, sizeof(address) - __len);
 
          if (!nested_list_add_item(opt->option_map,
                address, ":",

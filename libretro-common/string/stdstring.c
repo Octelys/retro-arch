@@ -141,17 +141,14 @@ char *string_trim_whitespace_left(char *const s)
    if (s && *s)
    {
       char *current  = s;
-
-      while (*current && ISSPACE((unsigned char)*current))
+      while (*current && (*current == ' ' || *current == '\t' || *current == '\n' || *current == '\r' || *current == '\v' || *current == '\f'))
          ++current;
-
       if (s != current)
       {
          size_t _len = strlen(current);
          memmove(s, current, _len + 1);
       }
    }
-
    return s;
 }
 
@@ -513,21 +510,22 @@ char* string_tokenize(char **str, const char *delim)
  * Leaf function.
  *
  * Removes every instance of character @c from @s
+ *
+ * Returns the length of the resulting string.
  **/
-void string_remove_all_chars(char *s, char c)
+size_t string_remove_all_chars(char *s, char c)
 {
-   char *read_ptr  = s;
-   char *write_ptr = s;
-
-   while (*read_ptr != '\0')
+   char *dst = s;
+   char *src = s;
+   while (*src)
    {
       /* Only write if the character is not the one to remove */
-      if (*read_ptr != c)
-         *write_ptr++ = *read_ptr;
-      read_ptr++;
+      if (*src != c)
+         *dst++ = *src;
+      src++;
    }
-
-   *write_ptr = '\0';
+   *dst = '\0';
+   return (size_t)(dst - s);
 }
 
 /**
@@ -633,8 +631,6 @@ int string_count_occurrences_single_character(const char *str, char c)
  *
  * Replaces all spaces with given character @c.
  **/
-/* FIX: Added unsigned char cast to ISSPACE argument for
- * correct behaviour with high-byte / signed char inputs. */
 void string_replace_whitespace_with_single_character(char *s, char c)
 {
    for (; *s; s++)
@@ -649,7 +645,6 @@ void string_replace_whitespace_with_single_character(char *s, char c)
  *
  * Replaces multiple spaces with a single space in a string.
  **/
-/* FIX: Added unsigned char cast to ISSPACE arguments. */
 void string_replace_multi_space_with_single_space(char *s)
 {
    char *str_trimmed  = s;
@@ -673,14 +668,16 @@ void string_replace_multi_space_with_single_space(char *s)
  * Leaf function.
  *
  * Remove all spaces from the given string.
+ * Returns the length of the resulting string.
  **/
-/* FIX: Added unsigned char cast to ISSPACE argument. */
-void string_remove_all_whitespace(char *s, const char *str)
+size_t string_remove_all_whitespace(char *s, const char *str)
 {
+   char *start = (char*)s;
    for (; *str; str++)
       if (!ISSPACE((unsigned char)*str))
          *s++ = *str;
    *s = '\0';
+   return s - start;
 }
 
 /**

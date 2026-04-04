@@ -114,7 +114,8 @@ static bool CCJSONObjectMemberHandler(void *context,
             {
                pCtx->current_string_val     = NULL;
 
-               if (string_is_equal(pValue, "version"))
+               if (len == sizeof("version") - 1
+                     && !memcmp(pValue, "version", sizeof("version") - 1))
                   pCtx->current_string_val  = &pCtx->core_info_cache_list->version;
             }
             break;
@@ -132,95 +133,118 @@ static bool CCJSONObjectMemberHandler(void *context,
                switch (pValue[0])
                {
                   case 'a':
-                     if (string_is_equal(pValue, "authors"))
+                     if (len == sizeof("authors") - 1
+                           && !memcmp(pValue, "authors", sizeof("authors") - 1))
                      {
                         pCtx->current_string_val      = &pCtx->core_info->authors;
                         pCtx->current_string_list_val = &pCtx->core_info->authors_list;
                      }
                      break;
                   case 'c':
-                     if (string_is_equal(pValue, "categories"))
+                     if (len == sizeof("categories") - 1
+                           && !memcmp(pValue, "categories", sizeof("categories") - 1))
                      {
                         pCtx->current_string_val      = &pCtx->core_info->categories;
                         pCtx->current_string_list_val = &pCtx->core_info->categories_list;
                      }
-                     else if (string_is_equal(pValue, "core_name"))
+                     else if (len == sizeof("core_name") - 1
+                           && !memcmp(pValue, "core_name", sizeof("core_name") - 1))
                         pCtx->current_string_val      = &pCtx->core_info->core_name;
-                     else if (string_is_equal(pValue, "core_file_id"))
+                     else if (len == sizeof("core_file_id") - 1
+                           && !memcmp(pValue, "core_file_id", sizeof("core_file_id") - 1))
                         pCtx->to_core_file_id         = true;
                      break;
                   case 'd':
-                     if (string_is_equal(pValue, "display_name"))
+                     if (len == sizeof("display_name") - 1
+                           && !memcmp(pValue, "display_name", sizeof("display_name") - 1))
                         pCtx->current_string_val      = &pCtx->core_info->display_name;
-                     else if (string_is_equal(pValue, "display_version"))
+                     else if (len == sizeof("display_version") - 1
+                           && !memcmp(pValue, "display_version", sizeof("display_version") - 1))
                         pCtx->current_string_val      = &pCtx->core_info->display_version;
-                     else if (string_is_equal(pValue, "databases"))
+                     else if (len == sizeof("databases") - 1
+                           && !memcmp(pValue, "databases", sizeof("databases") - 1))
                      {
                         pCtx->current_string_val      = &pCtx->core_info->databases;
                         pCtx->current_string_list_val = &pCtx->core_info->databases_list;
                      }
-                     else if (string_is_equal(pValue, "description"))
+                     else if (len == sizeof("description") - 1
+                           && !memcmp(pValue, "description", sizeof("description") - 1))
                         pCtx->current_string_val      = &pCtx->core_info->description;
-                     else if (string_is_equal(pValue, "database_match_archive_member"))
+                     else if (len == sizeof("database_match_archive_member") - 1
+                           && !memcmp(pValue, "database_match_archive_member", sizeof("database_match_archive_member") - 1))
                         pCtx->current_entry_flag_mask = CORE_INFO_FLAG_DATABASE_MATCH_ARCHIVE_MEMBER;
                      break;
                   case 'f':
-                     if (string_is_equal(pValue, "firmware"))
+                     if (len == sizeof("firmware") - 1
+                           && !memcmp(pValue, "firmware", sizeof("firmware") - 1))
                         pCtx->to_firmware             = true;
                      break;
                   case 'h':
-                     if (string_is_equal(pValue, "has_info"))
+                     if (len == sizeof("has_info") - 1
+                           && !memcmp(pValue, "has_info", sizeof("has_info") - 1))
                         pCtx->current_entry_flag_mask = CORE_INFO_FLAG_HAS_INFO;
                      break;
                   case 'l':
-                     if (string_is_equal(pValue, "licenses"))
+                     if (len == sizeof("licenses") - 1
+                           && !memcmp(pValue, "licenses", sizeof("licenses") - 1))
                      {
                         pCtx->current_string_val      = &pCtx->core_info->licenses;
                         pCtx->current_string_list_val = &pCtx->core_info->licenses_list;
                      }
                      break;
                   case 'i':
-                     if (string_is_equal(pValue, "is_experimental"))
+                     if (len == sizeof("is_experimental") - 1
+                           && !memcmp(pValue, "is_experimental", sizeof("is_experimental") - 1))
                         pCtx->current_entry_flag_mask = CORE_INFO_FLAG_IS_EXPERIMENTAL;
                      break;
                   case 'n':
-                     if (string_is_equal(pValue, "notes"))
+                     if (len == sizeof("notes") - 1
+                           && !memcmp(pValue, "notes", sizeof("notes") - 1))
                      {
                         pCtx->current_string_val      = &pCtx->core_info->notes;
                         pCtx->current_string_list_val = &pCtx->core_info->note_list;
                      }
                      break;
                   case 'p':
-                     if (string_is_equal(pValue, "permissions"))
+                     if (len == sizeof("permissions") - 1
+                           && !memcmp(pValue, "permissions", sizeof("permissions") - 1))
                      {
                         pCtx->current_string_val      = &pCtx->core_info->permissions;
                         pCtx->current_string_list_val = &pCtx->core_info->permissions_list;
                      }
                      break;
                   case 'r':
-                     if (string_is_equal(pValue, "required_hw_api"))
+                     if (len == sizeof("required_hw_api") - 1
+                           && !memcmp(pValue, "required_hw_api", sizeof("required_hw_api") - 1))
                      {
                         pCtx->current_string_val      = &pCtx->core_info->required_hw_api;
                         pCtx->current_string_list_val = &pCtx->core_info->required_hw_api_list;
                      }
                      break;
                   case 's':
-                     if (string_is_equal(pValue, "system_manufacturer"))
+                     if (len == sizeof("system_manufacturer") - 1
+                           && !memcmp(pValue, "system_manufacturer", sizeof("system_manufacturer") - 1))
                         pCtx->current_string_val      = &pCtx->core_info->system_manufacturer;
-                     else if (string_is_equal(pValue, "systemname"))
+                     else if (len == sizeof("systemname") - 1
+                           && !memcmp(pValue, "systemname", sizeof("systemname") - 1))
                         pCtx->current_string_val      = &pCtx->core_info->systemname;
-                     else if (string_is_equal(pValue, "system_id"))
+                     else if (len == sizeof("system_id") - 1
+                           && !memcmp(pValue, "system_id", sizeof("system_id") - 1))
                         pCtx->current_string_val      = &pCtx->core_info->system_id;
-                     else if (string_is_equal(pValue, "supported_extensions"))
+                     else if (len == sizeof("supported_extensions") - 1
+                           && !memcmp(pValue, "supported_extensions", sizeof("supported_extensions") - 1))
                      {
                         pCtx->current_string_val      = &pCtx->core_info->supported_extensions;
                         pCtx->current_string_list_val = &pCtx->core_info->supported_extensions_list;
                      }
-                     else if (string_is_equal(pValue, "supports_no_game"))
+                     else if (len == sizeof("supports_no_game") - 1
+                           && !memcmp(pValue, "supports_no_game", sizeof("supports_no_game") - 1))
                         pCtx->current_entry_flag_mask = CORE_INFO_FLAG_SUPPORTS_NO_GAME;
-                     else if (string_is_equal(pValue, "single_purpose"))
+                     else if (len == sizeof("single_purpose") - 1
+                           && !memcmp(pValue, "single_purpose", sizeof("single_purpose") - 1))
                         pCtx->current_entry_flag_mask = CORE_INFO_FLAG_SINGLE_PURPOSE;
-                     else if (string_is_equal(pValue, "savestate_support_level"))
+                     else if (len == sizeof("savestate_support_level") - 1
+                           && !memcmp(pValue, "savestate_support_level", sizeof("savestate_support_level") - 1))
                         pCtx->current_entry_uint_val  = &pCtx->core_info->savestate_support_level;
                      break;
                }
@@ -232,9 +256,11 @@ static bool CCJSONObjectMemberHandler(void *context,
 
                if (pCtx->to_core_file_id)
                {
-                  if (string_is_equal(pValue, "str"))
+                  if (len == sizeof("str") - 1
+                        && !memcmp(pValue, "str", sizeof("str") - 1))
                      pCtx->current_string_val      = &pCtx->core_info->core_file_id.str;
-                  else if (string_is_equal(pValue, "hash"))
+                  else if (len == sizeof("hash") - 1
+                        && !memcmp(pValue, "hash", sizeof("hash") - 1))
                      pCtx->current_entry_uint_val  = &pCtx->core_info->core_file_id.hash;
                }
             }
@@ -249,11 +275,14 @@ static bool CCJSONObjectMemberHandler(void *context,
                {
                   size_t firmware_idx              = pCtx->core_info->firmware_count - 1;
 
-                  if (string_is_equal(pValue, "path"))
+                  if (len == sizeof("path") - 1
+                        && !memcmp(pValue, "path", sizeof("path") - 1))
                      pCtx->current_string_val      = &pCtx->core_info->firmware[firmware_idx].path;
-                  else if (string_is_equal(pValue, "desc"))
+                  else if (len == sizeof("desc") - 1
+                        && !memcmp(pValue, "desc", sizeof("desc") - 1))
                      pCtx->current_string_val      = &pCtx->core_info->firmware[firmware_idx].desc;
-                  else if (string_is_equal(pValue, "optional"))
+                  else if (len == sizeof("optional") - 1
+                        && !memcmp(pValue, "optional", sizeof("optional") - 1))
                      pCtx->current_entry_bool_val  = &pCtx->core_info->firmware[firmware_idx].optional;
                }
             }
@@ -1394,7 +1423,7 @@ static core_path_list_t *core_info_path_list_new(const char *core_dir,
                path_list->core_list->size].filename = filename;
          path_list->core_list->size++;
       }
-      else if (string_is_equal(file_ext, FILE_PATH_LOCK_EXTENSION_NO_DOT))
+      else if (memcmp(file_ext, FILE_PATH_LOCK_EXTENSION_NO_DOT, sizeof(FILE_PATH_LOCK_EXTENSION_NO_DOT)) == 0)
       {
          path_list->lock_list->list[
                path_list->lock_list->size].filename = filename;
@@ -1403,7 +1432,7 @@ static core_path_list_t *core_info_path_list_new(const char *core_dir,
          path_list->lock_list->size++;
       }
 #if defined(HAVE_DYNAMIC)
-      else if (string_is_equal(file_ext, FILE_PATH_STANDALONE_EXEMPT_EXTENSION_NO_DOT))
+      else if (memcmp(file_ext, FILE_PATH_STANDALONE_EXEMPT_EXTENSION_NO_DOT, sizeof(FILE_PATH_STANDALONE_EXEMPT_EXTENSION_NO_DOT) - 1) == 0)
       {
          path_list->standalone_exempt_list->list[
                path_list->standalone_exempt_list->size].filename = filename;
@@ -1501,8 +1530,8 @@ static size_t core_info_get_file_id(const char *core_filename,
 #endif
    /* > Remove suffix */
    last_underscore = (char*)strrchr(s, '_');
-   if (   !string_is_empty(last_underscore)
-       && !string_is_equal(last_underscore, "_libretro"))
+   if (   last_underscore
+       && memcmp(last_underscore, "_libretro", STRLEN_CONST("_libretro") + 1))
    {
       *last_underscore = '\0';
       _len = last_underscore - s;
@@ -1813,12 +1842,12 @@ static void core_info_parse_config_file(
 
          if (entry && !string_is_empty(entry->value))
          {
-            if (string_is_equal(entry->value, "basic"))
+            if (memcmp(entry->value, "basic", 6) == 0)
                info->savestate_support_level =
-                     CORE_INFO_SAVESTATE_BASIC;
-            else if (string_is_equal(entry->value, "serialized"))
+                  CORE_INFO_SAVESTATE_BASIC;
+            else if (memcmp(entry->value, "serialized", 11) == 0)
                info->savestate_support_level =
-                     CORE_INFO_SAVESTATE_SERIALIZED;
+                  CORE_INFO_SAVESTATE_SERIALIZED;
          }
       }
       else
@@ -2168,19 +2197,19 @@ static bool core_info_does_support_any_file(const core_info_t *core,
 static bool core_info_does_support_file(
       const core_info_t *core, const char *path)
 {
-   const char *basename, *ext;
+   const char *ext;
    if (!core || !core->supported_extensions_list)
       return false;
    if (string_is_empty(path))
       return false;
-   basename = path_basename(path);
-   /* if a core has / in its list of supported extensions, the core
-      supports loading of directories on the host file system */
-   if (string_is_empty(basename))
-      return string_list_find_elem(core->supported_extensions_list, "/");
-   ext = strrchr(basename, '.');
-   return string_list_find_elem_prefix(
-         core->supported_extensions_list, ".", (ext ? ext + 1 : ""));
+   ext = strrchr(path, '.');
+   if (!ext)
+   {
+      size_t len = strlen(path);
+      return len > 0 && path[len - 1] == '/'
+         && string_list_find_elem(core->supported_extensions_list, "/");
+   }
+   return string_list_find_elem(core->supported_extensions_list, ext);
 }
 
 /* qsort_r() is not in standard C, sadly. */
@@ -2195,15 +2224,17 @@ static int core_info_qsort_cmp(const void *a_, const void *b_)
    int support_b                 = core_info_does_support_file(b,
          p_coreinfo->tmp_path);
 #ifdef HAVE_COMPRESSION
-   support_a            = support_a
-      || core_info_does_support_any_file(a, p_coreinfo->tmp_list);
-   support_b            = support_b
-      || core_info_does_support_any_file(b, p_coreinfo->tmp_list);
+   if (!support_a)
+      support_a = core_info_does_support_any_file(a, p_coreinfo->tmp_list);
+   if (!support_b)
+      support_b = core_info_does_support_any_file(b, p_coreinfo->tmp_list);
 #endif
    if (support_a != support_b)
       return support_b - support_a;
-   if (!a->display_name || !b->display_name)
-      return 0;
+   if (!a->display_name)
+      return b->display_name ? -1 : 0;
+   if (!b->display_name)
+      return 1;
    return strcasecmp(a->display_name, b->display_name);
 }
 
@@ -2449,16 +2480,23 @@ bool core_info_core_file_id_is_equal(const char *core_path_a,
 {
    char core_file_id_a[256];
    char core_file_id_b[256];
-   if (   string_is_empty(core_path_a)
-       || string_is_empty(core_path_b)
-       || (core_info_get_file_id(
-          path_basename_nocompression(core_path_a),
-            core_file_id_a, sizeof(core_file_id_a)) == 0)
-       || (core_info_get_file_id(
-          path_basename_nocompression(core_path_b),
-            core_file_id_b, sizeof(core_file_id_b)) == 0))
+   size_t _len;
+
+   if (!core_path_a || !core_path_b)
       return false;
-   return string_is_equal(core_file_id_a, core_file_id_b);
+
+   _len = core_info_get_file_id(
+         path_basename_nocompression(core_path_a),
+            core_file_id_a, sizeof(core_file_id_a));
+   if (!_len)
+      return false;
+
+   if (!core_info_get_file_id(
+          path_basename_nocompression(core_path_b),
+            core_file_id_b, sizeof(core_file_id_b)))
+      return false;
+
+   return !strcmp(core_file_id_a, core_file_id_b);
 }
 
 bool core_info_database_match_archive_member(const char *database_path)

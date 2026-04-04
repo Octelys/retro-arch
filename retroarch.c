@@ -655,7 +655,7 @@ bool midi_driver_set_all_sounds_off(void)
     * MIDI is not used. Frame Delay also breaks if MIDI sounds
     * are "set off", which happens on menu toggle, therefore
     * skip this if WASAPI is used and Frame Delay is active.. */
-   if (string_is_equal(audio_state_get_ptr()->current_audio->ident, "wasapi"))
+   if (memcmp(audio_state_get_ptr()->current_audio->ident, "wasapi", 6) == 0)
    {
       if (video_state_get_ptr()->frame_delay_target > 0)
          return false;
@@ -1177,81 +1177,81 @@ size_t midi_driver_get_event_size(uint8_t status)
 static size_t find_driver_nonempty(
       const char *label, int i, char *s, size_t len)
 {
-   if (string_is_equal(label, "camera_driver"))
+   if (!memcmp(label, "camera_driver", STRLEN_CONST("camera_driver")))
    {
       if (camera_drivers[i])
          return strlcpy(s, camera_drivers[i]->ident, len);
    }
-   else if (string_is_equal(label, "location_driver"))
+   else if (!memcmp(label, "location_driver", STRLEN_CONST("location_driver")))
    {
       if (location_drivers[i])
          return strlcpy(s, location_drivers[i]->ident, len);
    }
 #ifdef HAVE_MENU
-   else if (string_is_equal(label, "menu_driver"))
+   else if (!memcmp(label, "menu_driver", STRLEN_CONST("menu_driver")))
    {
       if (menu_ctx_drivers[i])
          return strlcpy(s, menu_ctx_drivers[i]->ident, len);
    }
 #endif
-   else if (string_is_equal(label, "input_driver"))
+   else if (!memcmp(label, "input_driver", STRLEN_CONST("input_driver")))
    {
       if (input_drivers[i])
          return strlcpy(s, input_drivers[i]->ident, len);
    }
-   else if (string_is_equal(label, "input_joypad_driver"))
+   else if (!memcmp(label, "input_joypad_driver", STRLEN_CONST("input_joypad_driver")))
    {
       if (joypad_drivers[i])
          return strlcpy(s, joypad_drivers[i]->ident, len);
    }
-   else if (string_is_equal(label, "video_driver"))
+   else if (!memcmp(label, "video_driver", STRLEN_CONST("video_driver")))
    {
       if (video_drivers[i])
          return strlcpy(s, video_drivers[i]->ident, len);
    }
-   else if (string_is_equal(label, "audio_driver"))
+   else if (!memcmp(label, "audio_driver", STRLEN_CONST("audio_driver")))
    {
       if (audio_drivers[i])
          return strlcpy(s, audio_drivers[i]->ident, len);
    }
 #ifdef HAVE_MICROPHONE
-   else if (string_is_equal(label, "microphone_driver"))
+   else if (!memcmp(label, "microphone_driver", STRLEN_CONST("microphone_driver")))
    {
       if (microphone_drivers[i])
          return strlcpy(s, microphone_drivers[i]->ident, len);
    }
 #endif
-   else if (string_is_equal(label, "record_driver"))
+   else if (!memcmp(label, "record_driver", STRLEN_CONST("record_driver")))
    {
       if (record_drivers[i])
          return strlcpy(s, record_drivers[i]->ident, len);
    }
-   else if (string_is_equal(label, "midi_driver"))
+   else if (!memcmp(label, "midi_driver", STRLEN_CONST("midi_driver")))
    {
       if (midi_driver_find_handle(i))
          return strlcpy(s, midi_drivers[i]->ident, len);
    }
-   else if (string_is_equal(label, "audio_resampler_driver"))
+   else if (!memcmp(label, "audio_resampler_driver", STRLEN_CONST("audio_resampler_driver")))
    {
       if (audio_resampler_driver_find_handle(i))
          return strlcpy(s, audio_resampler_driver_find_ident(i), len);
    }
 #ifdef HAVE_BLUETOOTH
-   else if (string_is_equal(label, "bluetooth_driver"))
+   else if (!memcmp(label, "bluetooth_driver", STRLEN_CONST("bluetooth_driver")))
    {
       if (bluetooth_drivers[i])
          return strlcpy(s, bluetooth_drivers[i]->ident, len);
    }
 #endif
 #ifdef HAVE_WIFI
-   else if (string_is_equal(label, "wifi_driver"))
+   else if (!memcmp(label, "wifi_driver", STRLEN_CONST("wifi_driver")))
    {
       if (wifi_drivers[i])
          return strlcpy(s, wifi_drivers[i]->ident, len);
    }
 #endif
 #ifdef HAVE_CLOUDSYNC
-   else if (string_is_equal(label, "cloud_sync_driver"))
+   else if (!memcmp(label, "cloud_sync_driver", STRLEN_CONST("cloud_sync_driver")))
    {
       if (cloud_sync_drivers[i])
          return strlcpy(s, cloud_sync_drivers[i]->ident, len);
@@ -2566,52 +2566,63 @@ bool path_set(enum rarch_path_type type, const char *path)
                p_rarch->dir_savestate);
          break;
       case RARCH_PATH_CORE:
-         strlcpy(p_rarch->path_libretro, path,
-               sizeof(p_rarch->path_libretro));
+         if (path != p_rarch->path_libretro)
+            strlcpy(p_rarch->path_libretro, path,
+                  sizeof(p_rarch->path_libretro));
          break;
       case RARCH_PATH_CORE_LAST:
-         strlcpy(p_rarch->path_libretro_last, path,
-               sizeof(p_rarch->path_libretro_last));
+         if (path != p_rarch->path_libretro_last)
+            strlcpy(p_rarch->path_libretro_last, path,
+                  sizeof(p_rarch->path_libretro_last));
          break;
       case RARCH_PATH_DEFAULT_SHADER_PRESET:
-         strlcpy(p_rarch->path_default_shader_preset, path,
-               sizeof(p_rarch->path_default_shader_preset));
+         if (path != p_rarch->path_default_shader_preset)
+            strlcpy(p_rarch->path_default_shader_preset, path,
+                  sizeof(p_rarch->path_default_shader_preset));
          break;
       case RARCH_PATH_CONFIG:
-         strlcpy(p_rarch->path_config_file, path,
-               sizeof(p_rarch->path_config_file));
+         if (path != p_rarch->path_config_file)
+            strlcpy(p_rarch->path_config_file, path,
+                  sizeof(p_rarch->path_config_file));
          break;
       case RARCH_PATH_CONFIG_DEFAULT:
-         strlcpy(p_rarch->path_config_default_file, path,
-               sizeof(p_rarch->path_config_default_file));
+         if (path != p_rarch->path_config_default_file)
+            strlcpy(p_rarch->path_config_default_file, path,
+                  sizeof(p_rarch->path_config_default_file));
          break;
       case RARCH_PATH_CONFIG_APPEND:
-         strlcpy(p_rarch->path_config_append_file, path,
-               sizeof(p_rarch->path_config_append_file));
+         if (path != p_rarch->path_config_append_file)
+            strlcpy(p_rarch->path_config_append_file, path,
+                  sizeof(p_rarch->path_config_append_file));
          break;
       case RARCH_PATH_CONFIG_OVERRIDE:
-         strlcpy(p_rarch->path_config_override_file, path,
-               sizeof(p_rarch->path_config_override_file));
+         if (path != p_rarch->path_config_override_file)
+            strlcpy(p_rarch->path_config_override_file, path,
+                  sizeof(p_rarch->path_config_override_file));
          break;
       case RARCH_PATH_CORE_OPTIONS:
-         strlcpy(p_rarch->path_core_options_file, path,
-               sizeof(p_rarch->path_core_options_file));
+         if (path != p_rarch->path_core_options_file)
+            strlcpy(p_rarch->path_core_options_file, path,
+                  sizeof(p_rarch->path_core_options_file));
          break;
       case RARCH_PATH_CONTENT:
-         strlcpy(p_rarch->path_content, path,
-               sizeof(p_rarch->path_content));
+         if (path != p_rarch->path_content)
+            strlcpy(p_rarch->path_content, path,
+                  sizeof(p_rarch->path_content));
          break;
       case RARCH_PATH_NONE:
          break;
       case RARCH_PATH_BASENAME:
          runloop_st = runloop_state_get_ptr();
-         strlcpy(runloop_st->runtime_content_path_basename, path,
-               sizeof(runloop_st->runtime_content_path_basename));
+         if (path != runloop_st->runtime_content_path_basename)
+            strlcpy(runloop_st->runtime_content_path_basename, path,
+                  sizeof(runloop_st->runtime_content_path_basename));
          break;
       case RARCH_PATH_SUBSYSTEM:
          runloop_st = runloop_state_get_ptr();
-         strlcpy(runloop_st->subsystem_path, path,
-               sizeof(runloop_st->subsystem_path));
+         if (path != runloop_st->subsystem_path)
+            strlcpy(runloop_st->subsystem_path, path,
+                  sizeof(runloop_st->subsystem_path));
          break;
    }
 
@@ -2752,23 +2763,63 @@ static void ram_state_to_file(void)
       command_event(CMD_EVENT_RAM_STATE_TO_FILE, state_path);
 }
 
+/**
+ * Compute DJB2 hash of a short string, lowercasing ASCII on the fly.
+ * Assumes ext points to a valid, short (extension-length) string.
+ */
+static INLINE uint32_t djb2_calculate_lower(const char *s)
+{
+   uint32_t h = 5381;
+   for (; *s; s++)
+   {
+      unsigned char c = (unsigned char)*s;
+      /* Branchless ASCII tolower: set bit 5 if uppercase letter */
+      c |= ((unsigned int)c - 'A' < 26u) ? 0x20 : 0x00;
+      h = (h << 5) + h + c;
+   }
+   return h;
+}
+
 enum rarch_content_type path_is_media_type(const char *path)
 {
-   char ext_lower[16];
-   strlcpy(ext_lower, path_get_extension(path), sizeof(ext_lower));
+   const char *ext;
 
-   string_to_lower(ext_lower);
+   if (!path || !*path)
+      return RARCH_CONTENT_NONE;
 
-   /* hack, to detect livestreams so the ffmpeg core can be started */
-   if (   string_starts_with_size(path, "udp://",   STRLEN_CONST("udp://"))
-       || string_starts_with_size(path, "http://",  STRLEN_CONST("http://"))
-       || string_starts_with_size(path, "https://", STRLEN_CONST("https://"))
-       || string_starts_with_size(path, "tcp://",   STRLEN_CONST("tcp://"))
-       || string_starts_with_size(path, "rtmp://",  STRLEN_CONST("rtmp://"))
-       || string_starts_with_size(path, "rtp://",   STRLEN_CONST("rtp://")))
-      return RARCH_CONTENT_MOVIE;
+   /* Fast streaming-protocol check: switch on first char to avoid
+    * testing all prefixes linearly. Only fall through on match. */
+   switch (path[0])
+   {
+      case 'u':
+         if (string_starts_with_size(path, "udp://", STRLEN_CONST("udp://")))
+            return RARCH_CONTENT_MOVIE;
+         break;
+      case 'h':
+         if (   string_starts_with_size(path, "http://",  STRLEN_CONST("http://"))
+             || string_starts_with_size(path, "https://", STRLEN_CONST("https://")))
+            return RARCH_CONTENT_MOVIE;
+         break;
+      case 't':
+         if (string_starts_with_size(path, "tcp://", STRLEN_CONST("tcp://")))
+            return RARCH_CONTENT_MOVIE;
+         break;
+      case 'r':
+         if (   string_starts_with_size(path, "rtmp://", STRLEN_CONST("rtmp://"))
+             || string_starts_with_size(path, "rtp://",  STRLEN_CONST("rtp://")))
+            return RARCH_CONTENT_MOVIE;
+         break;
+      default:
+         break;
+   }
 
-   switch (msg_hash_to_file_type(msg_hash_calculate(ext_lower)))
+   ext = path_get_extension(path);
+   if (!ext || !*ext)
+      return RARCH_CONTENT_NONE;
+
+   /* Hash the extension directly, lowercasing during hashing —
+    * eliminates strlcpy, string_to_lower, and the stack buffer. */
+   switch (msg_hash_to_file_type(djb2_calculate_lower(ext)))
    {
 #if defined(HAVE_FFMPEG) || defined(HAVE_MPV)
       case FILE_TYPE_OGM:
@@ -2824,7 +2875,6 @@ enum rarch_content_type path_is_media_type(const char *path)
       case FILE_TYPE_BMP:
          return RARCH_CONTENT_IMAGE;
 #endif
-      case FILE_TYPE_NONE:
       default:
          break;
    }
@@ -3568,7 +3618,7 @@ bool command_event(enum event_command cmd, void *data)
             configuration_set_int(settings, settings->ints.replay_slot, replay_slot);
          if (!res)
          {
-             const char *_msg = msg_hash_to_str(MSG_FAILED_TO_START_MOVIE_RECORD);
+            const char *_msg = msg_hash_to_str(MSG_FAILED_TO_START_MOVIE_RECORD);
             runloop_msg_queue_push(_msg, strlen(_msg), 1, 180, true, NULL,
                   MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
             RARCH_ERR("[Replay] %s.\n", _msg);
@@ -5498,9 +5548,9 @@ bool command_event(enum event_command cmd, void *data)
                if (show_message)
                {
                   const char *_msg =
-                        input_st->game_focus_state.enabled ?
-                        msg_hash_to_str(MSG_GAME_FOCUS_ON) :
-                        msg_hash_to_str(MSG_GAME_FOCUS_OFF);
+                        input_st->game_focus_state.enabled
+                        ? msg_hash_to_str(MSG_GAME_FOCUS_ON)
+                        : msg_hash_to_str(MSG_GAME_FOCUS_OFF);
 
                   runloop_msg_queue_push(_msg, strlen(_msg), 1, 60, true, NULL,
                         MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
@@ -6021,16 +6071,15 @@ void main_exit(void *args)
 static int mkdir_p(const char *path, mode_t mode)
 {
     char tmp[PATH_MAX_LENGTH];
-    char *p = NULL;
-    size_t len;
+    char *p     = NULL;
+    size_t _len = strlcpy(tmp, path, sizeof(tmp));
+    if (tmp[_len - 1] == '/')
+        tmp[_len - 1] = 0;
 
-    snprintf(tmp, sizeof(tmp), "%s", path);
-    len = strlen(tmp);
-    if (tmp[len - 1] == '/')
-        tmp[len - 1] = 0;
-
-    for (p = tmp + 1; *p; p++) {
-        if (*p == '/') {
+    for (p = tmp + 1; *p; p++)
+    {
+        if (*p == '/')
+        {
             *p = 0;
             mkdir(tmp, mode);
             *p = '/';
@@ -7022,48 +7071,42 @@ static void retroarch_parse_input_libretro_path(
        * an existing file in the cores directory */
       if (find_last_slash(path))
          goto end;
-
       /* First check for built-in cores */
-      if (string_is_equal(path, "ffmpeg"))
+      if (!memcmp(path, "ffmpeg", STRLEN_CONST("ffmpeg")))
       {
          runloop_set_current_core_type(CORE_TYPE_FFMPEG, true);
          return;
       }
-      else if (string_is_equal(path, "mpv"))
+      else if (!memcmp(path, "mpv", STRLEN_CONST("mpv")))
       {
          runloop_set_current_core_type(CORE_TYPE_MPV, true);
          return;
       }
-      else if (string_is_equal(path, "imageviewer"))
+      else if (!memcmp(path, "imageviewer", STRLEN_CONST("imageviewer")))
       {
          runloop_set_current_core_type(CORE_TYPE_IMAGEVIEWER, true);
          return;
       }
-      if (string_is_equal(path, "netretropad"))
+      if (!memcmp(path, "netretropad", STRLEN_CONST("netretropad")))
       {
          runloop_set_current_core_type(CORE_TYPE_NETRETROPAD, true);
          return;
       }
-      else if (string_is_equal(path, "videoprocessor"))
+      else if (!memcmp(path, "videoprocessor", STRLEN_CONST("videoprocessor")))
       {
          runloop_set_current_core_type(CORE_TYPE_VIDEO_PROCESSOR, true);
          return;
       }
-
       command_event(CMD_EVENT_CORE_INFO_INIT, NULL);
-
       _len = strlcpy(tmp_path, path, sizeof(tmp_path));
-
       if (!string_ends_with_size(tmp_path, "_libretro",
-            _len, STRLEN_CONST("_libretro")))
+               _len, STRLEN_CONST("_libretro")))
          strlcpy(tmp_path       + _len,
                "_libretro",
                sizeof(tmp_path) - _len);
-
       if (  !core_info_find(tmp_path, &core_info)
-          || string_is_empty(core_info->path))
+            || string_is_empty(core_info->path))
          goto end;
-
       core_path         = core_info->path;
       core_path_matched = true;
    }
@@ -7573,12 +7616,12 @@ static bool retroarch_parse_input_and_config(
                break;
 
             case 'M':
-               if (string_is_equal(optarg, "noload-nosave"))
+               if (memcmp(optarg, "noload-nosave", 13) == 0)
                   runloop_st->flags |= RUNLOOP_FLAG_IS_SRAM_LOAD_DISABLED
-                                     | RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED;
-               else if (string_is_equal(optarg, "noload-save"))
+                     | RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED;
+               else if (memcmp(optarg, "noload-save", 11) == 0)
                   runloop_st->flags |= RUNLOOP_FLAG_IS_SRAM_LOAD_DISABLED;
-               else if (string_is_equal(optarg, "load-nosave"))
+               else if (memcmp(optarg, "load-nosave", 11) == 0)
                   runloop_st->flags |= RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED;
                else if (string_is_not_equal(optarg, "load-save"))
                {
@@ -7692,12 +7735,27 @@ static bool retroarch_parse_input_and_config(
                break;
 
             case RA_OPT_SIZE:
-               if (sscanf(optarg, "%ux%u",
-                        &rec_st->width, &rec_st->height) != 2)
                {
-                  RARCH_ERR("Wrong format for --size.\n");
-                  retroarch_print_help(argv[0]);
-                  retroarch_fail(1, "retroarch_parse_input()");
+                  char *sep;
+                  unsigned long w = (unsigned long)strtoul(optarg, &sep, 0);
+                  if (sep == optarg || *sep != 'x')
+                  {
+                     RARCH_ERR("Wrong format for --size.\n");
+                     retroarch_print_help(argv[0]);
+                     retroarch_fail(1, "retroarch_parse_input()");
+                  }
+                  {
+                     char *end;
+                     unsigned long h = (unsigned long)strtoul(sep + 1, &end, 0);
+                     if (end == sep + 1 || *end != '\0')
+                     {
+                        RARCH_ERR("Wrong format for --size.\n");
+                        retroarch_print_help(argv[0]);
+                        retroarch_fail(1, "retroarch_parse_input()");
+                     }
+                     rec_st->width  = (unsigned)w;
+                     rec_st->height = (unsigned)h;
+                  }
                }
                break;
 
@@ -8952,6 +9010,7 @@ enum retro_language retroarch_get_language_from_iso(const char *iso639)
       {"gl", RETRO_LANGUAGE_GALICIAN},
       {"no", RETRO_LANGUAGE_NORWEGIAN},
       {"ga", RETRO_LANGUAGE_IRISH},
+      {"th", RETRO_LANGUAGE_THAI},
    };
 
    if (string_is_empty(iso639))

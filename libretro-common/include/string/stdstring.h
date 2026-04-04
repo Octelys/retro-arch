@@ -263,17 +263,19 @@ size_t word_wrap_wideglyph(
  *        token = NULL;
  *    }
  **/
-char* string_tokenize(char **str, const char *delim);
+char *string_tokenize(char **str, const char *delim);
 
 /**
  * string_remove_all_chars:
- * @str                : input string (must be non-NULL, otherwise UB)
+ * @s                 : input string (must be non-NULL, otherwise UB)
  *
  * Leaf function.
  *
- * Removes every instance of character @c from @str
+ * Removes every instance of character @c from @s
+ *
+ * Returns the length of the resulting string.
  **/
-void string_remove_all_chars(char *str, char c);
+size_t string_remove_all_chars(char *s, char c);
 
 /**
  * string_replace_all_chars:
@@ -345,8 +347,9 @@ void string_replace_multi_space_with_single_space(char *str);
  * Leaf function.
  *
  * Remove all spaces from the given string.
+ * Returns the length of the resulting string.
  **/
-void string_remove_all_whitespace(char *str_trimmed, const char *str);
+size_t string_remove_all_whitespace(char *str_trimmed, const char *str);
 
 /* Retrieve the last occurance of the given character in a string. */
 int string_index_last_occurance(const char *str, char c);

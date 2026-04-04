@@ -252,7 +252,8 @@ bool core_updater_list_get_filename(
             if (string_is_empty(current_entry->remote_filename))
                continue;
 
-            if (string_is_equal(remote_filename, current_entry->remote_filename))
+            if (string_is_equal(remote_filename,
+                current_entry->remote_filename))
             {
                *entry = current_entry;
                return true;
@@ -306,10 +307,12 @@ bool core_updater_list_get_core(
 
 #ifdef _WIN32
       /* Handle case-insensitive operating systems*/
-      if (string_is_equal_noncase(real_core_path, current_entry->local_core_path))
+      if (string_is_equal_noncase(real_core_path,
+          current_entry->local_core_path))
       {
 #else
-      if (string_is_equal(real_core_path, current_entry->local_core_path))
+      if (string_is_equal(real_core_path,
+          current_entry->local_core_path))
       {
 #endif
          *entry = current_entry;
@@ -414,7 +417,7 @@ static bool core_updater_list_set_paths(
    _len = strlen(filename_str) + 1;
    if (entry->remote_filename)
    {
-      char *tmp = realloc(entry->remote_filename, _len);
+      char *tmp = (char*)realloc(entry->remote_filename, _len);
       if (!tmp)
          return false;
       entry->remote_filename = tmp;
@@ -446,7 +449,7 @@ static bool core_updater_list_set_paths(
    _len = strlen(remote_core_path) + 1;
    if (entry->remote_core_path)
    {
-      char *tmp = realloc(entry->remote_core_path, _len);
+      char *tmp = (char*)realloc(entry->remote_core_path, _len);
       if (!tmp)
          return false;
       entry->remote_core_path = tmp;
@@ -475,7 +478,7 @@ static bool core_updater_list_set_paths(
    _len = strlen(local_core_path) + 1;
    if (entry->local_core_path)
    {
-      char *tmp = realloc(entry->local_core_path, _len);
+      char *tmp = (char*)realloc(entry->local_core_path, _len);
       if (!tmp)
          return false;
       entry->local_core_path = tmp;
@@ -502,7 +505,7 @@ static bool core_updater_list_set_paths(
 
    last_underscore = (char*)strrchr(local_info_path, '_');
    if (!string_is_empty(last_underscore))
-      if (!string_is_equal(last_underscore, "_libretro"))
+      if (memcmp(last_underscore, "_libretro", 9) != 0)
          *last_underscore = '\0';
 
    _len = strlen(local_info_path);
@@ -514,7 +517,7 @@ static bool core_updater_list_set_paths(
    _len = strlen(local_info_path) + 1;
    if (entry->local_info_path)
    {
-      char *tmp = realloc(entry->local_info_path, _len);
+      char *tmp = (char*)realloc(entry->local_info_path, _len);
       if (!tmp)
          return false;
       entry->local_info_path = tmp;
@@ -767,8 +770,9 @@ bool core_updater_list_parse_network_data(
       const char *network_buildbot_url,
       const char *data, size_t len)
 {
-   char *tok, *save   = NULL;
    char *data_buf     = NULL;
+   char *line         = NULL;
+   char *data_end     = NULL;
 
    /* Sanity check */
    if (!core_list || string_is_empty(data) || (len < 1))
@@ -786,30 +790,68 @@ bool core_updater_list_parse_network_data(
    memcpy(data_buf, data, len * sizeof(char));
    data_buf[len] = '\0';
 
-   /* Split network listing request into lines
-    * and loop over each line.
-    * The outer strtok_r replaces '\n' with '\0' in data_buf,
-    * so each tok is an isolated null-terminated string that
-    * can be safely tokenized in-place by the inner strtok_r
-    * without any extra allocations. */
-   for (tok = strtok_r(data_buf, "\n", &save); tok;
-        tok = strtok_r(NULL, "\n", &save))
+   data_end = data_buf + len;
+
+   /* Parse each line from the network data */
+   for (line = data_buf; line < data_end; )
    {
-      char *save2 = NULL;
+      char *line_end;
+      char *p;
       char *elem0 = NULL; /* date     */
       char *elem1 = NULL; /* crc      */
       char *elem2 = NULL; /* filename */
 
-      if (string_is_empty(tok))
-         continue;
+      /* Find end of current line and terminate it */
+      for (line_end = line; line_end < data_end && *line_end != '\n'; line_end++)
+         ;
+      *line_end = '\0';
 
-      /* Split line into listings info components
-       * directly in place - no strdup needed since
-       * strtok_r tracks state via save pointers,
-       * not the input string itself */
-      if ((elem0 = strtok_r(tok,  " ", &save2)) != NULL)
-      if ((elem1 = strtok_r(NULL, " ", &save2)) != NULL)
-            elem2 = strtok_r(NULL, " ", &save2);
+      /* Skip empty lines */
+      if (string_is_empty(line))
+      {
+         line = line_end + 1;
+         continue;
+      }
+
+      p = line;
+
+      /* --- elem0: date --- */
+      /* Skip leading spaces */
+      while (*p == ' ')
+         p++;
+      if (*p != '\0')
+      {
+         elem0 = p;
+         /* Advance to next space and terminate */
+         while (*p != ' ' && *p != '\0')
+            p++;
+         if (*p == ' ')
+            *p++ = '\0';
+      }
+
+      /* --- elem1: crc --- */
+      while (*p == ' ')
+         p++;
+      if (*p != '\0')
+      {
+         elem1 = p;
+         while (*p != ' ' && *p != '\0')
+            p++;
+         if (*p == ' ')
+            *p++ = '\0';
+      }
+
+      /* --- elem2: filename --- */
+      while (*p == ' ')
+         p++;
+      if (*p != '\0')
+      {
+         elem2 = p;
+         while (*p != ' ' && *p != '\0')
+            p++;
+         if (*p == ' ')
+            *p = '\0';
+      }
 
       /* Parse listings info and add to core updater
        * list */
@@ -824,6 +866,9 @@ bool core_updater_list_parse_network_data(
                path_libretro_info,
                network_buildbot_url,
                elem0, elem1, elem2);
+
+      /* Advance to next line */
+      line = line_end + 1;
    }
 
    /* Temporary data buffer is no longer required */
