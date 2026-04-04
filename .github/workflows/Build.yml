@@ -1,0 +1,101 @@
+name: Build
+run-name: |{{ github.ref_name }} build run
+
+on:
+  push:
+    tags:
+      - '*'
+    branches:
+      - main
+  pull_request:
+  repository_dispatch:
+    types: [run_build]
+
+permissions:
+  contents: write
+
+jobs:
+
+  build-linux:
+    name: Linux (i686)
+    uses: ./.github/workflows/Linux.yml
+
+  build-macos:
+    name: macOS
+    uses: ./.github/workflows/MacOS.yml
+
+  build-windows-x64:
+    name: Windows x64 (MXE)
+    uses: ./.github/workflows/Windows-x64-MXE.yml
+
+  build-windows-arm64:
+    name: Windows ARM64 (MSVC)
+    uses: ./.github/workflows/Windows-ARM64.yml
+
+  create-release:
+    name: Create Release
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    needs:
+      - build-linux
+      - build-macos
+      - build-windows-x64
+      - build-windows-arm64
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check Release Tag
+        id: check
+        run: |
+          : Check Release Tag
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+          shopt -s extglob
+
+          case "${GITHUB_REF_NAME}" in
+            +([0-9]).+([0-9]).+([0-9]) | v+([0-9]).+([0-9]).+([0-9]) )
+              echo 'validTag=true' >> $GITHUB_OUTPUT
+              echo 'prerelease=false' >> $GITHUB_OUTPUT
+              echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+              ;;
+            +([0-9]).+([0-9]).+([0-9])-@(beta|rc)*([0-9]) | v+([0-9]).+([0-9]).+([0-9])-@(beta|rc)*([0-9]) )
+              echo 'validTag=true' >> $GITHUB_OUTPUT
+              echo 'prerelease=true' >> $GITHUB_OUTPUT
+              echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+              ;;
+            *) echo 'validTag=false' >> $GITHUB_OUTPUT ;;
+          esac
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        if: fromJSON(steps.check.outputs.validTag)
+        id: download
+
+      - name: Generate Checksums
+        if: fromJSON(steps.check.outputs.validTag)
+        run: |
+          : Generate Checksums
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+          shopt -s extglob
+
+          echo "### Checksums" > ${{ github.workspace }}/CHECKSUMS.txt
+          for file in **/@(*.exe|*.tar.gz|*.zip); do
+            echo "    ${file##*/}: $(sha256sum "${file}" | cut -d ' ' -f 1)" >> ${{ github.workspace }}/CHECKSUMS.txt
+          done
+
+      - name: Create GitHub Release
+        if: fromJSON(steps.check.outputs.validTag)
+        uses: softprops/action-gh-release@9d7c94cfd0a1f3ed45544c887983e9fa900f0564
+        with:
+          draft: false
+          prerelease: ${{ fromJSON(steps.check.outputs.prerelease) }}
+          tag_name: ${{ steps.check.outputs.version }}
+          name: RetroArch ${{ steps.check.outputs.version }}
+          body_path: ${{ github.workspace }}/CHECKSUMS.txt
+          files: |
+            ${{ github.workspace }}/**/*.exe
+            ${{ github.workspace }}/**/*.zip
+            ${{ github.workspace }}/**/*.tar.gz
+            ${{ github.workspace }}/**/*.app
+            ${{ github.workspace }}/**/*.dmg

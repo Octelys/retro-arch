@@ -7,6 +7,7 @@ on:
   pull_request:
   repository_dispatch:
     types: [run_build]
+  workflow_call:
 
 permissions:
   contents: read
