@@ -2,6 +2,8 @@ name: CI Windows ARM64 (MSVC)
 
 on:
   push:
+    branches:
+      - main
   pull_request:
   repository_dispatch:
     types: [run_build]
@@ -19,7 +21,7 @@ jobs:
     strategy:
       matrix:
         version: [2022]
-        configuration: [Debug, Release]
+        configuration: [Release]
         platform: [ARM64]
 
     steps:
