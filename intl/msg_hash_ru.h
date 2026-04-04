@@ -1139,6 +1139,30 @@ MSG_HASH(
    "Пароль от вашего аккаунта в облачном хранилище."
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_CLOUD_SYNC_ACCESS_KEY_ID,
+   "ID ключа доступа"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_CLOUD_SYNC_ACCESS_KEY_ID,
+   "Ваш идентификатор ключа доступа к аккаунту облачного хранилища."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_CLOUD_SYNC_SECRET_ACCESS_KEY,
+   "Секретный ключ доступа"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_CLOUD_SYNC_SECRET_ACCESS_KEY,
+   "Ваш секретный ключ доступа к аккаунту облачного хранилища."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_CLOUD_SYNC_S3_URL,
+   "URL S3"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_CLOUD_SYNC_S3_URL,
+   "Сетевой адрес S3 для облачного хранилища."
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_LOGGING_SETTINGS,
    "Логирование"
    )
@@ -2431,12 +2455,20 @@ MSG_HASH(
    "Откл."
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_MENU_HDR_BRIGHTNESS_NITS,
+   "Яркость"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_MENU_HDR_BRIGHTNESS_NITS,
+   "Уровень яркости меню в кд/м2 (нит) при выводе изображения в HDR. Отображается только если HDR включен в Настройки > Видео > HDR."
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_HDR_PAPER_WHITE_NITS,
-   "Яркость белого листа"
+   "Яркость"
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_VIDEO_HDR_PAPER_WHITE_NITS,
-   "После установки пиковой яркости используйте данный параметр в качестве стандартной регулировки яркости. Фактически, это устанавливает яркость белой бумаги для читаемости текста или яркость в верхней части SDR (стандартного динамического диапазона)."
+   "Задаёт уровень яркости HDR в нитах. Используйте в комбинации с физической яркостью экрана. В качестве начальной точки установите значение на 80 и яркость дисплея на максимум. Альтернативно, установите значение согласно максимуму нит экрана и снижайте яркость экрана до полу[...]"
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_HDR_EXPAND_GAMUT,
@@ -2444,7 +2476,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_VIDEO_HDR_EXPAND_GAMUT,
-   "Использует полный цветовой диапазон дисплея для получения более светлого и насыщенного изображения. Установите 'Точный' режим для цветопередачи, приближенной к оригинальному изображению игры."
+   "Использует полный цветовой диапазон экрана для получения более светлого и насыщенного изображения. Выберите 'Точный' режим для цветопередачи, приближенной к оригинальному изображению игры."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_HDR_EXPAND_GAMUT_ACCURATE,

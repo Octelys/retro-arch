@@ -1127,6 +1127,26 @@ MSG_HASH(
    "La contrasenya del teu compte d'emmagatzematge al núvol."
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_CLOUD_SYNC_ACCESS_KEY_ID,
+   "ID de la clau d'accés"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_CLOUD_SYNC_ACCESS_KEY_ID,
+   "La teva clau d'accés ID per l'emmagatzematge al núvol."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_CLOUD_SYNC_SECRET_ACCESS_KEY,
+   "Codi de la clau d'accés"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_CLOUD_SYNC_SECRET_ACCESS_KEY,
+   "El teu codi de la clau d'accés per l'emmagatzematge al núvol."
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_CLOUD_SYNC_S3_URL,
+   "El teu punt final d'adreça web S3 per emmagatzematge al núvol."
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_LOGGING_SETTINGS,
    "Registres"
    )
@@ -2407,12 +2427,20 @@ MSG_HASH(
    "Apagat"
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_MENU_HDR_BRIGHTNESS_NITS,
+   "Brillantor"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_MENU_HDR_BRIGHTNESS_NITS,
+   "Brillantor del menú en cd/m2 (nits) quan es fa servir una pantalla HDR. Només està disponible si s'ha activat l'opció HDR en el menú Configuració > Vídeo > HDR."
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_HDR_PAPER_WHITE_NITS,
-   "Luminància de blancs"
+   "Brillantor"
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_VIDEO_HDR_PAPER_WHITE_NITS,
-   "Quan hagis fixat la luminància màxima, es farà aquest valor per configurar la brillantor estàndard. Tècnicament, estableix la luminància amb el blanc d'un full de paper amb text llegible, o la luminància màxima del rang SDR."
+   "Selecciona el nivell de brillantor de HDR en nits. Es fa servir en combinació de la configuració de brillantor del teu monitor. Pots començar per seleccionar un valor de 80 i posar la brillantor del teu monitor al màxim. O també pots posar el valor màxim i ajustar la brillantor del teu monitor fins que es vegi bé."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_HDR_EXPAND_GAMUT,
