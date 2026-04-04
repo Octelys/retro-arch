@@ -126,5 +126,6 @@ FONTS
 WEBSOCKET SERVER (MSVC only – compiled as C++ to support OpenSSL 3.x headers)
 ============================================================ */
 #if defined(HAVE_WEBSOCKET_SERVER) && defined(_MSC_VER)
+#include "../network/game_state.c"
 #include "../network/ws_server.c"
 #endif
