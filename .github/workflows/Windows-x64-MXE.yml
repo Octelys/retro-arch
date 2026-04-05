@@ -52,7 +52,55 @@ jobs:
       id: slug
       run: echo "sha8=$(echo ${GITHUB_SHA} | cut -c1-8)" >> $GITHUB_OUTPUT
 
+    - name: Download companion assets
+      run: |
+        git clone --depth=1 https://github.com/libretro/retroarch-assets.git         assets-repo
+        git clone --depth=1 https://github.com/libretro/libretro-database.git        database-repo
+        git clone --depth=1 https://github.com/libretro/libretro-core-info.git       core-info-repo
+        git clone --depth=1 https://github.com/libretro/retroarch-joypad-autoconfig.git joypad-repo
+        git clone --depth=1 https://github.com/libretro/slang-shaders.git            slang-repo
+        git clone --depth=1 https://github.com/libretro/glsl-shaders.git             glsl-repo
+        git clone --depth=1 https://github.com/libretro/common-overlays.git          overlays-repo
+
+    - name: Bundle release
+      run: |
+        SHA=${{ steps.slug.outputs.sha8 }}
+        BUNDLE=retroarch-windows-x64-${SHA}
+
+        mkdir -p ${BUNDLE}
+        cp retroarch.exe ${BUNDLE}/RetroArch.exe
+
+        mkdir -p ${BUNDLE}/assets    && cp -r assets-repo/.    ${BUNDLE}/assets/
+        mkdir -p ${BUNDLE}/database  && cp -r database-repo/.  ${BUNDLE}/database/
+        mkdir -p ${BUNDLE}/info      && cp -r core-info-repo/. ${BUNDLE}/info/
+        mkdir -p ${BUNDLE}/autoconfig && cp -r joypad-repo/.   ${BUNDLE}/autoconfig/
+        mkdir -p ${BUNDLE}/shaders/slang && cp -r slang-repo/. ${BUNDLE}/shaders/slang/
+        mkdir -p ${BUNDLE}/shaders/glsl  && cp -r glsl-repo/.  ${BUNDLE}/shaders/glsl/
+        mkdir -p ${BUNDLE}/overlays  && cp -r overlays-repo/.  ${BUNDLE}/overlays/
+
+        zip -r ${BUNDLE}.zip ${BUNDLE}/
+
+    - name: Build installer
+      run: |
+        SHA=${{ steps.slug.outputs.sha8 }}
+        BUNDLE=retroarch-windows-x64-${SHA}
+
+        apt-get install -y nsis
+
+        makensis \
+          -DVERSION=${SHA} \
+          -DARCH=x64 \
+          -DBUNDLE_DIR=$(realpath ${BUNDLE}) \
+          pkg/windows/installer.nsi
+
+        mv pkg/windows/${BUNDLE}-installer.exe ${BUNDLE}-installer.exe
+
     - uses: actions/upload-artifact@v4
       with:
         name: retroarch-windows-x64-${{ steps.slug.outputs.sha8 }}
-        path: retroarch.exe
+        path: retroarch-windows-x64-${{ steps.slug.outputs.sha8 }}.zip
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: retroarch-windows-x64-${{ steps.slug.outputs.sha8 }}-installer
+        path: retroarch-windows-x64-${{ steps.slug.outputs.sha8 }}-installer.exe

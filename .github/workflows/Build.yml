@@ -23,9 +23,9 @@ jobs:
     name: macOS
     uses: ./.github/workflows/MacOS.yml
 
-  #build-windows-x64:
-  #  name: Windows x64 (MXE)
-  #  uses: ./.github/workflows/Windows-x64-MXE.yml
+  build-windows-x64:
+    name: Windows x64 (MXE)
+    uses: ./.github/workflows/Windows-x64-MXE.yml
 
   build-windows-arm64:
     name: Windows ARM64 (MSVC)
@@ -38,7 +38,7 @@ jobs:
     needs:
       - build-linux
       - build-macos
-      #- build-windows-x64
+      - build-windows-x64
       - build-windows-arm64
     defaults:
       run:

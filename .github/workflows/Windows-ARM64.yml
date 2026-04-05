@@ -108,6 +108,8 @@ jobs:
             /DBUNDLE_DIR="$(Resolve-Path $bundle)" `
             pkg\windows\installer.nsi
 
+          Move-Item "pkg\windows\$bundle-installer.exe" "$bundle-installer.exe"
+
       - uses: actions/upload-artifact@v4
         with:
           name: retroarch-windows-arm64-${{ steps.slug.outputs.sha8 }}-installer
