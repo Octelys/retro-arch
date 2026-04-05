@@ -53,8 +53,63 @@ jobs:
         shell: powershell
         run: echo "sha8=$('${{ github.sha }}'.Substring(0,8))"  >> $env:GITHUB_OUTPUT
 
-      - uses: actions/upload-artifact@v7
+      - name: Download companion assets
+        shell: bash
+        run: |
+          git clone --depth=1 https://github.com/libretro/retroarch-assets.git         assets-repo
+          git clone --depth=1 https://github.com/libretro/libretro-database.git        database-repo
+          git clone --depth=1 https://github.com/libretro/libretro-core-info.git       core-info-repo
+          git clone --depth=1 https://github.com/libretro/retroarch-joypad-autoconfig.git joypad-repo
+          git clone --depth=1 https://github.com/libretro/slang-shaders.git            slang-repo
+          git clone --depth=1 https://github.com/libretro/glsl-shaders.git             glsl-repo
+          git clone --depth=1 https://github.com/libretro/common-overlays.git          overlays-repo
+
+      - name: Bundle release
+        shell: powershell
+        run: |
+          $sha    = '${{ steps.slug.outputs.sha8 }}'
+          $bundle = "retroarch-windows-arm64-$sha"
+          $exe    = "pkg/msvc/${{ matrix.platform }}/${{ matrix.configuration }}/RetroArch-msvc${{ matrix.version }}.exe"
+
+          New-Item -ItemType Directory -Force $bundle | Out-Null
+          Copy-Item $exe "$bundle\RetroArch.exe"
+
+          foreach ($pair in @(
+            @{ src='assets-repo';   dst='assets'      },
+            @{ src='database-repo'; dst='database'    },
+            @{ src='core-info-repo';dst='info'        },
+            @{ src='joypad-repo';   dst='autoconfig'  },
+            @{ src='slang-repo';    dst='shaders\slang'},
+            @{ src='glsl-repo';     dst='shaders\glsl' },
+            @{ src='overlays-repo'; dst='overlays'    }
+          )) {
+            $dest = "$bundle\$($pair.dst)"
+            New-Item -ItemType Directory -Force $dest | Out-Null
+            Copy-Item -Path "$($pair.src)\*" -Destination $dest -Recurse -Force
+          }
+
+          Compress-Archive -Path $bundle -DestinationPath "$bundle.zip"
+
+      - name: Build installer
+        shell: powershell
+        run: |
+          $sha    = '${{ steps.slug.outputs.sha8 }}'
+          $bundle = "retroarch-windows-arm64-$sha"
+
+          # Install NSIS if not already present
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            choco install nsis --no-progress --yes
+            $env:PATH += ";C:\Program Files (x86)\NSIS"
+          }
+
+          makensis `
+            /DVERSION=$sha `
+            /DARCH=arm64 `
+            /DBUNDLE_DIR="$(Resolve-Path $bundle)" `
+            pkg\windows\installer.nsi
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: retroarch-${{ matrix.version }}-${{ matrix.configuration }}-${{ matrix.platform }}-${{ steps.slug.outputs.sha8 }}
-          path: |
-            pkg/msvc/${{ matrix.platform }}/${{ matrix.configuration }}/RetroArch-msvc${{ matrix.version }}.exe
+          name: retroarch-windows-arm64-${{ steps.slug.outputs.sha8 }}-installer
+          path: retroarch-windows-arm64-${{ steps.slug.outputs.sha8 }}-installer.exe
+
