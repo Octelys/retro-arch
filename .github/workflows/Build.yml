@@ -91,10 +91,9 @@ jobs:
           prerelease: ${{ fromJSON(steps.check.outputs.prerelease) }}
           tag_name: ${{ steps.check.outputs.version }}
           name: RetroArch ${{ steps.check.outputs.version }}
+          generate_release_notes: true
           body_path: ${{ github.workspace }}/CHECKSUMS.txt
           files: |
             ${{ github.workspace }}/**/*.exe
             ${{ github.workspace }}/**/*.zip
             ${{ github.workspace }}/**/*.tar.gz
-            ${{ github.workspace }}/**/*.app
-            ${{ github.workspace }}/**/*.dmg
