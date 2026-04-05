@@ -1,4 +1,4 @@
-name: CI Linux (i686)
+name: CI Linux (x86_64)
 
 on:
   push:
@@ -12,31 +12,71 @@ on:
 permissions:
   contents: read
 
-env:
-  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
-
 jobs:
   build:
-    runs-on: ubuntu-latest
-    container:
-      image: git.libretro.com:5050/libretro-infrastructure/libretro-build-i386-ubuntu:xenial-gcc9
-      options: --user root
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Check Out Repo
-        uses: taiki-e/checkout-action@v1
+      - uses: actions/checkout@v6
 
-      - name: Install libwebsockets
-        run: apt-get update && apt-get install -y libwebsockets-dev
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config \
+            libasound2-dev libpulse-dev libsdl2-dev \
+            libfreetype6-dev libx11-dev libxext-dev \
+            libxinerama-dev libxrandr-dev libxi-dev \
+            libxss-dev libxxf86vm-dev libxkbcommon-dev \
+            libudev-dev libgbm-dev libdrm-dev \
+            libgl1-mesa-dev libegl1-mesa-dev \
+            libvulkan-dev libwayland-dev wayland-protocols \
+            liblzma-dev libmbedtls-dev libflac-dev \
+            libass-dev libjack-jackd2-dev libv4l-dev \
+            libwebsockets-dev libfontconfig1-dev \
+            libdbus-1-dev zlib1g-dev \
+            libespeak-ng-dev
 
       - name: Configure Build
         run: |
-          ./configure --disable-qt --enable-xdelta
+          ./configure \
+            --disable-qt \
+            --enable-dbus \
+            HAVE_TRANSLATE=1 \
+            HAVE_ACCESSIBILITY=1
 
       - name: Compile RA
+        run: make -j$(getconf _NPROCESSORS_ONLN) HAVE_WEBSOCKET_SERVER=1
+
+      - name: Download companion assets
         run: |
-          make -j$(getconf _NPROCESSORS_ONLN) clean
-          make -j$(getconf _NPROCESSORS_ONLN) info all
+          git clone --depth=1 https://github.com/libretro/retroarch-assets.git        assets-repo
+          git clone --depth=1 https://github.com/libretro/libretro-database.git       database-repo
+          git clone --depth=1 https://github.com/libretro/libretro-core-info.git      core-info-repo
+          git clone --depth=1 https://github.com/libretro/retroarch-joypad-autoconfig.git joypad-repo
+          git clone --depth=1 https://github.com/libretro/slang-shaders.git           slang-repo
+          git clone --depth=1 https://github.com/libretro/glsl-shaders.git            glsl-repo
+          git clone --depth=1 https://github.com/libretro/common-overlays.git         overlays-repo
+
+      - name: Bundle release
+        run: |
+          SHA=$(echo ${GITHUB_SHA} | cut -c1-8)
+          BUNDLE=retroarch-linux-x86_64-${SHA}
+          mkdir -p ${BUNDLE}/assets ${BUNDLE}/database ${BUNDLE}/info \
+                   ${BUNDLE}/autoconfig ${BUNDLE}/shaders/slang \
+                   ${BUNDLE}/shaders/glsl ${BUNDLE}/overlays
+
+          cp retroarch ${BUNDLE}/
+
+          make -C assets-repo    install PREFIX=$(pwd)/${BUNDLE}/assets    2>/dev/null || cp -r assets-repo/.    ${BUNDLE}/assets/
+          make -C database-repo  install PREFIX=$(pwd)/${BUNDLE}/database  2>/dev/null || cp -r database-repo/.  ${BUNDLE}/database/
+          make -C core-info-repo install PREFIX=$(pwd)/${BUNDLE}/info      2>/dev/null || cp -r core-info-repo/. ${BUNDLE}/info/
+          make -C joypad-repo    install PREFIX=$(pwd)/${BUNDLE}/autoconfig 2>/dev/null || cp -r joypad-repo/.  ${BUNDLE}/autoconfig/
+          cp -r slang-repo/.    ${BUNDLE}/shaders/slang/
+          cp -r glsl-repo/.     ${BUNDLE}/shaders/glsl/
+          cp -r overlays-repo/. ${BUNDLE}/overlays/
+
+          tar -czf ${BUNDLE}.tar.gz ${BUNDLE}/
 
       - name: Get short SHA
         id: slug
@@ -44,5 +84,5 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: retroarch-linux-i686-${{ steps.slug.outputs.sha8 }}
-          path: retroarch
+          name: retroarch-linux-x86_64-${{ steps.slug.outputs.sha8 }}
+          path: retroarch-linux-x86_64-${{ steps.slug.outputs.sha8 }}.tar.gz
