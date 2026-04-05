@@ -38,30 +38,11 @@ jobs:
           make -j$(getconf _NPROCESSORS_ONLN) clean
           make -j$(getconf _NPROCESSORS_ONLN) info all
 
-      - name: Stage binary
-        run: cp retroarch /github/workspace/retroarch
-
-      - name: Cache binary for upload job
-        uses: actions/cache/save@v4
-        with:
-          path: /github/workspace/retroarch
-          key: linux-i686-binary-${{ github.run_id }}
-
-  upload:
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - name: Restore binary from cache
-        uses: actions/cache/restore@v4
-        with:
-          path: retroarch
-          key: linux-i686-binary-${{ github.run_id }}
-
       - name: Get short SHA
         id: slug
         run: echo "sha8=$(echo ${GITHUB_SHA} | cut -c1-8)" >> $GITHUB_OUTPUT
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v4
         with:
           name: retroarch-linux-i686-${{ steps.slug.outputs.sha8 }}
           path: retroarch
