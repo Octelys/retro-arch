@@ -38,8 +38,8 @@ jobs:
     needs:
       - build-linux
       - build-macos
-      - build-windows-x64
-      - build-windows-arm64
+      #- build-windows-x64
+      #- build-windows-arm64
     defaults:
       run:
         shell: bash
