@@ -26,6 +26,7 @@ jobs:
             build-essential pkg-config \
             libasound2-dev libpulse-dev libsdl2-dev \
             libfreetype6-dev libx11-dev libxext-dev \
+            libx11-xcb-dev \
             libxinerama-dev libxrandr-dev libxi-dev \
             libxss-dev libxxf86vm-dev libxkbcommon-dev \
             libudev-dev libgbm-dev libdrm-dev \
