@@ -1,4 +1,4 @@
-name: CI Windows x64 (MXE)
+name: CI Windows x64 (MinGW)
 
 on:
   push:
@@ -12,41 +12,40 @@ on:
 permissions:
   contents: read
 
-env:
-  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
-
 jobs:
   build:
-    runs-on: ubuntu-latest
-    container:
-      image: git.libretro.com:5050/libretro-infrastructure/libretro-build-mxe-win64-cross:gcc10
-      options: --user root
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: msys2 {0}
 
     steps:
-    - uses: taiki-e/checkout-action@v1
+    - uses: actions/checkout@v4
 
-    - name: Install MXE libwebsockets (optional)
-      run: |
-        if apt-get install -y mxe-x86-64-w64-mingw32.shared-libwebsockets; then
-          echo "MXE libwebsockets installed; staging into deps/libwebsockets/x64/"
-          mkdir -p deps/libwebsockets/include deps/libwebsockets/x64
-          cp /usr/lib/mxe/usr/x86_64-w64-mingw32.shared/include/libwebsockets.h deps/libwebsockets/include/ || true
-          cp /usr/lib/mxe/usr/x86_64-w64-mingw32.shared/lib/libwebsockets.dll.a deps/libwebsockets/x64/ 2>/dev/null || \
-            cp /usr/lib/mxe/usr/x86_64-w64-mingw32.shared/lib/libwebsockets.a deps/libwebsockets/x64/ 2>/dev/null || true
-        else
-          echo "MXE libwebsockets not available; building without WebSocket server support"
-        fi
+    - name: Set up MSYS2 / MinGW-w64 x86_64
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: >-
+          base-devel
+          git
+          zip
+          mingw-w64-x86_64-toolchain
+          mingw-w64-x86_64-pkg-config
+          mingw-w64-x86_64-SDL2
+          mingw-w64-x86_64-freetype
+          mingw-w64-x86_64-zlib
+          mingw-w64-x86_64-flac
+          mingw-w64-x86_64-mbedtls
+          mingw-w64-x86_64-libwebsockets
+
+    - name: Configure
+      run: ./configure --disable-qt
 
     - name: Compile RA
-      run: |
-        export MOC=/usr/lib/mxe/usr/x86_64-w64-mingw32.shared/qt5/bin/moc
-        ./configure --host=x86_64-w64-mingw32.shared
-        make clean
-        if [ -f deps/libwebsockets/x64/libwebsockets.dll.a ] || [ -f deps/libwebsockets/x64/libwebsockets.a ]; then
-          make -j$(getconf _NPROCESSORS_ONLN) HAVE_WEBSOCKET_SERVER=1
-        else
-          make -j$(getconf _NPROCESSORS_ONLN)
-        fi
+      run: make -j$(getconf _NPROCESSORS_ONLN) HAVE_WEBSOCKET_SERVER=1
 
     - name: Get short SHA
       id: slug
@@ -70,30 +69,34 @@ jobs:
         mkdir -p ${BUNDLE}
         cp retroarch.exe ${BUNDLE}/RetroArch.exe
 
-        mkdir -p ${BUNDLE}/assets    && cp -r assets-repo/.    ${BUNDLE}/assets/
-        mkdir -p ${BUNDLE}/database  && cp -r database-repo/.  ${BUNDLE}/database/
-        mkdir -p ${BUNDLE}/info      && cp -r core-info-repo/. ${BUNDLE}/info/
-        mkdir -p ${BUNDLE}/autoconfig && cp -r joypad-repo/.   ${BUNDLE}/autoconfig/
-        mkdir -p ${BUNDLE}/shaders/slang && cp -r slang-repo/. ${BUNDLE}/shaders/slang/
-        mkdir -p ${BUNDLE}/shaders/glsl  && cp -r glsl-repo/.  ${BUNDLE}/shaders/glsl/
-        mkdir -p ${BUNDLE}/overlays  && cp -r overlays-repo/.  ${BUNDLE}/overlays/
+        mkdir -p ${BUNDLE}/assets       && cp -r assets-repo/.    ${BUNDLE}/assets/
+        mkdir -p ${BUNDLE}/database     && cp -r database-repo/.  ${BUNDLE}/database/
+        mkdir -p ${BUNDLE}/info         && cp -r core-info-repo/. ${BUNDLE}/info/
+        mkdir -p ${BUNDLE}/autoconfig   && cp -r joypad-repo/.    ${BUNDLE}/autoconfig/
+        mkdir -p ${BUNDLE}/shaders/slang && cp -r slang-repo/.    ${BUNDLE}/shaders/slang/
+        mkdir -p ${BUNDLE}/shaders/glsl  && cp -r glsl-repo/.     ${BUNDLE}/shaders/glsl/
+        mkdir -p ${BUNDLE}/overlays     && cp -r overlays-repo/.  ${BUNDLE}/overlays/
 
         zip -r ${BUNDLE}.zip ${BUNDLE}/
 
     - name: Build installer
+      shell: powershell
       run: |
-        SHA=${{ steps.slug.outputs.sha8 }}
-        BUNDLE=retroarch-windows-x64-${SHA}
+        $sha    = '${{ steps.slug.outputs.sha8 }}'
+        $bundle = "retroarch-windows-x64-$sha"
 
-        apt-get install -y nsis
+        if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+          choco install nsis --no-progress --yes
+          $env:PATH += ";C:\Program Files (x86)\NSIS"
+        }
 
-        makensis \
-          -DVERSION=${SHA} \
-          -DARCH=x64 \
-          -DBUNDLE_DIR=$(realpath ${BUNDLE}) \
-          pkg/windows/installer.nsi
+        makensis `
+          /DVERSION=$sha `
+          /DARCH=x64 `
+          /DBUNDLE_DIR="$(Resolve-Path $bundle)" `
+          pkg\windows\installer.nsi
 
-        mv pkg/windows/${BUNDLE}-installer.exe ${BUNDLE}-installer.exe
+        Move-Item "pkg\windows\$bundle-installer.exe" "$bundle-installer.exe"
 
     - uses: actions/upload-artifact@v4
       with:

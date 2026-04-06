@@ -12,9 +12,6 @@ on:
 permissions:
   contents: read
 
-env:
-  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
-
 jobs:
   msvc:
     runs-on: windows-11-arm
@@ -26,10 +23,19 @@ jobs:
         platform: [ARM64]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Add msbuild to PATH
-        uses: microsoft/setup-msbuild@v1
+        uses: microsoft/setup-msbuild@v2
+
+      # Cache vcpkg binary artefacts so OpenSSL/libwebsockets are not rebuilt every run
+      - name: Cache vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: vcpkg-arm64-windows-${{ hashFiles('**/vcpkg.json') }}-v1
+          restore-keys: |
+            vcpkg-arm64-windows-
 
       - name: Install libwebsockets (vcpkg)
         shell: powershell
@@ -75,20 +81,21 @@ jobs:
           Copy-Item $exe "$bundle\RetroArch.exe"
 
           foreach ($pair in @(
-            @{ src='assets-repo';   dst='assets'      },
-            @{ src='database-repo'; dst='database'    },
-            @{ src='core-info-repo';dst='info'        },
-            @{ src='joypad-repo';   dst='autoconfig'  },
+            @{ src='assets-repo';   dst='assets'       },
+            @{ src='database-repo'; dst='database'     },
+            @{ src='core-info-repo';dst='info'         },
+            @{ src='joypad-repo';   dst='autoconfig'   },
             @{ src='slang-repo';    dst='shaders\slang'},
             @{ src='glsl-repo';     dst='shaders\glsl' },
-            @{ src='overlays-repo'; dst='overlays'    }
+            @{ src='overlays-repo'; dst='overlays'     }
           )) {
             $dest = "$bundle\$($pair.dst)"
             New-Item -ItemType Directory -Force $dest | Out-Null
             Copy-Item -Path "$($pair.src)\*" -Destination $dest -Recurse -Force
           }
 
-          Compress-Archive -Path $bundle -DestinationPath "$bundle.zip"
+          # 7z is preinstalled on GitHub runners and is much faster than Compress-Archive
+          7z a -tzip -mx=1 "$bundle.zip" $bundle\
 
       - name: Build installer
         shell: powershell
@@ -96,7 +103,6 @@ jobs:
           $sha    = '${{ steps.slug.outputs.sha8 }}'
           $bundle = "retroarch-windows-arm64-$sha"
 
-          # Install NSIS if not already present
           if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
             choco install nsis --no-progress --yes
             $env:PATH += ";C:\Program Files (x86)\NSIS"
@@ -112,6 +118,10 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
+          name: retroarch-windows-arm64-${{ steps.slug.outputs.sha8 }}
+          path: retroarch-windows-arm64-${{ steps.slug.outputs.sha8 }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
           name: retroarch-windows-arm64-${{ steps.slug.outputs.sha8 }}-installer
           path: retroarch-windows-arm64-${{ steps.slug.outputs.sha8 }}-installer.exe
-
