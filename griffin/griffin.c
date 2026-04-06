@@ -641,6 +641,7 @@ INPUT
 #ifdef HAVE_WINRAWINPUT
 /* winraw only available since XP */
 #include "../input/drivers/winraw_input.c"
+#include "../input/drivers_joypad/winraw_joypad.c"
 #endif
 #endif
 
@@ -1694,8 +1695,6 @@ ANDROID PLAY FEATURE DELIVERY
 FFMPEG
 ============================================================ */
 #ifdef HAVE_FFMPEG
-#include "../cores/libretro-ffmpeg/packet_buffer.c"
-#include "../cores/libretro-ffmpeg/video_buffer.c"
 #include "../libretro-common/rthreads/tpool.c"
 #endif
 

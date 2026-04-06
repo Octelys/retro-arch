@@ -2200,16 +2200,14 @@ static bool core_info_does_support_file(
    const char *ext;
    if (!core || !core->supported_extensions_list)
       return false;
-   if (string_is_empty(path))
+   if (!path || !*path)
       return false;
    ext = strrchr(path, '.');
    if (!ext)
-   {
-      size_t len = strlen(path);
-      return len > 0 && path[len - 1] == '/'
-         && string_list_find_elem(core->supported_extensions_list, "/");
-   }
-   return string_list_find_elem(core->supported_extensions_list, ext);
+      return string_list_find_elem(core->supported_extensions_list, "/");
+   if (!ext[1])
+      return false;
+   return string_list_find_elem(core->supported_extensions_list, ext + 1);
 }
 
 /* qsort_r() is not in standard C, sadly. */

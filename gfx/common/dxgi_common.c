@@ -187,7 +187,7 @@ DXGI_FORMAT* dxgi_get_format_fallback_list(DXGI_FORMAT format)
          { \
             for (j = 0; j < width; j++) \
             { \
-               unsigned r, g, b, a; \
+               unsigned r = 0, g = 0, b = 0, a = 0; \
                src_type src_val = *src_ptr++; \
                if (src_rb) \
                { \
@@ -682,6 +682,7 @@ void dxgi_set_hdr_metadata(
       float                         max_fall
 )
 {
+   /* TODO/FIXME - static globals - not thread-safe */
    static DXGI_HDR_METADATA_HDR10 g_hdr10_meta_data = {0};
    static const display_chromaticities_t
       display_chromaticity_list[]                   =
