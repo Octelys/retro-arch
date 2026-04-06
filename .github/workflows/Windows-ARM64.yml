@@ -1,10 +1,7 @@
 name: CI Windows ARM64 (MSVC)
 
 on:
-  push:
-    branches:
-      - main
-  #pull_request:
+  pull_request:
   repository_dispatch:
     types: [run_build]
   workflow_call:
