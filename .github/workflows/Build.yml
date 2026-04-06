@@ -157,11 +157,15 @@ jobs:
         run: |
           : Generate Checksums
           if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
-          shopt -s extglob
 
           echo "### Checksums" > ${{ github.workspace }}/CHECKSUMS.txt
-          for file in **/@(*.exe|*.tar.gz|*.zip); do
-            echo "    ${file##*/}: $(sha256sum \"${file}\" | cut -d ' ' -f 1)" >> ${{ github.workspace }}/CHECKSUMS.txt
+          for file in \
+              retroarch-macos/retroarch-macos.zip \
+              retroarch-linux-x86_64/retroarch-linux-x86_64.tar.gz \
+              retroarch-windows-x64/retroarch-windows-x64.zip \
+              retroarch-windows-x64-installer/retroarch-windows-x64-installer.exe; do
+            [[ -f "$file" ]] || continue
+            echo "    ${file##*/}: $(sha256sum "$file" | cut -d ' ' -f 1)" >> ${{ github.workspace }}/CHECKSUMS.txt
           done
 
       - name: Create GitHub Release
@@ -175,6 +179,7 @@ jobs:
           generate_release_notes: true
           body_path: ${{ github.workspace }}/CHECKSUMS.txt
           files: |
-            ${{ github.workspace }}/**/*.exe
-            ${{ github.workspace }}/**/*.zip
-            ${{ github.workspace }}/**/*.tar.gz
+            retroarch-macos/retroarch-macos.zip
+            retroarch-linux-x86_64/retroarch-linux-x86_64.tar.gz
+            retroarch-windows-x64/retroarch-windows-x64.zip
+            retroarch-windows-x64-installer/retroarch-windows-x64-installer.exe

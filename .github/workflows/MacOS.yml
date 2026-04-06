@@ -43,5 +43,5 @@ jobs:
 
     - uses: actions/upload-artifact@v4
       with:
-        name: retroarch-macos-${{ steps.slug.outputs.sha8 }}
+        name: retroarch-macos
         path: retroarch-macos-${{ steps.slug.outputs.sha8 }}.zip

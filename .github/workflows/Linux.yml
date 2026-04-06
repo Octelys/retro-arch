@@ -55,5 +55,5 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: retroarch-linux-x86_64-${{ steps.slug.outputs.sha8 }}
+          name: retroarch-linux-x86_64
           path: retroarch-linux-x86_64-${{ steps.slug.outputs.sha8 }}.tar.gz
