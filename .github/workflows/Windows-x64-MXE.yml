@@ -54,6 +54,13 @@ jobs:
         BUNDLE=retroarch-windows-x64-${SHA}
         mkdir -p ${BUNDLE}
         cp retroarch.exe ${BUNDLE}/RetroArch.exe
+
+        # Bundle libwebsockets DLL so the binary runs without a separate install.
+        # MinGW installs it under /mingw64/bin/
+        for dll in /mingw64/bin/libwebsockets*.dll; do
+          [[ -f "$dll" ]] && cp "$dll" ${BUNDLE}/
+        done
+
         zip -r ${BUNDLE}.zip ${BUNDLE}/
 
     - name: Build installer

@@ -47,6 +47,16 @@ jobs:
           BUNDLE=retroarch-linux-x86_64-${SHA}
           mkdir -p ${BUNDLE}
           cp retroarch ${BUNDLE}/
+
+          # Bundle libwebsockets shared library so the binary runs without
+          # requiring the user to install it separately.
+          LWS_SO=$(ldconfig -p | awk '/libwebsockets\.so/{print $NF}' | head -1)
+          if [[ -n "$LWS_SO" ]]; then
+            cp "$LWS_SO" ${BUNDLE}/
+            # Also copy any versioned symlink targets (e.g. libwebsockets.so.19)
+            cp "${LWS_SO}"* ${BUNDLE}/ 2>/dev/null || true
+          fi
+
           tar -czf ${BUNDLE}.tar.gz ${BUNDLE}/
 
       - name: Get short SHA
