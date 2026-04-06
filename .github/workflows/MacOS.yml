@@ -28,40 +28,6 @@ jobs:
         set -o pipefail
         xcodebuild -workspace pkg/apple/RetroArch.xcworkspace -scheme RetroArch -config Release -xcconfig pkg/apple/GitHubCI.xcconfig -derivedDataPath build
 
-#    - name: Download companion assets
-#      run: |
-#        git clone --depth=1 https://github.com/libretro/retroarch-assets.git         assets-repo
-#        git clone --depth=1 https://github.com/libretro/libretro-database.git        database-repo
-#        git clone --depth=1 https://github.com/libretro/libretro-core-info.git       core-info-repo
-#        git clone --depth=1 https://github.com/libretro/retroarch-joypad-autoconfig.git joypad-repo
-#        git clone --depth=1 https://github.com/libretro/slang-shaders.git            slang-repo
-#        git clone --depth=1 https://github.com/libretro/glsl-shaders.git             glsl-repo
-#        git clone --depth=1 https://github.com/libretro/common-overlays.git          overlays-repo
-#
-#    - name: Bundle release
-#      run: |
-#        SHA=$(echo ${GITHUB_SHA} | cut -c1-8)
-#        BUNDLE=retroarch-macos-${SHA}
-#        APP=build/Build/Products/Release/RetroArch.app
-#        mkdir -p ${BUNDLE}
-#
-#        cp -r ${APP} ${BUNDLE}/
-#
-#        RESOURCES=${BUNDLE}/RetroArch.app/Contents/Resources
-#        mkdir -p ${RESOURCES}/assets ${RESOURCES}/database ${RESOURCES}/info \
-#                 ${RESOURCES}/autoconfig ${RESOURCES}/shaders/slang \
-#                 ${RESOURCES}/shaders/glsl ${RESOURCES}/overlays
-#
-#        make -C assets-repo    install PREFIX=$(pwd)/${RESOURCES}/assets    2>/dev/null || cp -r assets-repo/.    ${RESOURCES}/assets/
-#        make -C database-repo  install PREFIX=$(pwd)/${RESOURCES}/database  2>/dev/null || cp -r database-repo/.  ${RESOURCES}/database/
-#        make -C core-info-repo install PREFIX=$(pwd)/${RESOURCES}/info      2>/dev/null || cp -r core-info-repo/. ${RESOURCES}/info/
-#        make -C joypad-repo    install PREFIX=$(pwd)/${RESOURCES}/autoconfig 2>/dev/null || cp -r joypad-repo/.  ${RESOURCES}/autoconfig/
-#        cp -r slang-repo/.    ${RESOURCES}/shaders/slang/
-#        cp -r glsl-repo/.     ${RESOURCES}/shaders/glsl/
-#        cp -r overlays-repo/. ${RESOURCES}/overlays/
-#
-#        zip -r ${BUNDLE}.zip ${BUNDLE}/
-
     - name: Get short SHA
       id: slug
       run: echo "sha8=$(echo ${GITHUB_SHA} | cut -c1-8)" >> $GITHUB_OUTPUT
@@ -77,5 +43,5 @@ jobs:
 
     - uses: actions/upload-artifact@v4
       with:
-        name: RetroArch-macos-${{ steps.slug.outputs.sha8 }}
+        name: retroarch-macos-${{ steps.slug.outputs.sha8 }}
         path: retroarch-macos-${{ steps.slug.outputs.sha8 }}.zip
