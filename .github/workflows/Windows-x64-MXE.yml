@@ -1,7 +1,7 @@
 name: CI Windows x64 (MXE)
 
 on:
-  push:
+  #push:
   pull_request:
   repository_dispatch:
     types: [run_build]

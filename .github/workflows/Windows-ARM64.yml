@@ -1,7 +1,7 @@
 name: CI Windows ARM64 (MSVC)
 
 on:
-  push:
+  #push:
   pull_request:
   repository_dispatch:
     types: [run_build]

@@ -1,7 +1,7 @@
 name: CI Linux (i686)
 
 on:
-  push:
+  #push:
   pull_request:
   repository_dispatch:
     types: [run_build]
