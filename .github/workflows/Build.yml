@@ -127,11 +127,29 @@ jobs:
         run: |
           : Rename artifacts to versioned names
           if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
-          shopt -s extglob
-          VERSION="${{ steps.ver.outputs.version }}"
-          for f in **/retroarch-macos-*.zip; do
-            dir=$(dirname "$f")
-            mv "$f" "${dir}/retroarch-macos-${VERSION}.zip"
+
+          # macOS zip → retroarch-macos.zip
+          for f in **/RetroArch-macos-*.zip **/retroarch-macos-*.zip; do
+            [[ -f "$f" ]] || continue
+            mv "$f" "$(dirname "$f")/retroarch-macos.zip"
+          done
+
+          # Linux tarball → retroarch-linux-x86_64.tar.gz
+          for f in **/retroarch-linux-x86_64-*.tar.gz; do
+            [[ -f "$f" ]] || continue
+            mv "$f" "$(dirname "$f")/retroarch-linux-x86_64.tar.gz"
+          done
+
+          # Windows zip → retroarch-windows-x64.zip
+          for f in **/retroarch-windows-x64-*.zip; do
+            [[ -f "$f" ]] || continue
+            mv "$f" "$(dirname "$f")/retroarch-windows-x64.zip"
+          done
+
+          # Windows installer → retroarch-windows-x64-installer.exe
+          for f in **/retroarch-windows-x64-*-installer.exe; do
+            [[ -f "$f" ]] || continue
+            mv "$f" "$(dirname "$f")/retroarch-windows-x64-installer.exe"
           done
 
       - name: Generate Checksums
