@@ -1,0 +1,99 @@
+# Tracks upstream libretro/RetroArch releases and creates a matching branch
+# in this fork for each new release.
+#
+# When a new release is published upstream (e.g. v1.23.0) this workflow:
+#   1. Resolves the commit SHA that the release tag points to.
+#   2. Checks whether branch retroarch-releases/v1.23.0 already exists in the fork.
+#   3. If not, creates and pushes the branch at that exact commit.
+#
+# The resulting branch can then be used as a base for cherry-picks or as the
+# starting point for a new fork release.
+
+name: Release Branch Sync
+
+on:
+  schedule:
+    - cron: '0 7 * * *'   # every day at 07:00 UTC (1 hour after upstream-sync)
+  workflow_dispatch:        # allow manual trigger from the GitHub Actions UI
+    inputs:
+      tag:
+        description: 'Upstream release tag to sync (e.g. v1.23.0). Leave empty to use the latest release.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  sync-release-branch:
+    name: Create branch for upstream release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve target upstream release tag
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          INPUT_TAG="${{ github.event.inputs.tag }}"
+
+          if [[ -n "$INPUT_TAG" ]]; then
+            TAG="$INPUT_TAG"
+            echo "Using manually supplied tag: $TAG"
+          else
+            TAG=$(gh api repos/libretro/RetroArch/releases/latest \
+                    --jq '.tag_name')
+            echo "Latest upstream release tag: $TAG"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Add upstream remote and fetch release tag
+        run: |
+          git remote add upstream https://github.com/libretro/RetroArch.git
+          git fetch upstream "refs/tags/${{ steps.release.outputs.tag }}:refs/tags/upstream/${{ steps.release.outputs.tag }}" \
+            --no-tags
+
+      - name: Resolve release commit SHA
+        id: commit
+        run: |
+          # A release tag may be a lightweight tag (commit) or an annotated tag
+          # (tag object). ^{commit} dereferences either to the underlying commit.
+          SHA=$(git rev-parse "upstream/${{ steps.release.outputs.tag }}^{commit}")
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Release ${{ steps.release.outputs.tag }} → $SHA"
+
+      - name: Check whether branch already exists in fork
+        id: exists
+        run: |
+          BRANCH="retroarch-releases/${{ steps.release.outputs.tag }}"
+          if git ls-remote --exit-code origin "refs/heads/${BRANCH}" > /dev/null 2>&1; then
+            echo "Branch '${BRANCH}' already exists in the fork. Nothing to do."
+            echo "branch_exists=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "Branch '${BRANCH}' does not exist yet."
+            echo "branch_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create and push release branch
+        if: steps.exists.outputs.branch_exists == 'false'
+        run: |
+          BRANCH="retroarch-releases/${{ steps.release.outputs.tag }}"
+          SHA="${{ steps.commit.outputs.sha }}"
+
+          git branch "$BRANCH" "$SHA"
+          git push origin "$BRANCH"
+          echo "✅ Pushed branch '${BRANCH}' at ${SHA}"
+
