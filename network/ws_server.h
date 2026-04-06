@@ -48,6 +48,40 @@ bool ws_server_init(unsigned port);
  */
 void ws_server_destroy(void);
 
+/**
+ * ws_server_notify_game_changed:
+ *
+ * Broadcasts the current game state (obtained from game_state_to_json())
+ * followed immediately by the achievements list to all connected WebSocket
+ * clients.  Both messages are sent asynchronously by the background service
+ * thread; this function returns immediately.
+ *
+ * Call this whenever the active game changes (start or stop).  Safe to call
+ * from any thread while the server is running; no-op when the server is not
+ * initialised.
+ */
+void ws_server_notify_game_changed(void);
+
+/**
+ * ws_server_notify_achievements_changed:
+ *
+ * Broadcasts the updated achievements list to all connected WebSocket
+ * clients.  Call this when an achievement is unlocked.  Safe to call
+ * from any thread while the server is running.
+ */
+void ws_server_notify_achievements_changed(void);
+
+/**
+ * ws_server_notify_user_changed:
+ *
+ * Broadcasts the current RA user info (username, display name, score,
+ * avatar URL) to all connected WebSocket clients.  Call this after a
+ * successful RetroAchievements login.  Safe to call from any thread
+ * while the server is running.
+ */
+void ws_server_notify_user_changed(void);
+
+
 #ifdef __cplusplus
 }
 #endif

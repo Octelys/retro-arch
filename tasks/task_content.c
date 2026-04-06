@@ -106,6 +106,7 @@
 #include "../network/presence.h"
 #endif
 
+
 #define MAX_ARGS 32
 
 typedef struct content_stream content_stream_t;
@@ -1280,6 +1281,7 @@ static bool content_file_load(
 
       return false;
    }
+
 
 #ifdef HAVE_CHEEVOS
    if (!special)

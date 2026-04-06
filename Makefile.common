@@ -2963,6 +2963,7 @@ endif
 ifeq ($(HAVE_WEBSOCKET_SERVER), 1)
    DEFINES += -DHAVE_WEBSOCKET_SERVER
    OBJ     += network/ws_server.o
+   OBJ     += network/game_state.o
 
    ifneq ($(findstring Win32,$(OS)),)
       # Windows x64 / ARM64 – headers and import-lib live under

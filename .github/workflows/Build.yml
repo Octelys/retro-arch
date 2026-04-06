@@ -1,0 +1,164 @@
+name: Build
+run-name: ${{ github.ref_name }} build run
+
+on:
+  push:
+    tags:
+      - '*'
+    branches:
+      - main
+  repository_dispatch:
+    types: [run_build]
+
+permissions:
+  contents: write
+
+jobs:
+
+  build-linux:
+    name: Linux (i686)
+    uses: ./.github/workflows/Linux.yml
+
+  build-macos:
+    name: macOS
+    uses: ./.github/workflows/MacOS.yml
+
+  build-windows-x64:
+    name: Windows x64 (MXE)
+    uses: ./.github/workflows/Windows-x64-MXE.yml
+
+  #build-windows-arm64:
+  #  name: Windows ARM64 (MSVC)
+  #  uses: ./.github/workflows/Windows-ARM64.yml
+
+  create-release:
+    name: Create Release
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    needs:
+      #- build-linux
+      - build-macos
+      #- build-windows-x64
+      #- build-windows-arm64
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check Release Tag
+        id: check
+        run: |
+          : Check Release Tag
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+          shopt -s extglob
+
+          # Accept any non-empty tag — the fork uses free-form tags like
+          # "octelys.1" whose version is built by combining with the
+          # upstream RA release number.  Pre-release is flagged by the
+          # presence of -beta or -rc anywhere in the tag.
+          TAG="${GITHUB_REF_NAME}"
+          if [[ -z "$TAG" ]]; then
+            echo 'validTag=false' >> $GITHUB_OUTPUT
+          else
+            echo 'validTag=true' >> $GITHUB_OUTPUT
+            if [[ "$TAG" =~ -[bB]eta|-[rR][cC] ]]; then
+              echo 'prerelease=true' >> $GITHUB_OUTPUT
+            else
+              echo 'prerelease=false' >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Checkout repository
+        if: fromJSON(steps.check.outputs.validTag)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve upstream RetroArch version from git history
+        id: upstream
+        if: fromJSON(steps.check.outputs.validTag)
+        run: |
+          : Resolve upstream RetroArch version from git history
+          # Add upstream remote and fetch all release tags
+          git remote add upstream https://github.com/libretro/RetroArch.git
+          git fetch upstream 'refs/tags/v*:refs/tags/upstream-v*' --no-tags 2>/dev/null || true
+
+          # Find the most recent upstream tag that is an ancestor of HEAD.
+          # This tells us exactly which RA release main was rebased onto.
+          RA_TAG=$(git tag --list 'upstream-v*' --sort=-version:refname \
+                   | while read -r t; do
+                       if git merge-base --is-ancestor "$t" HEAD 2>/dev/null; then
+                         echo "$t"
+                         break
+                       fi
+                     done)
+
+          # Strip the 'upstream-' prefix we added during fetch, then strip 'v'
+          RA_TAG="${RA_TAG#upstream-}"
+          RA_VERSION="${RA_TAG#v}"
+
+          if [[ -z "$RA_VERSION" ]]; then
+            echo "::warning::Could not determine upstream RA version from git history. Falling back to API."
+            RA_VERSION=$(curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ github.token }}" \
+              https://api.github.com/repos/libretro/RetroArch/releases/latest \
+              | jq -r '.tag_name // empty' | sed 's/^v//')
+          fi
+
+          echo "ra_version=${RA_VERSION}" >> $GITHUB_OUTPUT
+          echo "Detected upstream RA version: ${RA_VERSION}"
+
+      - name: Build combined version string
+        id: ver
+        if: fromJSON(steps.check.outputs.validTag)
+        run: |
+          : Build combined version string
+          MY_TAG="${GITHUB_REF_NAME}"
+          RA="${{ steps.upstream.outputs.ra_version }}"
+          COMBINED="${RA}-${MY_TAG}"
+          echo "version=${COMBINED}" >> $GITHUB_OUTPUT
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        if: fromJSON(steps.check.outputs.validTag)
+        id: download
+
+      - name: Rename artifacts to versioned names
+        if: fromJSON(steps.check.outputs.validTag)
+        run: |
+          : Rename artifacts to versioned names
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+          shopt -s extglob
+          VERSION="${{ steps.ver.outputs.version }}"
+          for f in **/retroarch-macos-*.zip; do
+            dir=$(dirname "$f")
+            mv "$f" "${dir}/retroarch-macos-${VERSION}.zip"
+          done
+
+      - name: Generate Checksums
+        if: fromJSON(steps.check.outputs.validTag)
+        run: |
+          : Generate Checksums
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+          shopt -s extglob
+
+          echo "### Checksums" > ${{ github.workspace }}/CHECKSUMS.txt
+          for file in **/@(*.exe|*.tar.gz|*.zip); do
+            echo "    ${file##*/}: $(sha256sum \"${file}\" | cut -d ' ' -f 1)" >> ${{ github.workspace }}/CHECKSUMS.txt
+          done
+
+      - name: Create GitHub Release
+        if: fromJSON(steps.check.outputs.validTag)
+        uses: softprops/action-gh-release@9d7c94cfd0a1f3ed45544c887983e9fa900f0564
+        with:
+          draft: false
+          prerelease: ${{ fromJSON(steps.check.outputs.prerelease) }}
+          tag_name: ${{ github.ref_name }}
+          name: RetroArch ${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          body_path: ${{ github.workspace }}/CHECKSUMS.txt
+          files: |
+            ${{ github.workspace }}/**/*.exe
+            ${{ github.workspace }}/**/*.zip
+            ${{ github.workspace }}/**/*.tar.gz
