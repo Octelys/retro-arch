@@ -1,7 +1,7 @@
 name: CI macOS
 
 on:
-  pull_request:
+  #pull_request:
   workflow_call:
 
 permissions:
@@ -65,6 +65,15 @@ jobs:
     - name: Get short SHA
       id: slug
       run: echo "sha8=$(echo ${GITHUB_SHA} | cut -c1-8)" >> $GITHUB_OUTPUT
+
+    - name: Bundle release
+      run: |
+        SHA=${{ steps.slug.outputs.sha8 }}
+        BUNDLE=retroarch-macos-${SHA}
+        APP=build/Build/Products/Release/RetroArch.app
+        mkdir -p ${BUNDLE}
+        cp -r ${APP} ${BUNDLE}/
+        zip -r ${BUNDLE}.zip ${BUNDLE}/
 
     - uses: actions/upload-artifact@v4
       with:
