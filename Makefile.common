@@ -347,9 +347,7 @@ OBJ += \
        $(LIBRETRO_COMM_DIR)/queues/message_queue.o
 
 ifeq ($(HAVE_MENU), 1)
-   OBJ += \
-       gfx/gfx_thumbnail_path.o \
-       gfx/gfx_thumbnail.o
+   OBJ += gfx/gfx_thumbnail.o
 endif
 
 ifeq ($(HAVE_MICROPHONE), 1)
@@ -1238,8 +1236,8 @@ endif
 
 ifeq ($(TARGET), retroarch_orbis)
    OBJ +=  input/drivers/ps4_input.o \
-			  input/drivers_joypad/ps4_joypad.o \
-			  audio/drivers/psp_audio.o
+	   input/drivers_joypad/ps4_joypad.o \
+	   audio/drivers/psp_audio.o
 endif
 
 ifeq ($(TARGET), retroarch_vita)
@@ -1460,6 +1458,7 @@ ifneq ($(findstring Win32,$(OS)),)
 ifeq ($(HAVE_WINRAWINPUT), 1)
    DEFINES += -DHAVE_WINRAWINPUT
    OBJ     += input/drivers/winraw_input.o
+   OBJ     += input/drivers_joypad/winraw_joypad.o
 endif
 endif
 
@@ -1886,8 +1885,6 @@ ifeq ($(HAVE_SLANG),1)
    DEFINES += -DHAVE_SLANG
    OBJ += gfx/drivers_shader/slang_process.o
    OBJ += gfx/drivers_shader/glslang_util.o
-   OBJ += gfx/drivers_shader/glslang_util_cxx.o
-   OBJ += gfx/drivers_shader/slang_reflection.o
 endif
 
 ifeq ($(HAVE_SHADERS_COMMON), 1)
@@ -2569,8 +2566,6 @@ endif
 ifeq ($(HAVE_FFMPEG), 1)
    OBJ += record/drivers/record_ffmpeg.o \
           cores/libretro-ffmpeg/ffmpeg_core.o \
-          cores/libretro-ffmpeg/packet_buffer.o \
-          cores/libretro-ffmpeg/video_buffer.o \
           $(LIBRETRO_COMM_DIR)/rthreads/tpool.o
 
    LIBS += $(AVCODEC_LIBS) $(AVFORMAT_LIBS) $(AVUTIL_LIBS) $(SWSCALE_LIBS) $(SWRESAMPLE_LIBS) $(FFMPEG_LIBS) $(AVDEVICE_LIBS)

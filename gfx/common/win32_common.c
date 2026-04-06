@@ -328,32 +328,29 @@ static INT_PTR_COMPAT CALLBACK pick_core_proc(
       WPARAM wParam, LPARAM lParam)
 {
    size_t list_size;
-   core_info_list_t *core_info_list = NULL;
-   const core_info_t *core_info     = NULL;
 
    switch (message)
    {
       case WM_INITDIALOG:
          {
-            HWND hwndList;
-            unsigned i;
-
+            const core_info_t *core_info     = NULL;
+            core_info_list_t *core_info_list = NULL;
             /* Add items to list. */
             core_info_get_list(&core_info_list);
             core_info_list_get_supported_cores(core_info_list,
                   path_get(RARCH_PATH_CONTENT), &core_info, &list_size);
-
-            hwndList = GetDlgItem(hDlg, ID_CORELISTBOX);
-
-            for (i = 0; i < list_size; i++)
-               SendMessage(hwndList, LB_ADDSTRING, 0,
-                     (LPARAM)core_info[i].display_name);
-
-            /* Select the first item in the list */
-            SendMessage(hwndList, LB_SETCURSEL, 0, 0);
-            path_set(RARCH_PATH_CORE, core_info[0].path);
-
-            SetFocus(hwndList);
+            if (list_size != 0)
+            {
+               size_t i;
+               HWND hwndList = GetDlgItem(hDlg, ID_CORELISTBOX);
+               for (i = 0; i < list_size; i++)
+                  SendMessage(hwndList, LB_ADDSTRING, 0,
+                        (LPARAM)core_info[i].display_name);
+               /* Select the first item in the list */
+               SendMessage(hwndList, LB_SETCURSEL, 0, 0);
+               path_set(RARCH_PATH_CORE, core_info[0].path);
+               SetFocus(hwndList);
+            }
             return TRUE;
          }
 
@@ -369,13 +366,18 @@ static INT_PTR_COMPAT CALLBACK pick_core_proc(
                {
                   case LBN_SELCHANGE:
                      {
+                        const core_info_t *core_info     = NULL;
+                        core_info_list_t *core_info_list = NULL;
                         HWND hwndList = GetDlgItem(hDlg, ID_CORELISTBOX);
                         int lbItem    = (int)
                            SendMessage(hwndList, LB_GETCURSEL, 0, 0);
 
                         core_info_get_list(&core_info_list);
                         core_info_list_get_supported_cores(core_info_list,
-                              path_get(RARCH_PATH_CONTENT), &core_info, &list_size);
+                              path_get(RARCH_PATH_CONTENT), &core_info,
+                              &list_size);
+                        if (lbItem < 0 || (size_t)lbItem >= list_size)
+                           break;
                         path_set(RARCH_PATH_CORE, core_info[lbItem].path);
                      }
                      break;
@@ -391,7 +393,8 @@ static BOOL CALLBACK win32_monitor_enum_proc(HMONITOR hMonitor,
 {
    win32_common_state_t
       *g_win32           = (win32_common_state_t*)&win32_st;
-
+   if (g_win32->monitor_count >= MAX_MONITORS)
+      return FALSE;
    win32_monitor_all[g_win32->monitor_count++] = hMonitor;
    return TRUE;
 }
@@ -658,9 +661,11 @@ static bool win32_browser(
        * path/name of any file the user may select. */
       char new_title[PATH_MAX];
       char new_file[PATH_MAX_LENGTH]; /* MAX_PATH-length path buffer */
+      char new_dir[DIR_MAX_LENGTH];
 
       new_title[0] = '\0';
       new_file[0]  = '\0';
+      new_dir[0]   = '\0';
 
       if (!string_is_empty(title))
          strlcpy(new_title, title, sizeof(new_title));
@@ -668,11 +673,14 @@ static bool win32_browser(
       if (filename && *filename)
          strlcpy(new_file, filename, sizeof(new_file));
 
+      if (initial_dir && *initial_dir)
+         strlcpy(new_dir, initial_dir, sizeof(new_dir));
+
       /* OPENFILENAME.lpstrFilters is actually const,
        * so this cast should be safe */
       browser_state.filters  = (char*)extensions;
       browser_state.title    = new_title;
-      browser_state.startdir = strdup(initial_dir);
+      browser_state.startdir = new_dir;
       browser_state.path     = new_file;
       browser_state.window   = owner;
 
@@ -682,8 +690,6 @@ static bool win32_browser(
        * copy the final path back to the caller's buffer. */
       if (filename && browser_state.path)
          strlcpy(filename, browser_state.path, filename_size);
-
-      free(browser_state.startdir);
    }
 
    return result;
@@ -1304,30 +1310,58 @@ static LRESULT CALLBACK wnd_proc_common_dinput_internal(HWND hwnd,
       case WM_IME_COMPOSITION:
          {
             HIMC    hIMC = ImmGetContext(hwnd);
-            unsigned gcs = lparam & (GCS_COMPSTR|GCS_RESULTSTR);
-            if (gcs)
+            /* Process composition and result strings separately;
+             * ImmGetCompositionStringW expects a single flag per call. */
+            unsigned gcs_flags[2] = { GCS_RESULTSTR, GCS_COMPSTR };
+            int f;
+            for (f = 0; f < 2; f++)
             {
-               int i;
-               wchar_t wstr[4] = {0,};
-               LONG _len       = ImmGetCompositionStringW(hIMC, gcs, wstr, 4);
-               wstr[2]         = wstr[1];
-               wstr[1]         = 0;
-               if ((_len <= 0) || (_len > 4))
-                  break;
-               for (i = 0; i < _len; i = i + 2)
+               unsigned gcs_flag = gcs_flags[f];
+               if (!(lparam & gcs_flag))
+                  continue;
                {
-                  size_t __len;
-                  char *utf8   = utf16_to_utf8_string_alloc(wstr+i);
-                  if (!utf8)
+                  int i;
+                  /* Request up to 2 wide chars (4 bytes). Return value is in bytes. */
+                  wchar_t wstr[3] = {0, 0, 0};
+                  LONG byte_len   = ImmGetCompositionStringW(
+                        hIMC, gcs_flag, wstr, 2 * sizeof(wchar_t));
+                  int char_count;
+
+                  if (byte_len <= 0 || byte_len > (LONG)(2 * sizeof(wchar_t)))
                      continue;
-                  __len         = strlen(utf8) + 1;
-                  if (__len >= 1 && __len <= 3)
+
+                  char_count = byte_len / (int)sizeof(wchar_t);
+
+                  for (i = 0; i < char_count; i++)
                   {
-                     if (__len >= 2)
-                        utf8[3] = (gcs) | (gcs >> 4);
-                     input_keyboard_event(true, 1, *((int*)utf8), 0, RETRO_DEVICE_KEYBOARD);
+                     wchar_t single[2];
+                     char *utf8;
+                     size_t utf8_len;
+                     uint32_t packed = 0;
+
+                     single[0] = wstr[i];
+                     single[1] = 0;
+
+                     utf8 = utf16_to_utf8_string_alloc(single);
+                     if (!utf8)
+                        continue;
+
+                     utf8_len = strlen(utf8);
+
+                     /* Pack up to 3 UTF-8 bytes into the low 24 bits and
+                      * the composition/result flag into the high byte.
+                      * This matches what the receiver expects as a uint32. */
+                     if (utf8_len >= 1 && utf8_len <= 3)
+                     {
+                        memcpy(&packed, utf8, utf8_len);
+                        if (utf8_len >= 2)
+                           ((unsigned char*)&packed)[3] =
+                              (unsigned char)((gcs_flag) | (gcs_flag >> 4));
+                        input_keyboard_event(true, 1, (uint32_t)packed, 0,
+                              RETRO_DEVICE_KEYBOARD);
+                     }
+                     free(utf8);
                   }
-                  free(utf8);
                }
             }
             ImmReleaseContext(hwnd, hIMC);
@@ -1969,15 +2003,21 @@ void win32_check_window(void *data,
 #ifdef HAVE_CLIP_WINDOW
 void win32_clip_window(bool state)
 {
-   RECT clip_rect;
-
    if (state && main_window.hwnd)
    {
       WINDOWINFO info;
-      info.cbSize = sizeof(WINDOWINFO);
+      RECT clip_rect;
+      info.cbSize      = sizeof(WINDOWINFO);
 
       if (GetWindowInfo(main_window.hwnd, &info))
          clip_rect = info.rcClient;
+      else
+      {
+         clip_rect.left   = 0;
+         clip_rect.top    = 0;
+         clip_rect.right  = 0;
+         clip_rect.bottom = 0;
+      }
 
       ClipCursor(&clip_rect);
    }
@@ -2067,10 +2107,14 @@ static unsigned int menu_id_to_meta_key(unsigned int menu_id)
    return 0;
 }
 
-/* Given a short key (meta key), get its name as a string */
-/* For single character results, may return same pointer
- * with different data inside (modifying the old result) */
-static const char *win32_meta_key_to_name(unsigned int meta_key)
+/* Given a short key (meta key), get its name as a string.
+ * For named keys the return value points into the global
+ * input_config_key_map table.  For single printable-ASCII
+ * characters the name is written into the caller-supplied
+ * buffer (buf, buf_size) and the return value points there.
+ * Returns NULL when no name can be determined. */
+static const char *win32_meta_key_to_name(unsigned int meta_key,
+      char *buf, size_t buf_size)
 {
    int i = 0;
    const struct retro_keybind* key = &input_config_binds[0][meta_key];
@@ -2086,11 +2130,11 @@ static const char *win32_meta_key_to_name(unsigned int meta_key)
       i++;
    }
 
-   if (key_code >= 32 && key_code < 127)
+   if (key_code >= 32 && key_code < 127 && buf_size >= 2)
    {
-      static char single_char[2] = "A";
-      single_char[0]              = key_code;
-      return single_char;
+      buf[0] = (char)key_code;
+      buf[1] = '\0';
+      return buf;
    }
    return NULL;
 }
@@ -2145,6 +2189,7 @@ static void win32_localize_menu(HMENU menu)
          const char* new_label2     = new_label;
          const char* meta_key_name  = NULL;
          char* new_label_text       = NULL;
+         char key_name_buf[2]       = {0};
 
          /* specific replacements:
             Load Content = "Ctrl+O"
@@ -2163,7 +2208,8 @@ static void win32_localize_menu(HMENU menu)
          }
          else if (meta_key != 0)
          {
-            meta_key_name = win32_meta_key_to_name(meta_key);
+            meta_key_name = win32_meta_key_to_name(meta_key,
+                  key_name_buf, sizeof(key_name_buf));
             __len         = meta_key_name ? strlen(meta_key_name) : 0;
          }
 
@@ -2319,7 +2365,13 @@ bool win32_suspend_screensaver(void *data, bool enable)
                Request                                  =
                   powerCreateRequest(&RequestContext);
 
-               powerSetRequest( Request, PowerRequestDisplayRequired);
+               powerSetRequest(Request, PowerRequestDisplayRequired);
+               /* TODO/FIXME - handle is never released so
+                * technically counts as a memory leak. However, this
+                * handle needs to be kept alive so long as the screensaver
+                * should be suppressed. So this variable might need to
+                * be bookkept somewhere else where it can be properly
+                * closed upon shutdown */
                return true;
             }
          }
@@ -2572,7 +2624,7 @@ bool win32_set_video_mode(void *data,
 
 bool win32_get_client_rect(RECT* rect)
 {
-   return GetWindowRect(main_window.hwnd, rect);
+   return GetClientRect(main_window.hwnd, rect);
 }
 
 void win32_window_reset(void)
@@ -2604,13 +2656,13 @@ void win32_get_video_output_prev(
    unsigned curr_width  = 0;
    unsigned curr_height = 0;
 
-   if (win32_get_video_output(&dm, -1, sizeof(dm)))
+   if (win32_get_video_output(&dm, -1))
    {
       curr_width  = dm.dmPelsWidth;
       curr_height = dm.dmPelsHeight;
    }
 
-   for (i = 0; win32_get_video_output(&dm, i, sizeof(dm)); i++)
+   for (i = 0; win32_get_video_output(&dm, i); i++)
    {
       if (     dm.dmPelsWidth  == curr_width
             && dm.dmPelsHeight == curr_height)
@@ -2636,13 +2688,13 @@ void win32_get_video_output_prev(
 
 float win32_get_refresh_rate(void *data)
 {
-   float refresh_rate                      = 0.0f;
 #if _WIN32_WINNT >= 0x0601 || _WIN32_WINDOWS >= 0x0601 /* Win 7 */
    UINT32 TopologyID;
-   unsigned int NumPathArrayElements       = 0;
-   unsigned int NumModeInfoArrayElements   = 0;
-   DISPLAYCONFIG_PATH_INFO_CUSTOM *PathInfoArray  = NULL;
-   DISPLAYCONFIG_MODE_INFO_CUSTOM *ModeInfoArray  = NULL;
+   float refresh_rate                            = 0.0f;
+   unsigned int NumPathArrayElements             = 0;
+   unsigned int NumModeInfoArrayElements         = 0;
+   DISPLAYCONFIG_PATH_INFO_CUSTOM *PathInfoArray = NULL;
+   DISPLAYCONFIG_MODE_INFO_CUSTOM *ModeInfoArray = NULL;
 #ifdef HAVE_DYLIB
    static QUERYDISPLAYCONFIG pQueryDisplayConfig;
    static GETDISPLAYCONFIGBUFFERSIZES pGetDisplayConfigBufferSizes;
@@ -2650,51 +2702,56 @@ float win32_get_refresh_rate(void *data)
    {
       HMODULE user32 = GetModuleHandle("user32.dll");
       if (!pQueryDisplayConfig)
-         pQueryDisplayConfig        = (QUERYDISPLAYCONFIG)GetProcAddress(
-               user32, "QueryDisplayConfig");
+         pQueryDisplayConfig        = (QUERYDISPLAYCONFIG)
+         GetProcAddress(user32, "QueryDisplayConfig");
       if (!pGetDisplayConfigBufferSizes)
-         pGetDisplayConfigBufferSizes = (GETDISPLAYCONFIGBUFFERSIZES)GetProcAddress(
-               user32, "GetDisplayConfigBufferSizes");
+         pGetDisplayConfigBufferSizes = (GETDISPLAYCONFIGBUFFERSIZES)
+         GetProcAddress(user32, "GetDisplayConfigBufferSizes");
    }
 #else
-   static QUERYDISPLAYCONFIG pQueryDisplayConfig                   = QueryDisplayConfig;
+   static QUERYDISPLAYCONFIG pQueryDisplayConfig = QueryDisplayConfig;
    static GETDISPLAYCONFIGBUFFERSIZES pGetDisplayConfigBufferSizes = GetDisplayConfigBufferSizes;
 #endif
 
    /* Both function pointers must be valid before proceeding. */
    if (!pQueryDisplayConfig || !pGetDisplayConfigBufferSizes)
-      return refresh_rate;
+      return 0.0f;
 
    if (pGetDisplayConfigBufferSizes(
             QDC_DATABASE_CURRENT,
             &NumPathArrayElements,
             &NumModeInfoArrayElements) != ERROR_SUCCESS)
-      return refresh_rate;
+      return 0.0f;
 
    PathInfoArray = (DISPLAYCONFIG_PATH_INFO_CUSTOM *)
       malloc(sizeof(DISPLAYCONFIG_PATH_INFO_CUSTOM) * NumPathArrayElements);
+   if (!PathInfoArray)
+      return 0.0f;
    ModeInfoArray = (DISPLAYCONFIG_MODE_INFO_CUSTOM *)
       malloc(sizeof(DISPLAYCONFIG_MODE_INFO_CUSTOM) * NumModeInfoArrayElements);
-
-   if (PathInfoArray && ModeInfoArray)
+   if (!ModeInfoArray)
    {
-      if (pQueryDisplayConfig(QDC_DATABASE_CURRENT,
-                                 &NumPathArrayElements,
-                                 PathInfoArray,
-                                 &NumModeInfoArrayElements,
-                                 ModeInfoArray,
-                                 &TopologyID) == ERROR_SUCCESS
-            && NumPathArrayElements >= 1
-            && PathInfoArray[0].targetInfo.refreshRate.Denominator != 0)
-         refresh_rate = (float)PathInfoArray[0].targetInfo.refreshRate.Numerator /
-                               PathInfoArray[0].targetInfo.refreshRate.Denominator;
+      free(PathInfoArray);
+      return 0.0f;
    }
+
+   if (pQueryDisplayConfig(QDC_DATABASE_CURRENT,
+            &NumPathArrayElements,
+            PathInfoArray,
+            &NumModeInfoArrayElements,
+            ModeInfoArray,
+            &TopologyID) == ERROR_SUCCESS
+         && NumPathArrayElements >= 1
+         && PathInfoArray[0].targetInfo.refreshRate.Denominator != 0)
+      refresh_rate = (float)PathInfoArray[0].targetInfo.refreshRate.Numerator
+         / PathInfoArray[0].targetInfo.refreshRate.Denominator;
 
    free(ModeInfoArray);
    free(PathInfoArray);
-
-#endif
    return refresh_rate;
+#else
+   return 0.0f;
+#endif
 }
 
 void win32_get_video_output_next(
@@ -2706,13 +2763,13 @@ void win32_get_video_output_next(
    unsigned curr_width  = 0;
    unsigned curr_height = 0;
 
-   if (win32_get_video_output(&dm, -1, sizeof(dm)))
+   if (win32_get_video_output(&dm, -1))
    {
       curr_width  = dm.dmPelsWidth;
       curr_height = dm.dmPelsHeight;
    }
 
-   for (i = 0; win32_get_video_output(&dm, i, sizeof(dm)); i++)
+   for (i = 0; win32_get_video_output(&dm, i); i++)
    {
       if (found)
       {
@@ -2733,26 +2790,28 @@ void win32_get_video_output_next(
 #define WIN32_GET_VIDEO_OUTPUT(devName, iModeNum, dm) EnumDisplaySettings(devName, iModeNum, dm)
 #endif
 
-bool win32_get_video_output(DEVMODE *dm, int mode, size_t len)
+bool win32_get_video_output(DEVMODE *dm, int mode)
 {
    MONITORINFOEX current_mon;
    HMONITOR hm_to_use        = NULL;
    unsigned mon_id           = 0;
-   memset(dm, 0, len);
-   dm->dmSize  = len;
+
+   memset(dm, 0, sizeof(DEVMODE));
+   dm->dmSize = sizeof(DEVMODE);
+
    win32_monitor_info(&current_mon, &hm_to_use, &mon_id);
-   if (WIN32_GET_VIDEO_OUTPUT((const char*)&current_mon.szDevice, (mode == -1)
-            ? ENUM_CURRENT_SETTINGS
-            : (DWORD)mode,
-            dm) == 0)
-      return false;
-   return true;
+
+   return WIN32_GET_VIDEO_OUTPUT(
+         current_mon.szDevice,
+         (mode == -1) ? ENUM_CURRENT_SETTINGS : (DWORD)mode,
+         dm) != 0;
 }
 
-void win32_get_video_output_size(void *data, unsigned *width, unsigned *height, char *desc, size_t len)
+void win32_get_video_output_size(void *data, unsigned *width,
+   unsigned *height, char *desc, size_t len)
 {
    DEVMODE dm;
-   if (win32_get_video_output(&dm, -1, sizeof(dm)))
+   if (win32_get_video_output(&dm, -1))
    {
       *width  = dm.dmPelsWidth;
       *height = dm.dmPelsHeight;
@@ -2761,6 +2820,7 @@ void win32_get_video_output_size(void *data, unsigned *width, unsigned *height, 
 
 void win32_setup_pixel_format(HDC hdc, bool supports_gl)
 {
+   int pf;
    PIXELFORMATDESCRIPTOR pfd = {0};
    pfd.nSize        = sizeof(PIXELFORMATDESCRIPTOR);
    pfd.nVersion     = 1;
@@ -2774,7 +2834,9 @@ void win32_setup_pixel_format(HDC hdc, bool supports_gl)
    if (supports_gl)
       pfd.dwFlags  |= PFD_SUPPORT_OPENGL;
 
-   SetPixelFormat(hdc, ChoosePixelFormat(hdc, &pfd), &pfd);
+   pf = ChoosePixelFormat(hdc, &pfd);
+   if (pf == 0 || !SetPixelFormat(hdc, pf, &pfd))
+      RARCH_ERR("[Win32] Failed to set pixel format.\n");
 }
 
 #ifndef __WINRT__

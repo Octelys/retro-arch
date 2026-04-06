@@ -333,20 +333,17 @@ static void ps2_font_render_message(
    int lines                              = 0;
    font->font_driver->get_line_metrics(font->font_data, &line_metrics);
    line_height = (float)line_metrics->height * scale / (float)height;
-
    for (;;)
    {
-      const char* delim = strchr(msg, '\n');
-      size_t msg_len    = delim ? (delim - msg) : strlen(msg);
-
-      /* Draw the line */
-      ps2_font_render_line(ps2, font, msg, msg_len,
+      const char* scan = msg;
+      while (*scan && *scan != '\n')
+         scan++;
+      ps2_font_render_line(ps2, font, msg, (size_t)(scan - msg),
             scale, color, pos_x, pos_y - (float)lines * line_height,
             width, height, text_align);
-      if (!delim)
+      if (!*scan)
          break;
-
-      msg += msg_len + 1;
+      msg = scan + 1;
       lines++;
    }
 }
@@ -934,7 +931,7 @@ static bool ps2_frame(void *data, const void *frame,
          font_driver_render_msg(ps2, video_info->stat_text, osd_params, NULL);
    }
 
-   if (!string_is_empty(msg))
+   if (msg)
       font_driver_render_msg(ps2, msg, NULL, NULL);
 
    if (gsGlobal->DoubleBuffering == GS_SETTING_OFF)

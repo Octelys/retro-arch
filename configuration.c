@@ -41,6 +41,7 @@
 #include "input/input_keymaps.h"
 #include "input/input_remapping.h"
 #include "led/led_defines.h"
+#include "msg_hash_lbl_str.h"
 #include "defaults.h"
 #include "core.h"
 #include "paths.h"
@@ -241,6 +242,7 @@ enum joypad_driver_enum
    JOYPAD_QNX,
    JOYPAD_RWEBPAD,
    JOYPAD_MFI,
+   JOYPAD_WINRAW,
    JOYPAD_NULL
 };
 
@@ -715,6 +717,8 @@ static const enum joypad_driver_enum JOYPAD_DEFAULT_DRIVER = JOYPAD_DINPUT;
 static const enum joypad_driver_enum JOYPAD_DEFAULT_DRIVER = JOYPAD_UDEV;
 #elif defined(__linux) && !defined(ANDROID)
 static const enum joypad_driver_enum JOYPAD_DEFAULT_DRIVER = JOYPAD_LINUXRAW;
+#elif defined(HAVE_WINRAWINPUT)
+static const enum joypad_driver_enum JOYPAD_DEFAULT_DRIVER = JOYPAD_WINRAW;
 #elif defined(ANDROID)
 static const enum joypad_driver_enum JOYPAD_DEFAULT_DRIVER = JOYPAD_ANDROID;
 #elif defined(HAVE_MFI)
@@ -1307,6 +1311,8 @@ const char *config_get_default_joypad(void)
          return "dos";
       case JOYPAD_MFI:
          return "mfi";
+      case JOYPAD_WINRAW:
+         return "winraw";
       case JOYPAD_NULL:
          break;
    }
@@ -1554,10 +1560,10 @@ static struct config_array_setting *populate_settings_array(
 {
    unsigned i                           = 0;
    unsigned count                       = 0;
-   struct config_array_setting  *tmp    = (struct config_array_setting*)calloc(SETTINGS_ARRAY_COUNT_MAX, sizeof(struct config_array_setting));
+   static struct config_array_setting tmp_buf[SETTINGS_ARRAY_COUNT_MAX];
+   struct config_array_setting  *tmp    = tmp_buf;
 
-   if (!tmp)
-      return NULL;
+   memset(tmp, 0, SETTINGS_ARRAY_COUNT_MAX * sizeof(struct config_array_setting));
 
    /* Arrays */
    SETTING_ARRAY("audio_driver",                 settings->arrays.audio_driver, false, NULL, true);
@@ -1661,10 +1667,10 @@ static struct config_path_setting *populate_settings_path(
 {
    unsigned count = 0;
    recording_state_t *recording_st     = recording_state_get_ptr();
-   struct config_path_setting  *tmp    = (struct config_path_setting*)calloc(SETTINGS_PATH_COUNT_MAX, sizeof(struct config_path_setting));
+   static struct config_path_setting tmp_buf[SETTINGS_PATH_COUNT_MAX];
+   struct config_path_setting  *tmp    = tmp_buf;
 
-   if (!tmp)
-      return NULL;
+   memset(tmp, 0, SETTINGS_PATH_COUNT_MAX * sizeof(struct config_path_setting));
 
    /* Paths */
    SETTING_PATH("bundle_assets_src_path",        settings->paths.bundle_assets_src, false, NULL, true);
@@ -1771,8 +1777,11 @@ static struct config_path_setting *populate_settings_path(
 static struct config_bool_setting *populate_settings_bool(
       settings_t *settings, int *size)
 {
-   struct config_bool_setting  *tmp    = (struct config_bool_setting*)calloc(SETTINGS_BOOL_COUNT_MAX, sizeof(struct config_bool_setting));
+   static struct config_bool_setting tmp_buf[SETTINGS_BOOL_COUNT_MAX];
+   struct config_bool_setting  *tmp    = tmp_buf;
    unsigned count                      = 0;
+
+   memset(tmp, 0, SETTINGS_BOOL_COUNT_MAX * sizeof(struct config_bool_setting));
 
    SETTING_BOOL("accessibility_enable",          &settings->bools.accessibility_enable, true, DEFAULT_ACCESSIBILITY_ENABLE, false);
    SETTING_BOOL("driver_switch_enable",          &settings->bools.driver_switch_enable, true, DEFAULT_DRIVER_SWITCH_ENABLE, false);
@@ -2327,10 +2336,10 @@ static struct config_float_setting *populate_settings_float(
       settings_t *settings, int *size)
 {
    unsigned count = 0;
-   struct config_float_setting  *tmp      = (struct config_float_setting*)calloc(SETTINGS_FLOAT_COUNT_MAX, sizeof(struct config_float_setting));
+   static struct config_float_setting tmp_buf[SETTINGS_FLOAT_COUNT_MAX];
+   struct config_float_setting  *tmp      = tmp_buf;
 
-   if (!tmp)
-      return NULL;
+   memset(tmp, 0, SETTINGS_FLOAT_COUNT_MAX * sizeof(struct config_float_setting));
 
 #ifdef HAVE_MENU
    SETTING_FLOAT("menu_scale_factor",            &settings->floats.menu_scale_factor, true, DEFAULT_MENU_SCALE_FACTOR, false);
@@ -2431,10 +2440,10 @@ static struct config_uint_setting *populate_settings_uint(
       settings_t *settings, int *size)
 {
    unsigned count                     = 0;
-   struct config_uint_setting  *tmp   = (struct config_uint_setting*)calloc(SETTINGS_UINT_COUNT_MAX, sizeof(struct config_uint_setting));
+   static struct config_uint_setting tmp_buf[SETTINGS_UINT_COUNT_MAX];
+   struct config_uint_setting  *tmp   = tmp_buf;
 
-   if (!tmp)
-      return NULL;
+   memset(tmp, 0, SETTINGS_UINT_COUNT_MAX * sizeof(struct config_uint_setting));
 
    SETTING_UINT("frontend_log_level",            &settings->uints.frontend_log_level, true, DEFAULT_FRONTEND_LOG_LEVEL, false);
    SETTING_UINT("libretro_log_level",            &settings->uints.libretro_log_level, true, DEFAULT_LIBRETRO_LOG_LEVEL, false);
@@ -2734,10 +2743,10 @@ static struct config_size_setting *populate_settings_size(
       settings_t *settings, int *size)
 {
    unsigned count                     = 0;
-   struct config_size_setting  *tmp   = (struct config_size_setting*)calloc(SETTINGS_SIZE_COUNT_MAX, sizeof(struct config_size_setting));
+   static struct config_size_setting tmp_buf[SETTINGS_SIZE_COUNT_MAX];
+   struct config_size_setting  *tmp   = tmp_buf;
 
-   if (!tmp)
-      return NULL;
+   memset(tmp, 0, SETTINGS_SIZE_COUNT_MAX * sizeof(struct config_size_setting));
 
    SETTING_SIZE("rewind_buffer_size",            &settings->sizes.rewind_buffer_size, true, DEFAULT_REWIND_BUFFER_SIZE, false);
 
@@ -2750,10 +2759,10 @@ static struct config_int_setting *populate_settings_int(
       settings_t *settings, int *size)
 {
    unsigned count                     = 0;
-   struct config_int_setting  *tmp    = (struct config_int_setting*)calloc(SETTINGS_INT_COUNT_MAX, sizeof(struct config_int_setting));
+   static struct config_int_setting tmp_buf[SETTINGS_INT_COUNT_MAX];
+   struct config_int_setting  *tmp    = tmp_buf;
 
-   if (!tmp)
-      return NULL;
+   memset(tmp, 0, SETTINGS_INT_COUNT_MAX * sizeof(struct config_int_setting));
 
    SETTING_INT("content_favorites_size",         &settings->ints.content_favorites_size, true, DEFAULT_CONTENT_FAVORITES_SIZE, false);
    SETTING_INT("state_slot",                     &settings->ints.state_slot, false, 0, false);
@@ -2906,8 +2915,6 @@ void config_set_defaults(void *data)
          if (bool_settings[i].flags & CFG_BOOL_FLG_DEF_ENABLE)
             *bool_settings[i].ptr = bool_settings[i].def;
       }
-
-      free(bool_settings);
    }
 
    if (int_settings && (int_settings_size > 0))
@@ -2917,8 +2924,6 @@ void config_set_defaults(void *data)
          if (int_settings[i].flags & CFG_BOOL_FLG_DEF_ENABLE)
             *int_settings[i].ptr = int_settings[i].def;
       }
-
-      free(int_settings);
    }
 
    if (uint_settings && (uint_settings_size > 0))
@@ -2928,8 +2933,6 @@ void config_set_defaults(void *data)
          if (uint_settings[i].flags & CFG_BOOL_FLG_DEF_ENABLE)
             *uint_settings[i].ptr = uint_settings[i].def;
       }
-
-      free(uint_settings);
    }
 
    if (size_settings && (size_settings_size > 0))
@@ -2939,8 +2942,6 @@ void config_set_defaults(void *data)
          if (size_settings[i].flags & CFG_BOOL_FLG_DEF_ENABLE)
             *size_settings[i].ptr = size_settings[i].def;
       }
-
-      free(size_settings);
    }
 
    if (float_settings && (float_settings_size > 0))
@@ -2950,8 +2951,6 @@ void config_set_defaults(void *data)
          if (float_settings[i].flags & CFG_BOOL_FLG_DEF_ENABLE)
             *float_settings[i].ptr = float_settings[i].def;
       }
-
-      free(float_settings);
    }
 
    if (def_camera)
@@ -3546,40 +3545,39 @@ static bool check_menu_driver_compatibility(settings_t *settings)
    char *video_driver   = settings->arrays.video_driver;
    char *menu_driver    = settings->arrays.menu_driver;
 
-   if (     string_is_equal(menu_driver,  "rgui")
-         || string_is_equal(menu_driver,  "null")
-         || string_is_equal(video_driver, "null"))
+   if (  (memcmp(menu_driver,  "rgui", 4) == 0 && menu_driver[4]  == '\0')
+      || (memcmp(menu_driver,  "null", 4) == 0 && menu_driver[4]  == '\0')
+      || (memcmp(video_driver, "null", 4) == 0 && video_driver[4] == '\0'))
       return true;
 
-   /* TODO/FIXME - maintenance hazard */
-   if (string_starts_with_size(video_driver, "d3d", STRLEN_CONST("d3d")))
-      if (
-               string_is_equal(video_driver, "d3d9_hlsl")
-            || string_is_equal(video_driver, "d3d9_cg")
-            || string_is_equal(video_driver, "d3d10")
-            || string_is_equal(video_driver, "d3d11")
-            || string_is_equal(video_driver, "d3d12")
-         )
-      return true;
-   if (string_starts_with_size(video_driver, "gl", STRLEN_CONST("gl")))
-      if (
-               string_is_equal(video_driver, "gl")
-            || string_is_equal(video_driver, "gl1")
-            || string_is_equal(video_driver, "glcore")
-         )
-         return true;
-   if (
-            string_is_equal(video_driver, "caca")
-         || string_is_equal(video_driver, "gdi")
-         || string_is_equal(video_driver, "gx2")
-         || string_is_equal(video_driver, "vulkan")
-         || string_is_equal(video_driver, "metal")
-         || string_is_equal(video_driver, "ctr")
-         || string_is_equal(video_driver, "vita2d")
-         || string_is_equal(video_driver, "rsx")
-      )
-      return true;
-
+   switch (video_driver[0])
+   {
+      case 'd':
+         return (memcmp(video_driver, "d3d9_hlsl", 9) == 0 && video_driver[9] == '\0')
+             || (memcmp(video_driver, "d3d9_cg",  7) == 0 && video_driver[7]  == '\0')
+             || (memcmp(video_driver, "d3d10",    5) == 0 && video_driver[5]  == '\0')
+             || (memcmp(video_driver, "d3d11",    5) == 0 && video_driver[5]  == '\0')
+             || (memcmp(video_driver, "d3d12",    5) == 0 && video_driver[5]  == '\0');
+      case 'g':
+         if (video_driver[1] == 'l')
+            return (memcmp(video_driver, "gl",     2) == 0 && video_driver[2] == '\0')
+                || (memcmp(video_driver, "gl1",    3) == 0 && video_driver[3] == '\0')
+                || (memcmp(video_driver, "glcore", 6) == 0 && video_driver[6] == '\0');
+         if (video_driver[1] == 'x')
+            return (memcmp(video_driver, "gx2",    3) == 0 && video_driver[3] == '\0');
+         return false;
+      case 'v':
+         return (memcmp(video_driver, "vulkan", 6) == 0 && video_driver[6] == '\0')
+             || (memcmp(video_driver, "vita2d", 6) == 0 && video_driver[6] == '\0');
+      case 'm':
+         return (memcmp(video_driver, "metal",  5) == 0 && video_driver[5] == '\0');
+      case 'r':
+         return (memcmp(video_driver, "rsx",    3) == 0 && video_driver[3] == '\0');
+      case 'c':
+         return (memcmp(video_driver, "ctr",    3) == 0 && video_driver[3] == '\0');
+      default:
+         break;
+   }
    return false;
 }
 #endif
@@ -3856,8 +3854,8 @@ static bool config_load_file(global_t *global,
    static bool first_load                          = true;
    bool without_overrides                          = false;
    unsigned msg_color                              = 0;
-   char *save                                      = NULL;
-   char *override_username                         = NULL;
+   char override_username[PATH_MAX_LENGTH];
+   bool override_username_set                      = false;
    runloop_state_t *runloop_st                     = runloop_state_get_ptr();
    int bool_settings_size                          = SETTINGS_BOOL_COUNT_MAX;
    int float_settings_size                         = SETTINGS_FLOAT_COUNT_MAX;
@@ -3926,26 +3924,44 @@ static bool config_load_file(global_t *global,
 
    if (!path_is_empty(RARCH_PATH_CONFIG_APPEND))
    {
-      /* Don't destroy append_config_path, store in temporary
-       * variable. */
       char tmp_append_path[PATH_MAX_LENGTH];
-      const char *extra_path = NULL;
+      const char *ptr         = NULL;
+
       strlcpy(tmp_append_path, path_get(RARCH_PATH_CONFIG_APPEND),
             sizeof(tmp_append_path));
-      extra_path = strtok_r(tmp_append_path, "|", &save);
 
-      while (extra_path)
+      ptr = tmp_append_path;
+
+      while (ptr && *ptr)
       {
-         bool result = config_append_file(conf, extra_path);
+         char config_path[PATH_MAX_LENGTH];
+         const char *delim = strchr(ptr, '|');
 
-         if (!first_load)
+         if (delim)
          {
-            RARCH_LOG("[Config] Appending config: \"%s\".\n", extra_path);
-
-            if (!result)
-               RARCH_ERR("[Config] Failed to append config: \"%s\".\n", extra_path);
+            size_t len = delim - ptr;
+            if (len >= sizeof(config_path))
+               len = sizeof(config_path) - 1;
+            memcpy(config_path, ptr, len);
+            config_path[len] = '\0';
+            ptr = delim + 1;
          }
-         extra_path = strtok_r(NULL, "|", &save);
+         else
+         {
+            strlcpy(config_path, ptr, sizeof(config_path));
+            ptr = NULL;
+         }
+
+         if (*config_path)
+         {
+            bool result = config_append_file(conf, config_path);
+            if (!first_load)
+            {
+               RARCH_LOG("[Config] Appending config: \"%s\".\n", config_path);
+               if (!result)
+                  RARCH_ERR("[Config] Failed to append config: \"%s\".\n", config_path);
+            }
+         }
       }
 
       /* Re-check verbosity settings */
@@ -3954,8 +3970,6 @@ static bool config_load_file(global_t *global,
 
    if (!path_is_empty(RARCH_PATH_CONFIG_OVERRIDE) && !without_overrides)
    {
-      /* Don't destroy append_config_path, store in temporary
-       * variable. */
       char tmp_append_path[PATH_MAX_LENGTH];
       const char *extra_path = NULL;
 #ifdef HAVE_OVERLAY
@@ -3964,20 +3978,24 @@ static bool config_load_file(global_t *global,
 #endif
       strlcpy(tmp_append_path, path_get(RARCH_PATH_CONFIG_OVERRIDE),
             sizeof(tmp_append_path));
-      extra_path = strtok_r(tmp_append_path, "|", &save);
 
-      while (extra_path)
+      extra_path = tmp_append_path;
+      while (extra_path && *extra_path)
       {
-         bool result = config_append_file(conf, extra_path);
+         char *next = strchr(extra_path, '|');
+         if (next)
+            *next++ = '\0';
 
-         if (!first_load)
          {
-            RARCH_LOG("[Config] Appending override config: \"%s\".\n", extra_path);
-
-            if (!result)
-               RARCH_ERR("[Config] Failed to append override config: \"%s\".\n", extra_path);
+            bool result = config_append_file(conf, extra_path);
+            if (!first_load)
+            {
+               RARCH_LOG("[Config] Appending override config: \"%s\".\n", extra_path);
+               if (!result)
+                  RARCH_ERR("[Config] Failed to append override config: \"%s\".\n", extra_path);
+            }
          }
-         extra_path = strtok_r(NULL, "|", &save);
+         extra_path = next;
       }
 
       /* Re-check verbosity settings */
@@ -4000,7 +4018,10 @@ static bool config_load_file(global_t *global,
    /* Overrides */
 
    if (rarch_flags & RARCH_FLAGS_HAS_SET_USERNAME)
-      override_username = strdup(settings->paths.username);
+   {
+      strlcpy(override_username, settings->paths.username, sizeof(override_username));
+      override_username_set = true;
+   }
 
    /* Boolean settings */
 
@@ -4146,7 +4167,8 @@ static bool config_load_file(global_t *global,
    /* Post-settings load */
 
    libretro_directory = getenv("LIBRETRO_DIRECTORY");
-   if (libretro_directory) {
+   if (libretro_directory)
+   {
       configuration_set_string(settings,
             settings->paths.directory_libretro, libretro_directory);
       configuration_set_string(settings,
@@ -4178,12 +4200,11 @@ static bool config_load_file(global_t *global,
 				libretro_system_directory);
 
    if (     (rarch_flags & RARCH_FLAGS_HAS_SET_USERNAME)
-         && (override_username))
+         && override_username_set)
    {
       configuration_set_string(settings,
             settings->paths.username,
             override_username);
-      free(override_username);
    }
 
    if (settings->uints.video_hard_sync_frames > MAXIMUM_HARD_SYNC_FRAMES)
@@ -4349,28 +4370,45 @@ static bool config_load_file(global_t *global,
       *settings->paths.path_menu_wallpaper = '\0';
    if (string_is_equal(settings->paths.path_rgui_theme_preset, "default"))
       *settings->paths.path_rgui_theme_preset = '\0';
+
    libretro_video_shader_directory = getenv("LIBRETRO_VIDEO_SHADER_DIRECTORY");
-   if (libretro_video_shader_directory) { /* override configuration value */
+
+   if (libretro_video_shader_directory)
+   {
+      /* override configuration value */
       configuration_set_string(settings, settings->paths.directory_video_shader,
-			       libretro_video_shader_directory);
-   } else if (string_is_equal(settings->paths.directory_video_shader, "default"))
+            libretro_video_shader_directory);
+   }
+   else if (string_is_equal(settings->paths.directory_video_shader, "default"))
       *settings->paths.directory_video_shader = '\0';
+
    libretro_video_filter_directory = getenv("LIBRETRO_VIDEO_FILTER_DIRECTORY");
-   if (libretro_video_filter_directory) { /* override configuration value */
+
+   if (libretro_video_filter_directory)
+   {
+      /* override configuration value */
        configuration_set_string(settings, settings->paths.directory_video_filter,
 				libretro_video_filter_directory);
-   } else if (string_is_equal(settings->paths.directory_video_filter, "default"))
+   }
+   else if (string_is_equal(settings->paths.directory_video_filter, "default"))
       *settings->paths.directory_video_filter = '\0';
+
    if (string_is_equal(settings->paths.directory_audio_filter, "default"))
       *settings->paths.directory_audio_filter = '\0';
    if (string_is_equal(settings->paths.directory_core_assets, "default"))
       *settings->paths.directory_core_assets = '\0';
+
    libretro_assets_directory = getenv("LIBRETRO_ASSETS_DIRECTORY");
-   if (libretro_assets_directory) { /* override configuration value */
+
+   if (libretro_assets_directory)
+   {
+      /* override configuration value */
       configuration_set_string(settings,
            settings->paths.directory_assets, libretro_assets_directory);
-   } else if (string_is_equal(settings->paths.directory_assets, "default"))
+   }
+   else if (string_is_equal(settings->paths.directory_assets, "default"))
       *settings->paths.directory_assets = '\0';
+
 #ifdef _3DS
    if (string_is_equal(settings->paths.directory_bottom_assets, "default"))
       configuration_set_string(settings,
@@ -4619,20 +4657,6 @@ static bool config_load_file(global_t *global,
 
    if (conf)
       config_file_free(conf);
-   if (bool_settings)
-      free(bool_settings);
-   if (int_settings)
-      free(int_settings);
-   if (uint_settings)
-      free(uint_settings);
-   if (float_settings)
-      free(float_settings);
-   if (array_settings)
-      free(array_settings);
-   if (path_settings)
-      free(path_settings);
-   if (size_settings)
-      free(size_settings);
    first_load = false;
    return true;
 }
@@ -5379,40 +5403,24 @@ void config_get_autoconf_profile_filename(
       const char *device_name, unsigned user,
       char *s, size_t len)
 {
-   const char* invalid_filename_chars[] = {
-      /* https://support.microsoft.com/en-us/help/905231/information-about-the-characters-that-you-cannot-use-in-site-names--fo */
-      "~", "#", "%", "&", "*", "{", "}", "\\", ":", "[", "]", "?", "/", "|", "\'", "\"",
-      NULL
-   };
+   static const char invalid_filename_chars[] =
+      "~#%&*{}\\:[]?/|'\"";
    size_t i;
    size_t _len;
-   char *sanitised_name                 = NULL;
-
+   char sanitised_name[PATH_MAX_LENGTH];
    if (string_is_empty(device_name))
       return;
-
-   sanitised_name = strdup(device_name);
-
+   strlcpy(sanitised_name, device_name, sizeof(sanitised_name));
    /* Remove invalid filename characters from
     * input device name */
-   for (i = 0; invalid_filename_chars[i]; i++)
+   for (i = 0; sanitised_name[i]; i++)
    {
-      for (;;)
-      {
-         char *tmp = strstr(sanitised_name, invalid_filename_chars[i]);
-
-         if (!tmp)
-            break;
-         *tmp = '_';
-      }
+      if (strchr(invalid_filename_chars, sanitised_name[i]))
+         sanitised_name[i] = '_';
    }
-
    /* Generate autoconfig file path */
    _len = strlcpy(s, sanitised_name, len);
    strlcpy(s + _len, ".cfg", len - _len);
-
-   free(sanitised_name);
-   sanitised_name = NULL;
 }
 
 /**
@@ -5649,8 +5657,6 @@ bool config_save_file(const char *path)
 
          config_set_path(conf, path_settings[i].ident, value);
       }
-
-      free(path_settings);
    }
 
 #ifdef HAVE_MENU
@@ -5671,8 +5677,6 @@ bool config_save_file(const char *path)
             config_set_string(conf,
                   array_settings[i].ident,
                   array_settings[i].ptr);
-
-      free(array_settings);
    }
 
    /* Float settings  */
@@ -5684,8 +5688,6 @@ bool config_save_file(const char *path)
             config_set_float(conf,
                   float_settings[i].ident,
                   *float_settings[i].ptr);
-
-      free(float_settings);
    }
 
    /* Integer settings */
@@ -5697,8 +5699,6 @@ bool config_save_file(const char *path)
             config_set_int(conf,
                   int_settings[i].ident,
                   *int_settings[i].ptr);
-
-      free(int_settings);
    }
 
    if (uint_settings && (uint_settings_size > 0))
@@ -5709,8 +5709,6 @@ bool config_save_file(const char *path)
             config_set_int(conf,
                   uint_settings[i].ident,
                   *uint_settings[i].ptr);
-
-      free(uint_settings);
    }
 
    if (size_settings && (size_settings_size > 0))
@@ -5721,8 +5719,6 @@ bool config_save_file(const char *path)
             config_set_int(conf,
                   size_settings[i].ident,
                   (int)*size_settings[i].ptr);
-
-      free(size_settings);
    }
 
    for (i = 0; i < MAX_USERS; i++)
@@ -5763,8 +5759,6 @@ bool config_save_file(const char *path)
             config_set_string(conf, bool_settings[i].ident,
                   *bool_settings[i].ptr
                   ? "true" : "false");
-
-      free(bool_settings);
    }
 
 #ifdef HAVE_NETWORKGAMEPAD
@@ -5931,31 +5925,73 @@ int8_t config_save_overrides(enum override_type type,
    config_load_file(global_get_ptr(),
          "without-overrides", settings);
 
-   bool_settings       = populate_settings_bool(settings,   &bool_settings_size);
+   /* populate_settings_*() returns a pointer to a static buffer.
+    * Since we need two results simultaneously (settings vs overrides),
+    * snapshot the first result into a heap copy before the second call.
+    * This is a rare code path (user-initiated save) so the allocation
+    * is acceptable, and it avoids large stack locals that would be
+    * unsafe on embedded targets (3DS, PSP, Wii: 32 KB stack). */
+
+   {
+      struct config_bool_setting *tmp = populate_settings_bool(settings, &bool_settings_size);
+      bool_settings = (struct config_bool_setting*)malloc(bool_settings_size * sizeof(*bool_settings));
+      if (bool_settings)
+         memcpy(bool_settings, tmp, bool_settings_size * sizeof(*bool_settings));
+   }
    tmp_i               = SETTINGS_BOOL_COUNT_MAX;
    bool_overrides      = populate_settings_bool(overrides,  &tmp_i);
 
-   int_settings        = populate_settings_int(settings,    &int_settings_size);
+   {
+      struct config_int_setting *tmp = populate_settings_int(settings, &int_settings_size);
+      int_settings = (struct config_int_setting*)malloc(int_settings_size * sizeof(*int_settings));
+      if (int_settings)
+         memcpy(int_settings, tmp, int_settings_size * sizeof(*int_settings));
+   }
    tmp_i               = SETTINGS_INT_COUNT_MAX;
    int_overrides       = populate_settings_int(overrides,   &tmp_i);
 
-   uint_settings       = populate_settings_uint(settings,   &uint_settings_size);
+   {
+      struct config_uint_setting *tmp = populate_settings_uint(settings, &uint_settings_size);
+      uint_settings = (struct config_uint_setting*)malloc(uint_settings_size * sizeof(*uint_settings));
+      if (uint_settings)
+         memcpy(uint_settings, tmp, uint_settings_size * sizeof(*uint_settings));
+   }
    tmp_i               = SETTINGS_UINT_COUNT_MAX;
    uint_overrides      = populate_settings_uint(overrides,  &tmp_i);
 
-   size_settings       = populate_settings_size(settings,   &size_settings_size);
+   {
+      struct config_size_setting *tmp = populate_settings_size(settings, &size_settings_size);
+      size_settings = (struct config_size_setting*)malloc(size_settings_size * sizeof(*size_settings));
+      if (size_settings)
+         memcpy(size_settings, tmp, size_settings_size * sizeof(*size_settings));
+   }
    tmp_i               = SETTINGS_SIZE_COUNT_MAX;
    size_overrides      = populate_settings_size(overrides,  &tmp_i);
 
-   float_settings      = populate_settings_float(settings,  &float_settings_size);
+   {
+      struct config_float_setting *tmp = populate_settings_float(settings, &float_settings_size);
+      float_settings = (struct config_float_setting*)malloc(float_settings_size * sizeof(*float_settings));
+      if (float_settings)
+         memcpy(float_settings, tmp, float_settings_size * sizeof(*float_settings));
+   }
    tmp_i               = SETTINGS_FLOAT_COUNT_MAX;
    float_overrides     = populate_settings_float(overrides, &tmp_i);
 
-   array_settings      = populate_settings_array(settings,  &array_settings_size);
+   {
+      struct config_array_setting *tmp = populate_settings_array(settings, &array_settings_size);
+      array_settings = (struct config_array_setting*)malloc(array_settings_size * sizeof(*array_settings));
+      if (array_settings)
+         memcpy(array_settings, tmp, array_settings_size * sizeof(*array_settings));
+   }
    tmp_i               = SETTINGS_ARRAY_COUNT_MAX;
    array_overrides     = populate_settings_array(overrides, &tmp_i);
 
-   path_settings       = populate_settings_path(settings,   &path_settings_size);
+   {
+      struct config_path_setting *tmp = populate_settings_path(settings, &path_settings_size);
+      path_settings = (struct config_path_setting*)malloc(path_settings_size * sizeof(*path_settings));
+      if (path_settings)
+         memcpy(path_settings, tmp, path_settings_size * sizeof(*path_settings));
+   }
    tmp_i               = SETTINGS_PATH_COUNT_MAX;
    path_overrides      = populate_settings_path(overrides,  &tmp_i);
 
@@ -6215,34 +6251,15 @@ int8_t config_save_overrides(enum override_type type,
    /* Since config_load_file resets binds, restore overrides back to current binds */
    memcpy(input_config_binds, input_override_binds, sizeof(input_config_binds));
 
-   if (bool_settings)
-      free(bool_settings);
-   if (bool_overrides)
-      free(bool_overrides);
-   if (int_settings)
-      free(int_settings);
-   if (uint_settings)
-      free(uint_settings);
-   if (size_settings)
-      free(size_settings);
-   if (int_overrides)
-      free(int_overrides);
-   if (uint_overrides)
-      free(uint_overrides);
-   if (float_settings)
-      free(float_settings);
-   if (float_overrides)
-      free(float_overrides);
-   if (array_settings)
-      free(array_settings);
-   if (array_overrides)
-      free(array_overrides);
-   if (path_settings)
-      free(path_settings);
-   if (path_overrides)
-      free(path_overrides);
-   if (size_overrides)
-      free(size_overrides);
+   /* Free the malloc'd snapshot copies of settings
+    * (overrides pointers point to static buffers, no free needed) */
+   free(bool_settings);
+   free(int_settings);
+   free(uint_settings);
+   free(size_settings);
+   free(float_settings);
+   free(array_settings);
+   free(path_settings);
    free(settings);
 
    return ret;
@@ -6496,7 +6513,8 @@ bool input_remapping_save_file(const char *path)
          continue;
 
       _len = snprintf(formatted_number, sizeof(formatted_number), "%u", i + 1);
-      if (_len >= sizeof(formatted_number)) {
+      if (_len >= sizeof(formatted_number))
+      {
          RARCH_ERR("[Config] Unexpectedly high number of users.");
          break;
       }
@@ -7025,11 +7043,8 @@ void input_config_parse_joy_button(
    config_file_t *conf             = (config_file_t*)data;
    struct retro_keybind *bind      = (struct retro_keybind*)bind_data;
    struct config_entry_list *tmp_a = NULL;
-
    tmp[0]                          = '\0';
-
    fill_pathname_join_delim(key, s, "btn", '_', sizeof(key));
-
    if (config_get_array(conf, key, tmp, sizeof(tmp)))
    {
       btn = tmp;
@@ -7045,7 +7060,7 @@ void input_config_parse_joy_button(
          {
             const char *str = btn + 1;
             /* Parse hat? */
-            if (str && ISDIGIT((int)*str))
+            if (str && *str >= '0' && *str <= '9')
             {
                char        *dir = NULL;
                uint16_t     hat = strtoul(str, &dir, 0);
@@ -7056,16 +7071,12 @@ void input_config_parse_joy_button(
          }
          else
             bind->joykey = strtoull(tmp, NULL, 0);
-
          bind->valid = true;
       }
    }
-
    fill_pathname_join_delim(key, s,
          "btn_label", '_', sizeof(key));
-
    tmp_a = config_get_entry(conf, key);
-
    if (tmp_a && !string_is_empty(tmp_a->value))
    {
       if (!string_is_empty(bind->joykey_label))

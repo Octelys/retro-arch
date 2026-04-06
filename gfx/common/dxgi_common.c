@@ -14,7 +14,6 @@
  */
 
 #include <compat/strl.h>
-#include <string/stdstring.h>
 #include <retro_environment.h>
 
 #ifdef HAVE_CONFIG_H
@@ -188,7 +187,7 @@ DXGI_FORMAT* dxgi_get_format_fallback_list(DXGI_FORMAT format)
          { \
             for (j = 0; j < width; j++) \
             { \
-               unsigned r, g, b, a; \
+               unsigned r = 0, g = 0, b = 0, a = 0; \
                src_type src_val = *src_ptr++; \
                if (src_rb) \
                { \
@@ -683,6 +682,7 @@ void dxgi_set_hdr_metadata(
       float                         max_fall
 )
 {
+   /* TODO/FIXME - static globals - not thread-safe */
    static DXGI_HDR_METADATA_HDR10 g_hdr10_meta_data = {0};
    static const display_chromaticities_t
       display_chromaticity_list[]                   =
@@ -762,10 +762,10 @@ void dxgi_set_hdr_metadata(
    hdr10_meta_data.MaxFrameAverageLightLevel    =
       (UINT16)(max_fall);
 
-   if (g_hdr10_meta_data.RedPrimary                 != hdr10_meta_data.RedPrimary            ||
-       g_hdr10_meta_data.GreenPrimary               != hdr10_meta_data.GreenPrimary          ||
-       g_hdr10_meta_data.BluePrimary                != hdr10_meta_data.BluePrimary           ||
-       g_hdr10_meta_data.WhitePoint                 != hdr10_meta_data.WhitePoint            ||
+   if (memcmp(g_hdr10_meta_data.RedPrimary,   hdr10_meta_data.RedPrimary,   sizeof(hdr10_meta_data.RedPrimary))   ||
+       memcmp(g_hdr10_meta_data.GreenPrimary, hdr10_meta_data.GreenPrimary, sizeof(hdr10_meta_data.GreenPrimary)) ||
+       memcmp(g_hdr10_meta_data.BluePrimary,  hdr10_meta_data.BluePrimary,  sizeof(hdr10_meta_data.BluePrimary))  ||
+       memcmp(g_hdr10_meta_data.WhitePoint,   hdr10_meta_data.WhitePoint,   sizeof(hdr10_meta_data.WhitePoint))   ||
        g_hdr10_meta_data.MaxContentLightLevel       != hdr10_meta_data.MaxContentLightLevel  ||
        g_hdr10_meta_data.MaxMasteringLuminance      != hdr10_meta_data.MaxMasteringLuminance ||
        g_hdr10_meta_data.MinMasteringLuminance      != hdr10_meta_data.MinMasteringLuminance ||

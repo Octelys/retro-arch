@@ -32,6 +32,7 @@
 #include <retro_common_api.h>
 #include <retro_inline.h>
 #include <compat/strl.h>
+#include <compat/posix_string.h>
 
 RETRO_BEGIN_DECLS
 
@@ -59,12 +60,16 @@ RETRO_BEGIN_DECLS
 
 static INLINE bool string_is_empty(const char *data)
 {
-   return !data || (*data == '\0');
+   return !data || !*data;
 }
 
 static INLINE bool string_is_equal(const char *a, const char *b)
 {
-   return (a && b) ? !strcmp(a, b) : false;
+   if (a == b)
+      return true;
+   if (!a || !b)
+      return false;
+   return !strcmp(a, b);
 }
 
 static INLINE bool string_starts_with_size(const char *str, const char *prefix,
@@ -108,7 +113,6 @@ static INLINE size_t strlen_size(const char *str, size_t len)
       while (i < len && str[i]) i++;
    return i;
 }
-
 
 static INLINE bool string_is_equal_case_insensitive(const char *a,
       const char *b)
@@ -263,17 +267,19 @@ size_t word_wrap_wideglyph(
  *        token = NULL;
  *    }
  **/
-char* string_tokenize(char **str, const char *delim);
+char *string_tokenize(char **str, const char *delim);
 
 /**
  * string_remove_all_chars:
- * @str                : input string (must be non-NULL, otherwise UB)
+ * @s                 : input string (must be non-NULL, otherwise UB)
  *
  * Leaf function.
  *
- * Removes every instance of character @c from @str
+ * Removes every instance of character @c from @s
+ *
+ * Returns the length of the resulting string.
  **/
-void string_remove_all_chars(char *str, char c);
+size_t string_remove_all_chars(char *s, char c);
 
 /**
  * string_replace_all_chars:
@@ -345,8 +351,9 @@ void string_replace_multi_space_with_single_space(char *str);
  * Leaf function.
  *
  * Remove all spaces from the given string.
+ * Returns the length of the resulting string.
  **/
-void string_remove_all_whitespace(char *str_trimmed, const char *str);
+size_t string_remove_all_whitespace(char *str_trimmed, const char *str);
 
 /* Retrieve the last occurance of the given character in a string. */
 int string_index_last_occurance(const char *str, char c);
