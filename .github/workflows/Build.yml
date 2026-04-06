@@ -15,31 +15,31 @@ permissions:
 
 jobs:
 
-  build-linux:
-    name: Linux (i686)
-    uses: ./.github/workflows/Linux.yml
+  #build-linux:
+  #  name: Linux (i686)
+  #  uses: ./.github/workflows/Linux.yml
 
   build-macos:
     name: macOS
     uses: ./.github/workflows/MacOS.yml
 
-  build-windows-x64:
-    name: Windows x64 (MXE)
-    uses: ./.github/workflows/Windows-x64-MXE.yml
+  #build-windows-x64:
+  #  name: Windows x64 (MXE)
+  #  uses: ./.github/workflows/Windows-x64-MXE.yml
 
-  build-windows-arm64:
-    name: Windows ARM64 (MSVC)
-    uses: ./.github/workflows/Windows-ARM64.yml
+  #build-windows-arm64:
+  #  name: Windows ARM64 (MSVC)
+  #  uses: ./.github/workflows/Windows-ARM64.yml
 
   create-release:
     name: Create Release
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     needs:
-      - build-linux
+      #- build-linux
       - build-macos
-      - build-windows-x64
-      - build-windows-arm64
+      #- build-windows-x64
+      #- build-windows-arm64
     defaults:
       run:
         shell: bash

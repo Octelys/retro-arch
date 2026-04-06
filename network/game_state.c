@@ -454,9 +454,10 @@ size_t game_state_achievements_to_json(const rc_client_t *client,
             }
             first = false;
 
-            n = snprintf(buf + pos, buf_size - pos,
-                  "{\"id\":%u,\"points\":%u,\"status\":\"%s\"",
-                  (unsigned)ach->id, (unsigned)ach->points, status);
+             n = snprintf(buf + pos, buf_size - pos,
+                   "{\"id\":%u,\"points\":%u,\"status\":\"%s\",\"unlock_time\":%lld",
+                   (unsigned)ach->id, (unsigned)ach->points, status,
+                   (long long)ach->unlock_time);
             if (n > 0)
                pos += (size_t)n;
 
@@ -465,6 +466,15 @@ size_t game_state_achievements_to_json(const rc_client_t *client,
 
             if (!string_is_empty(ach->badge_url))
                json_append_field(buf, &pos, buf_size, "badge_url", ach->badge_url);
+
+            if (!string_is_empty(ach->measured_progress))
+            {
+               json_append_field(buf, &pos, buf_size, "measured_progress", ach->measured_progress);
+               n = snprintf(buf + pos, buf_size - pos,
+                     ",\"measured_percent\":%.2f", ach->measured_percent);
+               if (n > 0)
+                  pos += (size_t)n;
+            }
 
             if (pos + 1 < buf_size)
                buf[pos++] = '}';
