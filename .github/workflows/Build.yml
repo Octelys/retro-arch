@@ -14,7 +14,7 @@ permissions:
 jobs:
 
   build-linux:
-    name: Linux (i686)
+    name: Linux
     uses: ./.github/workflows/Linux.yml
 
   build-macos:
@@ -22,7 +22,7 @@ jobs:
     uses: ./.github/workflows/MacOS.yml
 
   build-windows-x64:
-    name: Windows x64 (MXE)
+    name: Windows x64
     uses: ./.github/workflows/Windows-x64-MXE.yml
 
   #build-windows-arm64:
