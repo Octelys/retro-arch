@@ -48,22 +48,17 @@ jobs:
         run: |
           : Check Release Tag
           if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
-          shopt -s extglob
 
-          # Accept any non-empty tag — the fork uses free-form tags like
-          # "octelys.1" whose version is built by combining with the
-          # upstream RA release number.  Pre-release is flagged by the
-          # presence of -beta or -rc anywhere in the tag.
           TAG="${GITHUB_REF_NAME}"
-          if [[ -z "$TAG" ]]; then
-            echo 'validTag=false' >> $GITHUB_OUTPUT
-          else
+
+          # Only accept tags in the form v<number> (e.g. v1, v2, v42)
+          if [[ "$TAG" =~ ^v([0-9]+)$ ]]; then
             echo 'validTag=true' >> $GITHUB_OUTPUT
-            if [[ "$TAG" =~ -[bB]eta|-[rR][cC] ]]; then
-              echo 'prerelease=true' >> $GITHUB_OUTPUT
-            else
-              echo 'prerelease=false' >> $GITHUB_OUTPUT
-            fi
+            echo 'prerelease=false' >> $GITHUB_OUTPUT
+            echo "build_number=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
+          else
+            echo "::error::Tag '${TAG}' does not match required format v<number> (e.g. v1, v2, v42). Stopping."
+            echo 'validTag=false' >> $GITHUB_OUTPUT
           fi
 
       - name: Checkout repository
@@ -112,10 +107,9 @@ jobs:
         if: fromJSON(steps.check.outputs.validTag)
         run: |
           : Build combined version string
-          MY_TAG="${GITHUB_REF_NAME}"
           RA="${{ steps.upstream.outputs.ra_version }}"
-          COMBINED="${RA}-${MY_TAG}"
-          echo "version=${COMBINED}" >> $GITHUB_OUTPUT
+          BUILD="${{ steps.check.outputs.build_number }}"
+          echo "version=${RA}.${BUILD}" >> $GITHUB_OUTPUT
 
       - name: Download Build Artifacts
         uses: actions/download-artifact@v4

@@ -62,11 +62,11 @@ libretro/RetroArch
                                     ▼
              main: [v1.23.0 code] ── [feature A'] ── [feature B']
                   │                                                │
-                  │  you branch off here                     git tag octelys.1
+                  │  you branch off here                     git tag v1
                   │                                                │
                   ├── feature/ws-server       ──► PR ──► main     ▼
                   ├── feature/achievement-events ► PR ──► main  GitHub Release
-                  └── feature/...                                "RetroArch 1.23.0-octelys.1"
+                  └── feature/...                                "RetroArch 1.23.0.1"
 ```
 
 ---
@@ -144,18 +144,18 @@ After this, `main` = `[RA v1.23.0 code] + [your features]`. ✅
 > Do this after main has been rebased onto the desired upstream release.
 
 ```zsh
-# Your tag is just your own suffix.
-# Build.yml automatically fetches the upstream version and prepends it.
-git tag octelys.1
-git push origin octelys.1
-# → Build.yml fires → GitHub Release created: "RetroArch 1.23.0-octelys.1"
+# Your tag is a version number prefixed with v.
+# Build.yml combines it with the upstream RA version: <ra>.<build_number>
+git tag v1
+git push origin v1
+# → Build.yml fires → GitHub Release created: "RetroArch 1.23.0.1"
 ```
 
 To publish a second release on the same upstream version:
 ```zsh
-git tag octelys.2
-git push origin octelys.2
-# → GitHub Release: "RetroArch 1.23.0-octelys.2"
+git tag v2
+git push origin v2
+# → GitHub Release: "RetroArch 1.23.0.2"
 ```
 
 ---
