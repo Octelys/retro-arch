@@ -41,16 +41,29 @@ jobs:
       - name: Compile RA
         run: make -j$(getconf _NPROCESSORS_ONLN) HAVE_DBUS=1 HAVE_TRANSLATE=1 HAVE_ACCESSIBILITY=1 HAVE_WEBSOCKET_SERVER=1
 
+      - name: Download companion assets
+        run: |
+          git clone --depth=1 https://github.com/libretro/retroarch-assets.git        assets-repo
+          git clone --depth=1 https://github.com/libretro/libretro-core-info.git      core-info-repo
+          git clone --depth=1 https://github.com/libretro/retroarch-joypad-autoconfig.git joypad-repo
+
       - name: Bundle release
         run: |
           SHA=$(echo ${GITHUB_SHA} | cut -c1-8)
           BUNDLE=retroarch-linux-x86_64-${SHA}
-          mkdir -p ${BUNDLE}
+          mkdir -p ${BUNDLE}/assets ${BUNDLE}/info ${BUNDLE}/autoconfig
+
           cp retroarch ${BUNDLE}/
+
+          # Assets (fonts, icons, menu graphics)
+          rsync -a --exclude='.git' assets-repo/. ${BUNDLE}/assets/
+          # Core info
+          rsync -a --exclude='.git' core-info-repo/. ${BUNDLE}/info/
+          # Joypad autoconfig profiles
+          rsync -a --exclude='.git' joypad-repo/. ${BUNDLE}/autoconfig/
 
           # Bundle libwebsockets shared library so the binary runs without
           # requiring the user to install it separately.
-          # dpkg -L gives exact file paths for the installed runtime package.
           for f in $(dpkg -L libwebsockets19t64 libwebsockets19 2>/dev/null | grep '\.so'); do
             [[ -f "$f" ]] && cp -L "$f" ${BUNDLE}/
           done

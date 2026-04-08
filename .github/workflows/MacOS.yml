@@ -32,12 +32,27 @@ jobs:
       id: slug
       run: echo "sha8=$(echo ${GITHUB_SHA} | cut -c1-8)" >> $GITHUB_OUTPUT
 
+    - name: Download companion assets
+      run: |
+        git clone --depth=1 https://github.com/libretro/retroarch-assets.git        assets-repo
+        git clone --depth=1 https://github.com/libretro/libretro-core-info.git      core-info-repo
+        git clone --depth=1 https://github.com/libretro/retroarch-joypad-autoconfig.git joypad-repo
+
     - name: Bundle release
       run: |
         SHA=${{ steps.slug.outputs.sha8 }}
         BUNDLE=retroarch-macos-${SHA}
         APP=build/Build/Products/Release/RetroArch.app
-        mkdir -p ${BUNDLE}
+        RESOURCES=${APP}/Contents/Resources
+        mkdir -p ${BUNDLE} ${RESOURCES}/assets ${RESOURCES}/info ${RESOURCES}/autoconfig
+
+        # Assets (fonts, icons, menu graphics)
+        rsync -a --exclude='.git' assets-repo/. ${RESOURCES}/assets/
+        # Core info
+        rsync -a --exclude='.git' core-info-repo/. ${RESOURCES}/info/
+        # Joypad autoconfig profiles
+        rsync -a --exclude='.git' joypad-repo/. ${RESOURCES}/autoconfig/
+
         cp -r ${APP} ${BUNDLE}/
         zip -r ${BUNDLE}.zip ${BUNDLE}/
 
