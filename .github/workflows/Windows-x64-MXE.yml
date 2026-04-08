@@ -55,11 +55,12 @@ jobs:
         mkdir -p ${BUNDLE}
         cp retroarch.exe ${BUNDLE}/RetroArch.exe
 
-        # Bundle libwebsockets DLL so the binary runs without a separate install.
-        # MinGW installs it under /mingw64/bin/
-        for dll in /mingw64/bin/libwebsockets*.dll; do
-          [[ -f "$dll" ]] && cp "$dll" ${BUNDLE}/
-        done
+        # Copy all MinGW runtime DLLs that RetroArch.exe depends on
+        # (libwebsockets, mbedTLS, libgcc, libwinpthread, etc.)
+        # ldd prints lines like: "libfoo.dll => /mingw64/bin/libfoo.dll (0x...)"
+        ldd retroarch.exe \
+          | awk '/\/mingw64\/bin\//{print $3}' \
+          | xargs -I{} cp {} ${BUNDLE}/
 
         zip -r ${BUNDLE}.zip ${BUNDLE}/
 
