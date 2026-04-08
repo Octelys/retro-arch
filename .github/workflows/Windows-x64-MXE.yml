@@ -29,6 +29,7 @@ jobs:
           base-devel
           git
           zip
+          rsync
           mingw-w64-x86_64-toolchain
           mingw-w64-x86_64-pkg-config
           mingw-w64-x86_64-SDL2
