@@ -46,24 +46,49 @@ jobs:
           git clone --depth=1 https://github.com/libretro/retroarch-assets.git        assets-repo
           git clone --depth=1 https://github.com/libretro/libretro-core-info.git      core-info-repo
           git clone --depth=1 https://github.com/libretro/retroarch-joypad-autoconfig.git joypad-repo
+          git clone --depth=1 https://github.com/libretro/libretro-database.git       database-repo
+          git clone --depth=1 https://github.com/libretro/common-overlays.git         overlays-repo
+          git clone --depth=1 https://github.com/libretro/glsl-shaders.git            glsl-repo
 
       - name: Bundle release
         run: |
           SHA=$(echo ${GITHUB_SHA} | cut -c1-8)
           BUNDLE=retroarch-linux-x86_64-${SHA}
-          mkdir -p ${BUNDLE}/assets ${BUNDLE}/info ${BUNDLE}/autoconfig
+          mkdir -p ${BUNDLE}/assets ${BUNDLE}/info ${BUNDLE}/autoconfig \
+                   ${BUNDLE}/database ${BUNDLE}/overlays ${BUNDLE}/shaders \
+                   ${BUNDLE}/saves ${BUNDLE}/screenshots ${BUNDLE}/states \
+                   ${BUNDLE}/system ${BUNDLE}/filters
 
           cp retroarch ${BUNDLE}/
+          cp retroarch.cfg ${BUNDLE}/retroarch.default.cfg 2>/dev/null || true
 
-          # Assets (fonts, icons, menu graphics)
-          rsync -a --exclude='.git' assets-repo/. ${BUNDLE}/assets/
-          # Core info
-          rsync -a --exclude='.git' core-info-repo/. ${BUNDLE}/info/
-          # Joypad autoconfig profiles
-          rsync -a --exclude='.git' joypad-repo/. ${BUNDLE}/autoconfig/
+          rsync -a \
+            --exclude='.git' --exclude='.github' --exclude='.gitignore' \
+            --exclude='.gitlab-ci.yml' \
+            --exclude='src/' --exclude='scripts/' --exclude='branding/' \
+            --exclude='ctr/' --exclude='nxrgui/' --exclude='switch/' --exclude='pkg/' \
+            --exclude='Makefile' --exclude='configure' \
+            --exclude='README.md' --exclude='COPYING' \
+            assets-repo/.       ${BUNDLE}/assets/
+          rsync -a \
+            --exclude='.git' --exclude='Makefile' --exclude='configure' \
+            --exclude='COPYING' \
+            core-info-repo/.    ${BUNDLE}/info/
+          rsync -a \
+            --exclude='.git' --exclude='Makefile' --exclude='configure' \
+            --exclude='README.md' --exclude='COPYING' \
+            joypad-repo/.       ${BUNDLE}/autoconfig/
+          rsync -a --exclude='.git' \
+            database-repo/rdb/. ${BUNDLE}/database/
+          rsync -a \
+            --exclude='.git' --exclude='Makefile' --exclude='configure' \
+            --exclude='ctr/' \
+            overlays-repo/.     ${BUNDLE}/overlays/
+          rsync -a \
+            --exclude='.git' --exclude='Makefile' --exclude='configure' \
+            glsl-repo/.         ${BUNDLE}/shaders/
 
-          # Bundle libwebsockets shared library so the binary runs without
-          # requiring the user to install it separately.
+          # Bundle libwebsockets shared library
           for f in $(dpkg -L libwebsockets19t64 libwebsockets19 2>/dev/null | grep '\.so'); do
             [[ -f "$f" ]] && cp -L "$f" ${BUNDLE}/
           done

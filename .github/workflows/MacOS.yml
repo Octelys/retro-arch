@@ -37,6 +37,9 @@ jobs:
         git clone --depth=1 https://github.com/libretro/retroarch-assets.git        assets-repo
         git clone --depth=1 https://github.com/libretro/libretro-core-info.git      core-info-repo
         git clone --depth=1 https://github.com/libretro/retroarch-joypad-autoconfig.git joypad-repo
+        git clone --depth=1 https://github.com/libretro/libretro-database.git       database-repo
+        git clone --depth=1 https://github.com/libretro/common-overlays.git         overlays-repo
+        git clone --depth=1 https://github.com/libretro/glsl-shaders.git            glsl-repo
 
     - name: Bundle release
       run: |
@@ -44,14 +47,37 @@ jobs:
         BUNDLE=retroarch-macos-${SHA}
         APP=build/Build/Products/Release/RetroArch.app
         RESOURCES=${APP}/Contents/Resources
-        mkdir -p ${BUNDLE} ${RESOURCES}/assets ${RESOURCES}/info ${RESOURCES}/autoconfig
+        mkdir -p ${BUNDLE} \
+                 ${RESOURCES}/assets ${RESOURCES}/info ${RESOURCES}/autoconfig \
+                 ${RESOURCES}/database ${RESOURCES}/overlays ${RESOURCES}/shaders \
+                 ${RESOURCES}/saves ${RESOURCES}/screenshots ${RESOURCES}/states \
+                 ${RESOURCES}/system ${RESOURCES}/filters
 
-        # Assets (fonts, icons, menu graphics)
-        rsync -a --exclude='.git' assets-repo/. ${RESOURCES}/assets/
-        # Core info
-        rsync -a --exclude='.git' core-info-repo/. ${RESOURCES}/info/
-        # Joypad autoconfig profiles
-        rsync -a --exclude='.git' joypad-repo/. ${RESOURCES}/autoconfig/
+        rsync -a \
+          --exclude='.git' --exclude='.github' --exclude='.gitignore' \
+          --exclude='.gitlab-ci.yml' \
+          --exclude='src/' --exclude='scripts/' --exclude='branding/' \
+          --exclude='ctr/' --exclude='nxrgui/' --exclude='switch/' --exclude='pkg/' \
+          --exclude='Makefile' --exclude='configure' \
+          --exclude='README.md' --exclude='COPYING' \
+          assets-repo/.       ${RESOURCES}/assets/
+        rsync -a \
+          --exclude='.git' --exclude='Makefile' --exclude='configure' \
+          --exclude='COPYING' \
+          core-info-repo/.    ${RESOURCES}/info/
+        rsync -a \
+          --exclude='.git' --exclude='Makefile' --exclude='configure' \
+          --exclude='README.md' --exclude='COPYING' \
+          joypad-repo/.       ${RESOURCES}/autoconfig/
+        rsync -a --exclude='.git' \
+          database-repo/rdb/. ${RESOURCES}/database/
+        rsync -a \
+          --exclude='.git' --exclude='Makefile' --exclude='configure' \
+          --exclude='ctr/' \
+          overlays-repo/.     ${RESOURCES}/overlays/
+        rsync -a \
+          --exclude='.git' --exclude='Makefile' --exclude='configure' \
+          glsl-repo/.         ${RESOURCES}/shaders/
 
         cp -r ${APP} ${BUNDLE}/
         zip -r ${BUNDLE}.zip ${BUNDLE}/
