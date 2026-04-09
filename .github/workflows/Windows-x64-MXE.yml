@@ -53,6 +53,15 @@ jobs:
         git clone --depth=1 https://github.com/libretro/libretro-database.git          database-repo
         git clone --depth=1 https://github.com/libretro/common-overlays.git            overlays-repo
         git clone --depth=1 https://github.com/libretro/glsl-shaders.git               glsl-repo
+        git clone --depth=1 https://github.com/libretro/RetroArch-Video-Filters.git    video-filters-repo
+        git clone --depth=1 https://github.com/libretro/RetroArch-Audio-Filters.git    audio-filters-repo
+
+    - name: Build filters
+      run: |
+        # Build video filters
+        make -C video-filters-repo -j$(getconf _NPROCESSORS_ONLN)
+        # Build audio filters
+        make -C audio-filters-repo -j$(getconf _NPROCESSORS_ONLN)
 
     - name: Get short SHA
       id: slug
@@ -66,7 +75,8 @@ jobs:
                  ${BUNDLE}/database/rdb ${BUNDLE}/database/cursors \
                  ${BUNDLE}/overlays ${BUNDLE}/shaders/shaders_glsl \
                  ${BUNDLE}/saves ${BUNDLE}/screenshots ${BUNDLE}/states \
-                 ${BUNDLE}/system ${BUNDLE}/filters
+                 ${BUNDLE}/system \
+                 ${BUNDLE}/filters/video ${BUNDLE}/filters/audio
 
         cp retroarch.exe ${BUNDLE}/RetroArch.exe
         cp retroarch.cfg ${BUNDLE}/retroarch.default.cfg 2>/dev/null || true
@@ -105,6 +115,11 @@ jobs:
         rsync -a \
           --exclude='.git' --exclude='Makefile' --exclude='configure' \
           glsl-repo/.             ${BUNDLE}/shaders/shaders_glsl/
+        # filters: video (.dll + .filt) and audio (.dll + .dsp)
+        find video-filters-repo -maxdepth 1 \( -name '*.dll' -o -name '*.filt' \) \
+          -exec cp {} ${BUNDLE}/filters/video/ \;
+        find audio-filters-repo -maxdepth 1 \( -name '*.dll' -o -name '*.dsp' \) \
+          -exec cp {} ${BUNDLE}/filters/audio/ \;
 
         # Copy all MinGW runtime DLLs that RetroArch.exe depends on
         ldd retroarch.exe \
