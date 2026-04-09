@@ -49,7 +49,8 @@ jobs:
         RESOURCES=${APP}/Contents/Resources
         mkdir -p ${BUNDLE} \
                  ${RESOURCES}/assets ${RESOURCES}/info ${RESOURCES}/autoconfig \
-                 ${RESOURCES}/database ${RESOURCES}/overlays ${RESOURCES}/shaders \
+                 ${RESOURCES}/database/rdb ${RESOURCES}/database/cursors \
+                 ${RESOURCES}/overlays ${RESOURCES}/shaders/shaders_glsl \
                  ${RESOURCES}/saves ${RESOURCES}/screenshots ${RESOURCES}/states \
                  ${RESOURCES}/system ${RESOURCES}/filters
 
@@ -57,27 +58,25 @@ jobs:
           --exclude='.git' --exclude='.github' --exclude='.gitignore' \
           --exclude='.gitlab-ci.yml' \
           --exclude='src/' --exclude='scripts/' --exclude='branding/' \
-          --exclude='ctr/' --exclude='nxrgui/' --exclude='switch/' --exclude='pkg/' \
+          --exclude='ctr/' --exclude='nxrgui/' --exclude='switch/' \
+          --exclude='fonts/' --exclude='wallpapers/' \
           --exclude='Makefile' --exclude='configure' \
           --exclude='README.md' --exclude='COPYING' \
-          assets-repo/.       ${RESOURCES}/assets/
+          assets-repo/.           ${RESOURCES}/assets/
+        rsync -a \
+          --exclude='.git' --exclude='Makefile' --exclude='configure' --exclude='COPYING' \
+          core-info-repo/.        ${RESOURCES}/info/
+        rsync -a --exclude='.git' joypad-repo/sdl2/.     ${RESOURCES}/autoconfig/sdl2/
+        rsync -a --exclude='.git' joypad-repo/hid/.      ${RESOURCES}/autoconfig/hid/
+        rsync -a --exclude='.git' joypad-repo/mfi/.      ${RESOURCES}/autoconfig/mfi/
+        rsync -a --exclude='.git' database-repo/rdb/.    ${RESOURCES}/database/rdb/
+        rsync -a --exclude='.git' database-repo/cursors/. ${RESOURCES}/database/cursors/
+        rsync -a \
+          --exclude='.git' --exclude='Makefile' --exclude='configure' --exclude='ctr/' \
+          overlays-repo/.         ${RESOURCES}/overlays/
         rsync -a \
           --exclude='.git' --exclude='Makefile' --exclude='configure' \
-          --exclude='COPYING' \
-          core-info-repo/.    ${RESOURCES}/info/
-        rsync -a \
-          --exclude='.git' --exclude='Makefile' --exclude='configure' \
-          --exclude='README.md' --exclude='COPYING' \
-          joypad-repo/.       ${RESOURCES}/autoconfig/
-        rsync -a --exclude='.git' \
-          database-repo/rdb/. ${RESOURCES}/database/
-        rsync -a \
-          --exclude='.git' --exclude='Makefile' --exclude='configure' \
-          --exclude='ctr/' \
-          overlays-repo/.     ${RESOURCES}/overlays/
-        rsync -a \
-          --exclude='.git' --exclude='Makefile' --exclude='configure' \
-          glsl-repo/.         ${RESOURCES}/shaders/
+          glsl-repo/.             ${RESOURCES}/shaders/shaders_glsl/
 
         cp -r ${APP} ${BUNDLE}/
         zip -r ${BUNDLE}.zip ${BUNDLE}/

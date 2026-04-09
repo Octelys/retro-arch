@@ -63,38 +63,48 @@ jobs:
         SHA=${{ steps.slug.outputs.sha8 }}
         BUNDLE=retroarch-windows-x64-${SHA}
         mkdir -p ${BUNDLE}/assets ${BUNDLE}/info ${BUNDLE}/autoconfig \
-                 ${BUNDLE}/database ${BUNDLE}/overlays ${BUNDLE}/shaders \
+                 ${BUNDLE}/database/rdb ${BUNDLE}/database/cursors \
+                 ${BUNDLE}/overlays ${BUNDLE}/shaders/shaders_glsl \
                  ${BUNDLE}/saves ${BUNDLE}/screenshots ${BUNDLE}/states \
                  ${BUNDLE}/system ${BUNDLE}/filters
 
         cp retroarch.exe ${BUNDLE}/RetroArch.exe
         cp retroarch.cfg ${BUNDLE}/retroarch.default.cfg 2>/dev/null || true
 
+        # assets: keep pkg/ (fallback fonts), drop src/ scripts/ branding/ fonts/ wallpapers/ platform dirs
         rsync -a \
           --exclude='.git' --exclude='.github' --exclude='.gitignore' \
           --exclude='.gitlab-ci.yml' \
           --exclude='src/' --exclude='scripts/' --exclude='branding/' \
-          --exclude='ctr/' --exclude='nxrgui/' --exclude='switch/' --exclude='pkg/' \
+          --exclude='ctr/' --exclude='nxrgui/' --exclude='switch/' \
+          --exclude='fonts/' --exclude='wallpapers/' \
           --exclude='Makefile' --exclude='configure' \
           --exclude='README.md' --exclude='COPYING' \
-          assets-repo/.       ${BUNDLE}/assets/
+          assets-repo/.           ${BUNDLE}/assets/
+        # info: all .info files live at root of repo
         rsync -a \
-          --exclude='.git' --exclude='Makefile' --exclude='configure' \
-          --exclude='COPYING' \
-          core-info-repo/.    ${BUNDLE}/info/
-        rsync -a \
-          --exclude='.git' --exclude='Makefile' --exclude='configure' \
-          --exclude='README.md' --exclude='COPYING' \
-          joypad-repo/.       ${BUNDLE}/autoconfig/
+          --exclude='.git' --exclude='Makefile' --exclude='configure' --exclude='COPYING' \
+          core-info-repo/.        ${BUNDLE}/info/
+        # autoconfig: Windows-relevant drivers only
         rsync -a --exclude='.git' \
-          database-repo/rdb/. ${BUNDLE}/database/
+          joypad-repo/dinput/.    ${BUNDLE}/autoconfig/dinput/
+        rsync -a --exclude='.git' \
+          joypad-repo/sdl2/.      ${BUNDLE}/autoconfig/sdl2/
+        rsync -a --exclude='.git' \
+          joypad-repo/xinput/.    ${BUNDLE}/autoconfig/xinput/
+        rsync -a --exclude='.git' \
+          joypad-repo/hid/.       ${BUNDLE}/autoconfig/hid/
+        # database: rdb/ and cursors/ as subdirs
+        rsync -a --exclude='.git' database-repo/rdb/.     ${BUNDLE}/database/rdb/
+        rsync -a --exclude='.git' database-repo/cursors/. ${BUNDLE}/database/cursors/
+        # overlays
+        rsync -a \
+          --exclude='.git' --exclude='Makefile' --exclude='configure' --exclude='ctr/' \
+          overlays-repo/.         ${BUNDLE}/overlays/
+        # shaders: glsl inside shaders/shaders_glsl/ to match official layout
         rsync -a \
           --exclude='.git' --exclude='Makefile' --exclude='configure' \
-          --exclude='ctr/' \
-          overlays-repo/.     ${BUNDLE}/overlays/
-        rsync -a \
-          --exclude='.git' --exclude='Makefile' --exclude='configure' \
-          glsl-repo/.         ${BUNDLE}/shaders/
+          glsl-repo/.             ${BUNDLE}/shaders/shaders_glsl/
 
         # Copy all MinGW runtime DLLs that RetroArch.exe depends on
         ldd retroarch.exe \
