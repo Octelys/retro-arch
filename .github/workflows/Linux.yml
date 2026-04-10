@@ -39,7 +39,16 @@ jobs:
         run: ./configure --disable-qt
 
       - name: Compile RA
-        run: make -j$(getconf _NPROCESSORS_ONLN) HAVE_DBUS=1 HAVE_TRANSLATE=1 HAVE_ACCESSIBILITY=1 HAVE_WEBSOCKET_SERVER=1 LDFLAGS="-Wl,-rpath,\$$ORIGIN"
+        run: |
+          # Embed $ORIGIN rpath so the binary finds bundled .so files next to itself.
+          # Makefile.local is -include'd by the main Makefile; writing the flag here
+          # avoids bash/make quoting issues that break $ORIGIN on the command line.
+          echo 'LDFLAGS += -Wl,-rpath,\$$ORIGIN' > Makefile.local
+          make -j$(getconf _NPROCESSORS_ONLN) \
+            HAVE_DBUS=1 \
+            HAVE_TRANSLATE=1 \
+            HAVE_ACCESSIBILITY=1 \
+            HAVE_WEBSOCKET_SERVER=1
 
       - name: Download companion assets
         run: |
@@ -88,10 +97,25 @@ jobs:
             --exclude='.git' --exclude='Makefile' --exclude='configure' \
             glsl-repo/.             ${BUNDLE}/shaders/shaders_glsl/
 
-          # Bundle libwebsockets shared library (and any other non-system deps)
-          ldd retroarch \
-            | awk '/libwebsockets/{print $3}' \
-            | xargs -I{} cp -L {} ${BUNDLE}/
+          # Verify $ORIGIN rpath was baked in
+          if readelf -d retroarch | grep -q 'ORIGIN'; then
+            echo "✓ RPATH with \$ORIGIN found in binary"
+          else
+            echo "✗ ERROR: \$ORIGIN rpath missing from binary"
+            readelf -d retroarch | grep -i -E 'rpath|runpath' || true
+            exit 1
+          fi
+
+          # Bundle libwebsockets shared library
+          LWS_SO=$(ldd retroarch | awk '/libwebsockets/{print $3}')
+          if [ -n "$LWS_SO" ]; then
+            cp -L "$LWS_SO" ${BUNDLE}/
+            echo "✓ Bundled: $LWS_SO"
+          else
+            echo "✗ ERROR: libwebsockets not found in ldd output"
+            ldd retroarch
+            exit 1
+          fi
 
           tar -czf ${BUNDLE}.tar.gz ${BUNDLE}/
 
