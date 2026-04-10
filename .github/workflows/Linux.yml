@@ -58,7 +58,7 @@ jobs:
                    ${BUNDLE}/database/rdb ${BUNDLE}/database/cursors \
                    ${BUNDLE}/overlays ${BUNDLE}/shaders/shaders_glsl \
                    ${BUNDLE}/saves ${BUNDLE}/screenshots ${BUNDLE}/states \
-                   ${BUNDLE}/system ${BUNDLE}/filters
+                   ${BUNDLE}/system
 
           cp retroarch ${BUNDLE}/
           cp retroarch.cfg ${BUNDLE}/retroarch.default.cfg 2>/dev/null || true
@@ -88,10 +88,10 @@ jobs:
             --exclude='.git' --exclude='Makefile' --exclude='configure' \
             glsl-repo/.             ${BUNDLE}/shaders/shaders_glsl/
 
-          # Bundle libwebsockets shared library
-          for f in $(dpkg -L libwebsockets19t64 libwebsockets19 2>/dev/null | grep '\.so'); do
-            [[ -f "$f" ]] && cp -L "$f" ${BUNDLE}/
-          done
+          # Bundle libwebsockets shared library (and any other non-system deps)
+          ldd retroarch \
+            | awk '/libwebsockets/{print $3}' \
+            | xargs -I{} cp -L {} ${BUNDLE}/
 
           tar -czf ${BUNDLE}.tar.gz ${BUNDLE}/
 
