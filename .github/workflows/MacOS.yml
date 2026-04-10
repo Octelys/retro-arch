@@ -47,12 +47,24 @@ jobs:
         BUNDLE=retroarch-macos-${SHA}
         APP=build/Build/Products/Release/RetroArch.app
         RESOURCES=${APP}/Contents/Resources
+        FRAMEWORKS=${APP}/Contents/Frameworks
         mkdir -p ${BUNDLE} \
                  ${RESOURCES}/assets ${RESOURCES}/info ${RESOURCES}/autoconfig \
                  ${RESOURCES}/database/rdb ${RESOURCES}/database/cursors \
                  ${RESOURCES}/overlays ${RESOURCES}/shaders/shaders_glsl \
                  ${RESOURCES}/saves ${RESOURCES}/screenshots ${RESOURCES}/states \
-                 ${RESOURCES}/system ${RESOURCES}/filters
+                 ${RESOURCES}/system \
+                 ${FRAMEWORKS}
+
+        # Bundle libwebsockets dylib and fix its install name
+        LWS_DYLIB=$(brew --prefix libwebsockets)/lib/libwebsockets.dylib
+        cp -L "${LWS_DYLIB}" ${FRAMEWORKS}/
+        LWS_BASENAME=$(basename $(readlink -f "${LWS_DYLIB}"))
+        install_name_tool -change "${LWS_DYLIB}" \
+          "@executable_path/../Frameworks/${LWS_BASENAME}" \
+          ${APP}/Contents/MacOS/RetroArch 2>/dev/null || true
+        install_name_tool -id "@executable_path/../Frameworks/${LWS_BASENAME}" \
+          ${FRAMEWORKS}/${LWS_BASENAME}
 
         rsync -a \
           --exclude='.git' --exclude='.github' --exclude='.gitignore' \
