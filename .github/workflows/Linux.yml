@@ -39,7 +39,7 @@ jobs:
         run: ./configure --disable-qt
 
       - name: Compile RA
-        run: make -j$(getconf _NPROCESSORS_ONLN) HAVE_DBUS=1 HAVE_TRANSLATE=1 HAVE_ACCESSIBILITY=1 HAVE_WEBSOCKET_SERVER=1 LDFLAGS="-Wl,-rpath,'\$ORIGIN'"
+        run: make -j$(getconf _NPROCESSORS_ONLN) HAVE_DBUS=1 HAVE_TRANSLATE=1 HAVE_ACCESSIBILITY=1 HAVE_WEBSOCKET_SERVER=1 LDFLAGS="-Wl,-rpath,\$$ORIGIN"
 
       - name: Download companion assets
         run: |
