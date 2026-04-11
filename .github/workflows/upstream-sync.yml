@@ -58,7 +58,7 @@ jobs:
         run: |
           echo "Fork is already up to date with upstream. Nothing to do."
 
-      - name: Create sync branch - upstream/master with your features rebased on top
+      - name: "Create sync branch: upstream/master with your features rebased on top"
         if: steps.check.outputs.new_commits != '0'
         run: |
           # Start the sync branch from upstream/master (not from main)
