@@ -71,19 +71,9 @@ jobs:
 
           cp retroarch ${BUNDLE}/
 
-          # Create portable launcher script that ensures RetroArch finds
+          # Copy portable launcher script that ensures RetroArch finds
           # its bundled assets (fonts, icons, etc.) and shared libraries.
-          cat > ${BUNDLE}/retroarch.sh << 'LAUNCHER'
-#!/usr/bin/env bash
-# Portable launcher - resolves the bundle directory so that RetroArch
-# finds its bundled assets, cores, databases, and shared libraries
-# regardless of the user's current working directory.
-SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
-export LD_LIBRARY_PATH="$SCRIPT_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export LIBRETRO_ASSETS_DIRECTORY="$SCRIPT_DIR/assets"
-cd "$SCRIPT_DIR"
-exec "$SCRIPT_DIR/retroarch" "$@"
-LAUNCHER
+          cp pkg/linux/retroarch.sh ${BUNDLE}/retroarch.sh
           chmod +x ${BUNDLE}/retroarch.sh
 
           # Place osd-font.ttf in the bundle root so the font renderers'
