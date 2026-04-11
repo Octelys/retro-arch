@@ -70,6 +70,27 @@ jobs:
                    ${BUNDLE}/system
 
           cp retroarch ${BUNDLE}/
+
+          # Create portable launcher script that ensures RetroArch finds
+          # its bundled assets (fonts, icons, etc.) and shared libraries.
+          cat > ${BUNDLE}/retroarch.sh << 'LAUNCHER'
+#!/usr/bin/env bash
+# Portable launcher – resolves the bundle directory so that RetroArch
+# finds its bundled assets, cores, databases, and shared libraries
+# regardless of the user's current working directory.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export LD_LIBRARY_PATH="${SCRIPT_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LIBRETRO_ASSETS_DIRECTORY="${SCRIPT_DIR}/assets"
+cd "${SCRIPT_DIR}"
+exec "${SCRIPT_DIR}/retroarch" "$@"
+LAUNCHER
+          chmod +x ${BUNDLE}/retroarch.sh
+
+          # Place osd-font.ttf in the bundle root so the font renderers'
+          # relative-path fallback ("osd-font.ttf") finds it when CWD is
+          # the bundle directory (set by retroarch.sh above).
+          ln -sf assets/pkg/osd-font.ttf ${BUNDLE}/osd-font.ttf
+
           cp retroarch.cfg ${BUNDLE}/retroarch.default.cfg 2>/dev/null || true
 
           rsync -a \
@@ -116,6 +137,16 @@ jobs:
             ldd retroarch
             exit 1
           fi
+
+          # Bundle libfreetype and libfontconfig so OSD/menu fonts render
+          # correctly on systems where they are not installed.
+          for lib in libfreetype libfontconfig; do
+            SO=$(ldd retroarch | awk "/${lib}/"'{print $3}' | head -1)
+            if [ -n "$SO" ]; then
+              cp -L "$SO" ${BUNDLE}/
+              echo "✓ Bundled: $SO"
+            fi
+          done
 
           tar -czf ${BUNDLE}.tar.gz ${BUNDLE}/
 
