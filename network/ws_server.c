@@ -291,7 +291,7 @@ static int callback_retroarch(struct lws *wsi,
 
             /* Copy the progress snapshot for this session. */
             session->progress_id      = g_broadcast_progress_id;
-            strlcpy(session->progress_str, g_broadcast_progress_str,
+            strncpy(session->progress_str, g_broadcast_progress_str,
                   sizeof(session->progress_str));
          }
 
