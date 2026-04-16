@@ -47,12 +47,12 @@ jobs:
 
     - name: Download companion assets
       run: |
-        git clone --depth=1 https://github.com/libretro/retroarch-assets.git           assets-repo
-        git clone --depth=1 https://github.com/libretro/libretro-core-info.git         core-info-repo
-        git clone --depth=1 https://github.com/libretro/retroarch-joypad-autoconfig.git joypad-repo
-        git clone --depth=1 https://github.com/libretro/libretro-database.git          database-repo
-        git clone --depth=1 https://github.com/libretro/common-overlays.git            overlays-repo
-        git clone --depth=1 https://github.com/libretro/glsl-shaders.git               glsl-repo
+          git -c core.autocrlf=false clone --depth=1 https://github.com/libretro/retroarch-assets.git           assets-repo
+          git -c core.autocrlf=false clone --depth=1 https://github.com/libretro/libretro-core-info.git         core-info-repo
+          git -c core.autocrlf=false clone --depth=1 https://github.com/libretro/retroarch-joypad-autoconfig.git joypad-repo
+          git -c core.autocrlf=false clone --depth=1 https://github.com/libretro/libretro-database.git          database-repo
+          git -c core.autocrlf=false clone --depth=1 https://github.com/libretro/common-overlays.git            overlays-repo
+          git -c core.autocrlf=false clone --depth=1 https://github.com/libretro/glsl-shaders.git               glsl-repo
 
     - name: Get short SHA
       id: slug

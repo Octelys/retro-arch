@@ -590,6 +590,11 @@ static void rcheevos_progress_updated(rcheevos_locals_t* locals,
          && gfx_widgets_ready()
          && settings->bools.cheevos_visibility_progress_tracker)
       gfx_widget_set_achievement_progress(cheevo->badge_name, cheevo->measured_progress);
+
+   /* Broadcast the progress update via WebSocket. */
+   if (cheevo)
+      ws_server_notify_achievement_progress(cheevo->id,
+            cheevo->measured_progress);
 }
 
 static void rcheevos_progress_hide(rcheevos_locals_t* locals)
