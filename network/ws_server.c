@@ -387,7 +387,7 @@ static void ws_server_thread(void *userdata)
       {
          g_progress_broadcast_pending = false;
          progress_id      = g_progress_id;
-         strlcpy(progress_str, g_progress_str, sizeof(progress_str));
+         strncpy(progress_str, g_progress_str, sizeof(progress_str));
       }
       slock_unlock(g_lock);
 
@@ -409,7 +409,7 @@ static void ws_server_thread(void *userdata)
 
          g_broadcast_kind             = kind;
          g_broadcast_progress_id      = progress_id;
-         strlcpy(g_broadcast_progress_str, progress_str,
+         strncpy(g_broadcast_progress_str, progress_str,
                sizeof(g_broadcast_progress_str));
 
          lws_callback_on_writable_all_protocol(g_lws_ctx, &g_protocols[0]);
