@@ -562,7 +562,7 @@ void ws_server_notify_achievement_progress(uint32_t id,
 
    slock_lock(g_lock);
    g_progress_id      = id;
-   strlcpy(g_progress_str,
+   strncpy(g_progress_str,
          measured_progress ? measured_progress : "",
          sizeof(g_progress_str));
    g_progress_broadcast_pending = true;
