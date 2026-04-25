@@ -106,11 +106,24 @@ static bool                g_running               = false;
 static bool                g_game_broadcast_pending = false;
 static bool                g_ach_broadcast_pending  = false;
 static bool                g_user_broadcast_pending = false;
+static bool                g_progress_broadcast_pending = false;
+
+/* Snapshot of the most-recently-reported achievement progress.
+ * Written under g_lock by ws_server_notify_achievement_progress(),
+ * read (also under g_lock) by the service thread before it issues the
+ * lws_callback_on_writable_all_protocol() call.                        */
+#define WS_PROGRESS_STR_MAX 64
+static uint32_t g_progress_id       = 0;
+static char     g_progress_str[WS_PROGRESS_STR_MAX];
 
 /* Written by the service thread before lws_callback_on_writable_all_protocol,
  * read inside the WRITEABLE callback — both on the same service thread.
  * Holds a WS_MSG_* bitmask indicating which messages the broadcast delivers. */
 static int                 g_broadcast_kind         = 0;
+
+/* Snapshot of progress data captured at broadcast time (service-thread only). */
+static uint32_t g_broadcast_progress_id      = 0;
+static char     g_broadcast_progress_str[WS_PROGRESS_STR_MAX];
 
 /* -------------------------------------------------------------------------
  * Per-session data
@@ -127,9 +140,14 @@ static int                 g_broadcast_kind         = 0;
 #define WS_MSG_GAME_STATE   (1 << 0)
 #define WS_MSG_ACHIEVEMENTS (1 << 1)
 #define WS_MSG_USER         (1 << 2)
+#define WS_MSG_PROGRESS     (1 << 3)
 
 typedef struct {
-   int pending_messages;
+   int      pending_messages;
+   /* Per-session copy of progress data so each client gets the right snapshot
+    * even if a newer broadcast arrives before this client's WRITEABLE fires. */
+   uint32_t progress_id;
+   char     progress_str[WS_PROGRESS_STR_MAX];
 } ws_session_t;
 
 /* -------------------------------------------------------------------------
@@ -213,9 +231,30 @@ static void ws_write_user(struct lws *wsi)
 #endif
 }
 
-/* -------------------------------------------------------------------------
- * Protocol callback
- * ---------------------------------------------------------------------- */
+/**
+ * ws_write_progress:
+ * @wsi     : the WebSocket connection to write to.
+ * @session : the per-session data that holds the progress snapshot.
+ *
+ * Sends a lightweight achievement_progress JSON message to @wsi.
+ * Must be called from within the libwebsockets service thread.
+ */
+static void ws_write_progress(struct lws *wsi, ws_session_t *session)
+{
+   unsigned char buf[LWS_PRE + 256];
+   int           n;
+
+   n = snprintf((char *)(buf + LWS_PRE),
+         sizeof(buf) - LWS_PRE,
+         "{\"type\":\"achievement_progress\","
+         "\"id\":%u,"
+         "\"measured_progress\":\"%s\"}",
+         (unsigned)session->progress_id,
+         session->progress_str);
+
+   if (n > 0)
+      lws_write(wsi, buf + LWS_PRE, (size_t)n, LWS_WRITE_TEXT);
+}
 
 static int callback_retroarch(struct lws *wsi,
       enum lws_callback_reasons reason,
@@ -249,6 +288,11 @@ static int callback_retroarch(struct lws *wsi,
          {
             session->pending_messages = g_broadcast_kind;
             g_broadcast_kind          = 0;
+
+            /* Copy the progress snapshot for this session. */
+            session->progress_id      = g_broadcast_progress_id;
+            strncpy(session->progress_str, g_broadcast_progress_str,
+                  sizeof(session->progress_str));
          }
 
          /* Send exactly one message per WRITEABLE invocation. */
@@ -269,6 +313,12 @@ static int callback_retroarch(struct lws *wsi,
             session->pending_messages &= ~WS_MSG_ACHIEVEMENTS;
             fprintf(stderr, "[ws_server] WRITE ACHIEVEMENTS\n");
             ws_write_achievements(wsi);
+         }
+         else if (session->pending_messages & WS_MSG_PROGRESS)
+         {
+            session->pending_messages &= ~WS_MSG_PROGRESS;
+            fprintf(stderr, "[ws_server] WRITE ACHIEVEMENT PROGRESS\n");
+            ws_write_progress(wsi, session);
          }
 
          /* If more messages remain, schedule the next write. */
@@ -315,24 +365,36 @@ static void ws_server_thread(void *userdata)
       bool game_broadcast;
       bool ach_broadcast;
       bool user_broadcast;
+      bool progress_broadcast;
+      uint32_t progress_id      = 0;
+      char     progress_str[WS_PROGRESS_STR_MAX];
+
+      progress_str[0] = '\0';
 
       slock_lock(g_lock);
-      running        = g_running;
-      game_broadcast = g_game_broadcast_pending;
-      ach_broadcast  = g_ach_broadcast_pending;
-      user_broadcast = g_user_broadcast_pending;
+      running            = g_running;
+      game_broadcast     = g_game_broadcast_pending;
+      ach_broadcast      = g_ach_broadcast_pending;
+      user_broadcast     = g_user_broadcast_pending;
+      progress_broadcast = g_progress_broadcast_pending;
       if (game_broadcast)
          g_game_broadcast_pending = false;
       if (ach_broadcast)
          g_ach_broadcast_pending = false;
       if (user_broadcast)
          g_user_broadcast_pending = false;
+      if (progress_broadcast)
+      {
+         g_progress_broadcast_pending = false;
+         progress_id      = g_progress_id;
+         strncpy(progress_str, g_progress_str, sizeof(progress_str));
+      }
       slock_unlock(g_lock);
 
       if (!running)
          break;
 
-      if (game_broadcast || ach_broadcast || user_broadcast)
+      if (game_broadcast || ach_broadcast || user_broadcast || progress_broadcast)
       {
          /* Compose the message bitmask for this broadcast. */
          int kind = 0;
@@ -342,8 +404,14 @@ static void ws_server_thread(void *userdata)
             kind |= WS_MSG_ACHIEVEMENTS;
          if (user_broadcast)
             kind |= WS_MSG_USER;
+         if (progress_broadcast)
+            kind |= WS_MSG_PROGRESS;
 
-         g_broadcast_kind = kind;
+         g_broadcast_kind             = kind;
+         g_broadcast_progress_id      = progress_id;
+         strncpy(g_broadcast_progress_str, progress_str,
+               sizeof(g_broadcast_progress_str));
+
          lws_callback_on_writable_all_protocol(g_lws_ctx, &g_protocols[0]);
       }
 
@@ -391,10 +459,11 @@ bool ws_server_init(unsigned port)
    }
 
    slock_lock(g_lock);
-   g_running                = true;
-   g_game_broadcast_pending = false;
-   g_ach_broadcast_pending  = false;
-   g_user_broadcast_pending = false;
+   g_running                    = true;
+   g_game_broadcast_pending     = false;
+   g_ach_broadcast_pending      = false;
+   g_user_broadcast_pending     = false;
+   g_progress_broadcast_pending = false;
    slock_unlock(g_lock);
 
    g_thread = sthread_create(ws_server_thread, NULL);
@@ -480,6 +549,23 @@ void ws_server_notify_user_changed(void)
 
    slock_lock(g_lock);
    g_user_broadcast_pending = true;
+   slock_unlock(g_lock);
+
+   lws_cancel_service(g_lws_ctx);
+}
+
+void ws_server_notify_achievement_progress(uint32_t id,
+      const char *measured_progress)
+{
+   if (!g_lws_ctx || !g_lock)
+      return;
+
+   slock_lock(g_lock);
+   g_progress_id      = id;
+   strncpy(g_progress_str,
+         measured_progress ? measured_progress : "",
+         sizeof(g_progress_str));
+   g_progress_broadcast_pending = true;
    slock_unlock(g_lock);
 
    lws_cancel_service(g_lws_ctx);
