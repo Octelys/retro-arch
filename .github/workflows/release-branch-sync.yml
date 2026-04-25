@@ -23,7 +23,6 @@ on:
 
 permissions:
   contents: write
-  workflows: write
 
 jobs:
   sync-release-branch:
@@ -36,7 +35,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PAT_WORKFLOW }}
 
       - name: Configure git identity
         run: |
@@ -90,11 +89,13 @@ jobs:
 
       - name: Create and push release branch
         if: steps.exists.outputs.branch_exists == 'false'
+        env:
+          PAT_WORKFLOW: ${{ secrets.PAT_WORKFLOW }}
         run: |
           BRANCH="retroarch-releases/${{ steps.release.outputs.tag }}"
           SHA="${{ steps.commit.outputs.sha }}"
 
           git branch "$BRANCH" "$SHA"
-          git push origin "$BRANCH"
+          git push "https://x-access-token:${PAT_WORKFLOW}@github.com/${{ github.repository }}.git" "$BRANCH"
           echo "✅ Pushed branch '${BRANCH}' at ${SHA}"
 
