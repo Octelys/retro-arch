@@ -87,15 +87,22 @@ jobs:
             echo "branch_exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create and push release branch
+      - name: Create release branch with workflows disabled
         if: steps.exists.outputs.branch_exists == 'false'
         env:
           PAT_WORKFLOW: ${{ secrets.PAT_WORKFLOW }}
         run: |
           BRANCH="retroarch-releases/${{ steps.release.outputs.tag }}"
           SHA="${{ steps.commit.outputs.sha }}"
+          REMOTE="https://x-access-token:${PAT_WORKFLOW}@github.com/${{ github.repository }}.git"
 
-          git branch "$BRANCH" "$SHA"
-          git push "https://x-access-token:${PAT_WORKFLOW}@github.com/${{ github.repository }}.git" "$BRANCH"
+          git checkout -b "$BRANCH" "$SHA"
+
+          if [ -d .github/workflows ]; then
+            git mv .github/workflows .github/workflows-upstream
+            git commit -m "ci: rename workflows dir to prevent execution on release branch"
+          fi
+
+          git push "$REMOTE" "$BRANCH"
           echo "✅ Pushed branch '${BRANCH}' at ${SHA}"
 
