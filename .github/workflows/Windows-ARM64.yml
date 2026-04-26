@@ -56,43 +56,50 @@ jobs:
         shell: powershell
         run: echo "sha8=$('${{ github.sha }}'.Substring(0,8))"  >> $env:GITHUB_OUTPUT
 
-#      - name: Download companion assets
-#        shell: bash
-#        run: |
-#          git clone --depth=1 https://github.com/libretro/retroarch-assets.git         assets-repo
-#          git clone --depth=1 https://github.com/libretro/libretro-database.git        database-repo
-#          git clone --depth=1 https://github.com/libretro/libretro-core-info.git       core-info-repo
-#          git clone --depth=1 https://github.com/libretro/retroarch-joypad-autoconfig.git joypad-repo
-#          git clone --depth=1 https://github.com/libretro/slang-shaders.git            slang-repo
-#          git clone --depth=1 https://github.com/libretro/glsl-shaders.git             glsl-repo
-#          git clone --depth=1 https://github.com/libretro/common-overlays.git          overlays-repo
-#
-#      - name: Bundle release
-#        shell: powershell
-#        run: |
-#          $sha    = '${{ steps.slug.outputs.sha8 }}'
-#          $bundle = "retroarch-windows-arm64-$sha"
-#          $exe    = "pkg/msvc/${{ matrix.platform }}/${{ matrix.configuration }}/RetroArch-msvc${{ matrix.version }}.exe"
-#
-#          New-Item -ItemType Directory -Force $bundle | Out-Null
-#          Copy-Item $exe "$bundle\RetroArch.exe"
-#
-#          foreach ($pair in @(
-#            @{ src='assets-repo';   dst='assets'       },
-#            @{ src='database-repo'; dst='database'     },
-#            @{ src='core-info-repo';dst='info'         },
-#            @{ src='joypad-repo';   dst='autoconfig'   },
-#            @{ src='slang-repo';    dst='shaders\slang'},
-#            @{ src='glsl-repo';     dst='shaders\glsl' },
-#            @{ src='overlays-repo'; dst='overlays'     }
-#          )) {
-#            $dest = "$bundle\$($pair.dst)"
-#            New-Item -ItemType Directory -Force $dest | Out-Null
-#            Copy-Item -Path "$($pair.src)\*" -Destination $dest -Recurse -Force
-#          }
-#
-#          # 7z is preinstalled on GitHub runners and is much faster than Compress-Archive
-#          7z a -tzip -mx=1 "$bundle.zip" $bundle\
+      - name: Download companion assets
+        shell: bash
+        run: |
+          git -c core.autocrlf=false clone --depth=1 https://github.com/libretro/retroarch-assets.git            assets-repo
+          git -c core.autocrlf=false clone --depth=1 https://github.com/libretro/libretro-core-info.git          core-info-repo
+          git -c core.autocrlf=false clone --depth=1 https://github.com/libretro/retroarch-joypad-autoconfig.git joypad-repo
+          git -c core.autocrlf=false clone --depth=1 https://github.com/libretro/libretro-database.git           database-repo
+          git -c core.autocrlf=false clone --depth=1 https://github.com/libretro/common-overlays.git             overlays-repo
+          git -c core.autocrlf=false clone --depth=1 https://github.com/libretro/glsl-shaders.git                glsl-repo
+
+      - name: Bundle release
+        shell: powershell
+        run: |
+          $sha    = '${{ steps.slug.outputs.sha8 }}'
+          $bundle = "retroarch-windows-arm64-$sha"
+          $exe    = "pkg\msvc\${{ matrix.platform }}\${{ matrix.configuration }}\RetroArch-msvc${{ matrix.version }}.exe"
+
+          foreach ($dir in @(
+            "$bundle\assets", "$bundle\info", "$bundle\autoconfig",
+            "$bundle\database\rdb", "$bundle\database\cursors",
+            "$bundle\overlays", "$bundle\shaders\shaders_glsl",
+            "$bundle\saves", "$bundle\screenshots", "$bundle\states",
+            "$bundle\system"
+          )) { New-Item -ItemType Directory -Force $dir | Out-Null }
+
+          Copy-Item $exe "$bundle\RetroArch.exe"
+          if (Test-Path retroarch.cfg) { Copy-Item retroarch.cfg "$bundle\retroarch.default.cfg" }
+
+          # robocopy exit codes 0-7 are success (files copied/skipped); 8+ are errors
+          function Robocopy-Safe { robocopy @args | Out-Null; if ($LASTEXITCODE -gt 7) { exit $LASTEXITCODE } }
+
+          Robocopy-Safe assets-repo      "$bundle\assets"                /E /XD .git .github src scripts branding ctr nxrgui switch fonts wallpapers /XF .gitignore .gitlab-ci.yml Makefile configure README.md COPYING
+          Robocopy-Safe core-info-repo   "$bundle\info"                  /E /XD .git /XF Makefile configure COPYING
+          Robocopy-Safe joypad-repo\dinput "$bundle\autoconfig\dinput"   /E /XD .git
+          Robocopy-Safe joypad-repo\sdl2   "$bundle\autoconfig\sdl2"     /E /XD .git
+          Robocopy-Safe joypad-repo\xinput "$bundle\autoconfig\xinput"   /E /XD .git
+          Robocopy-Safe joypad-repo\hid    "$bundle\autoconfig\hid"      /E /XD .git
+          Robocopy-Safe database-repo\rdb     "$bundle\database\rdb"     /E /XD .git
+          Robocopy-Safe database-repo\cursors "$bundle\database\cursors" /E /XD .git
+          Robocopy-Safe overlays-repo    "$bundle\overlays"              /E /XD .git ctr /XF Makefile configure
+          Robocopy-Safe glsl-repo        "$bundle\shaders\shaders_glsl"  /E /XD .git /XF Makefile configure
+
+          # 7z is preinstalled on GitHub runners and is much faster than Compress-Archive
+          7z a -tzip -mx=1 "$bundle.zip" $bundle\
 
       - name: Build installer
         shell: powershell

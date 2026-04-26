@@ -19,6 +19,7 @@
 #define __RARCH_WS_SERVER_H
 
 #include <boolean.h>
+#include <stdint.h>
 
 /* Default TCP port used when no explicit port is supplied. */
 #define RARCH_DEFAULT_WEBSOCKET_PORT 55437
@@ -80,6 +81,24 @@ void ws_server_notify_achievements_changed(void);
  * while the server is running.
  */
 void ws_server_notify_user_changed(void);
+
+/**
+ * ws_server_notify_achievement_progress:
+ * @id                : achievement ID.
+ * @measured_progress : human-readable progress string (e.g. "5/10").
+ *
+ * Broadcasts a lightweight achievement_progress message to all connected
+ * WebSocket clients:
+ *   { "type":"achievement_progress",
+ *     "id":<id>,
+ *     "measured_progress":"...",
+ *     "measured_percent":<float> }
+ *
+ * Safe to call from any thread while the server is running; no-op when the
+ * server is not initialised.
+ */
+void ws_server_notify_achievement_progress(uint32_t id,
+      const char *measured_progress);
 
 
 #ifdef __cplusplus

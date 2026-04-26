@@ -52,18 +52,21 @@ jobs:
 
       - name: Download companion assets
         run: |
-          git clone --depth=1 https://github.com/libretro/retroarch-assets.git        assets-repo
-          git clone --depth=1 https://github.com/libretro/libretro-core-info.git      core-info-repo
-          git clone --depth=1 https://github.com/libretro/retroarch-joypad-autoconfig.git joypad-repo
-          git clone --depth=1 https://github.com/libretro/libretro-database.git       database-repo
-          git clone --depth=1 https://github.com/libretro/common-overlays.git         overlays-repo
-          git clone --depth=1 https://github.com/libretro/glsl-shaders.git            glsl-repo
+          git -c core.autocrlf=false clone --depth=1 https://github.com/libretro/retroarch-assets.git        assets-repo
+          git -c core.autocrlf=false clone --depth=1 https://github.com/libretro/libretro-core-info.git      core-info-repo
+          git -c core.autocrlf=false clone --depth=1 https://github.com/libretro/retroarch-joypad-autoconfig.git joypad-repo
+          git -c core.autocrlf=false clone --depth=1 https://github.com/libretro/libretro-database.git       database-repo
+          git -c core.autocrlf=false clone --depth=1 https://github.com/libretro/common-overlays.git         overlays-repo
+          git -c core.autocrlf=false clone --depth=1 https://github.com/libretro/glsl-shaders.git            glsl-repo
 
       - name: Bundle release
         run: |
           SHA=$(echo ${GITHUB_SHA} | cut -c1-8)
           BUNDLE=retroarch-linux-x86_64-${SHA}
-          mkdir -p ${BUNDLE}/assets ${BUNDLE}/info ${BUNDLE}/autoconfig \
+          mkdir -p ${BUNDLE}/assets ${BUNDLE}/info \
+                   ${BUNDLE}/autoconfig/linuxraw ${BUNDLE}/autoconfig/udev \
+                   ${BUNDLE}/autoconfig/sdl2 ${BUNDLE}/autoconfig/hid \
+                   ${BUNDLE}/autoconfig/x \
                    ${BUNDLE}/database/rdb ${BUNDLE}/database/cursors \
                    ${BUNDLE}/overlays ${BUNDLE}/shaders/shaders_glsl \
                    ${BUNDLE}/saves ${BUNDLE}/screenshots ${BUNDLE}/states \
@@ -99,6 +102,7 @@ jobs:
           rsync -a --exclude='.git' joypad-repo/udev/.     ${BUNDLE}/autoconfig/udev/
           rsync -a --exclude='.git' joypad-repo/sdl2/.     ${BUNDLE}/autoconfig/sdl2/
           rsync -a --exclude='.git' joypad-repo/hid/.      ${BUNDLE}/autoconfig/hid/
+          rsync -a --exclude='.git' joypad-repo/x/.        ${BUNDLE}/autoconfig/x/
           rsync -a --exclude='.git' database-repo/rdb/.    ${BUNDLE}/database/rdb/
           rsync -a --exclude='.git' database-repo/cursors/. ${BUNDLE}/database/cursors/
           rsync -a \
