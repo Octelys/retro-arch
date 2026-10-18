@@ -46,6 +46,7 @@
 #endif
 
 #include "runtime_file.h"
+#include <compat/strl.h>
 
 /* JSON Stuff... */
 
@@ -126,18 +127,26 @@ static void runtime_log_read_file(runtime_log_t *runtime_log)
    unsigned state_slot         = 0;
 
    RtlJSONContext context      = {0};
-   /* Attempt to open log file */
-   RFILE *file                 = filestream_open(runtime_log->path,
-         RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+   uint8_t *file_buf           = NULL;
+   int64_t file_len            = 0;
 
-   if (!file)
+   /* Read the whole log in one operation: these files are a few
+    * hundred bytes and always parsed in full, so a single
+    * open/size/read/close beats a pre-open stat plus the chunked
+    * callback path (which itself sizes the stream with an extra
+    * fstat).  A missing log - the first-run case - is silent, as
+    * it always was; the stat runs only when there is a failure to
+    * classify. */
+   if (!filestream_read_file(runtime_log->path,
+         (void**)&file_buf, &file_len))
    {
-      RARCH_ERR("[Runtime] Failed to open runtime log file: \"%s\".\n", runtime_log->path);
+      if (path_is_valid(runtime_log->path))
+         RARCH_ERR("[Runtime] Failed to open runtime log file: \"%s\".\n", runtime_log->path);
       return;
    }
 
    /* Initialise JSON parser */
-   if (!(parser = rjson_open_rfile(file)))
+   if (!(parser = rjson_open_buffer(file_buf, (size_t)file_len)))
    {
       RARCH_ERR("[Runtime] Failed to create JSON parser.\n");
       goto end;
@@ -286,13 +295,6 @@ parsed:
       state_slot = (unsigned)val;
    }
 
-   if (     state_slot > 0
-         && state_slot < 1000)
-   {
-      runloop_state_t *runloop_st  = runloop_state_get_ptr();
-      runloop_st->entry_state_slot = state_slot;
-   }
-
    /* If we reach this point then all is well
     * > Assign values to runtime_log object */
    runtime_log->runtime.hours      = runtime_hours;
@@ -321,8 +323,8 @@ end:
    if (context.state_slot)
       free(context.state_slot);
 
-   /* Close log file */
-   filestream_close(file);
+   /* Release file contents */
+   free(file_buf);
 }
 
 /* Initialise runtime log, loading current parameters
@@ -349,15 +351,15 @@ runtime_log_t *runtime_log_init(
    content_name[0]            = '\0';
    core_name[0]               = '\0';
 
-   if (     string_is_empty(dir_runtime_log)
-         && string_is_empty(dir_playlist))
+   if (     (!dir_runtime_log || !*dir_runtime_log)
+         && (!dir_playlist || !*dir_playlist))
    {
       RARCH_ERR("[Runtime] Runtime log directory is undefined - cannot save"
             " runtime log files.\n");
       return NULL;
    }
 
-   if (     string_is_empty(core_path)
+   if (     (!core_path || !*core_path)
          || !memcmp(core_path, "builtin", 8)
          || !memcmp(core_path, "DETECT", 7))
       return NULL;
@@ -373,17 +375,17 @@ runtime_log_t *runtime_log_init(
    if (core_info_find(core_path, &core_info))
    {
       supports_no_game = (core_info->flags & CORE_INFO_FLAG_SUPPORTS_NO_GAME);
-      if (!string_is_empty(core_info->core_name))
+      if (core_info->core_name && *core_info->core_name)
          strlcpy(core_name, core_info->core_name, sizeof(core_name));
    }
 
-   if (string_is_empty(core_name))
+   if (!*core_name)
       return NULL;
 
    /* Get runtime log directory
     * If 'custom' runtime log path is undefined,
     * use default 'playlists/logs' directory... */
-   if (string_is_empty(dir_runtime_log))
+   if (!dir_runtime_log || !*dir_runtime_log)
       fill_pathname_join_special(
             tmp_buf,
             dir_playlist,
@@ -392,7 +394,7 @@ runtime_log_t *runtime_log_init(
    else
       strlcpy(tmp_buf, dir_runtime_log, sizeof(tmp_buf));
 
-   if (string_is_empty(tmp_buf))
+   if (!*tmp_buf)
       return NULL;
 
    if (log_per_core)
@@ -404,22 +406,19 @@ runtime_log_t *runtime_log_init(
    else
       strlcpy(log_file_dir, tmp_buf, sizeof(log_file_dir));
 
-   if (string_is_empty(log_file_dir))
+   if (!*log_file_dir)
       return NULL;
 
-   /* Create directory, if required */
-   if (!path_is_directory(log_file_dir))
-   {
-      if (!path_mkdir(log_file_dir))
-      {
-         RARCH_ERR("[Runtime] Failed to create directory for"
-               " runtime log: \"%s\".\n", log_file_dir);
-         return NULL;
-      }
-   }
+   /* Note: the log directory is not created here - reading an
+    * existing log does not need it to exist, and this function
+    * runs on read-only paths that never write one (playlist
+    * sublabels init a log per entry).  runtime_log_save()
+    * creates it when a log is actually written, so the read
+    * paths no longer pay a stat (plus a possible mkdir) per
+    * call. */
 
    /* Get content name */
-   if (string_is_empty(content_path))
+   if (!content_path || !*content_path)
    {
       /* If core supports contentless operation and
        * no content is provided, 'content' is simply
@@ -456,14 +455,14 @@ runtime_log_t *runtime_log_init(
             FILE_PATH_RUNTIME_EXTENSION,
             sizeof(content_name));
 
-   if (string_is_empty(content_name))
+   if (!*content_name)
       return NULL;
 
    /* Build final log file path */
    fill_pathname_join_special(log_file_path, log_file_dir,
          content_name, sizeof(log_file_path));
 
-   if (string_is_empty(log_file_path))
+   if (!*log_file_path)
       return NULL;
 
    /* Phew... If we get this far then all is well.
@@ -491,9 +490,9 @@ runtime_log_t *runtime_log_init(
 
    strlcpy(runtime_log->path, log_file_path, sizeof(runtime_log->path));
 
-   /* Load existing log file, if it exists */
-   if (path_is_valid(runtime_log->path))
-      runtime_log_read_file(runtime_log);
+   /* Load existing log file, if it exists (a missing file is
+    * handled - silently - inside) */
+   runtime_log_read_file(runtime_log);
 
    return runtime_log;
 }
@@ -618,7 +617,7 @@ size_t runtime_log_get_runtime_str(runtime_log_t *runtime_log,
             runtime_log->runtime.hours, runtime_log->runtime.minutes,
             runtime_log->runtime.seconds);
    else
-      _len += strlcpy(s + _len, " 00:00:00", len - _len);
+      _len += strlcpy_lit(s + _len, " 00:00:00", len - _len);
    return _len;
 }
 
@@ -672,6 +671,7 @@ static size_t runtime_last_played_human(runtime_log_t *runtime_log,
       char *s, size_t len)
 {
    size_t _len;
+   int _ret;
    struct tm time_info;
    time_t last_played;
    time_t current;
@@ -706,8 +706,11 @@ static size_t runtime_last_played_human(runtime_log_t *runtime_log,
    for (i = 0; i < ARRAY_SIZE(periods) - 1 && delta >= periods[i]; i++)
       delta /= periods[i];
 
-   /* Generate string */
-   _len  = snprintf(s, len, "%u ", (unsigned)delta);
+   /* Generate string. snprintf() reports the length it would have
+    * written, so take the length that landed. */
+   _ret  = snprintf(s, len, "%u ", (unsigned)delta);
+   _len  = (_ret < 0 || (size_t)_ret >= len) ? (len ? len - 1 : 0)
+                                            : (size_t)_ret;
    _len += strlcpy(s + _len,
          msg_hash_to_str((enum msg_hash_enums)units[i][(delta == 1) ? 0 : 1]),
          len - _len);
@@ -731,8 +734,14 @@ void runtime_log_get_last_played_str(runtime_log_t *runtime_log,
       enum playlist_sublabel_last_played_date_separator_type date_separator)
 {
    const char *format_str = "";
+   /* strlcpy() reports the length of its source, so a translation of
+    * the label longer than @s would carry _len past len and leave
+    * every len - _len below wrapping to a very large size_t. */
    size_t _len            = strlcpy(s, msg_hash_to_str(
             MENU_ENUM_LABEL_VALUE_PLAYLIST_SUBLABEL_LAST_PLAYED), len);
+
+   if (_len >= len)
+      _len = len ? len - 1 : 0;
 
    if (runtime_log)
    {
@@ -1126,6 +1135,10 @@ void runtime_log_get_last_played_str(runtime_log_t *runtime_log,
                   runtime_log->last_played.day, runtime_log->last_played.month);
             return;
          case PLAYLIST_LAST_PLAYED_STYLE_AGO:
+            /* Two octets are held back below, so there has to be room
+             * for the separator and for them. */
+            if (_len + 3 >= len)
+               return;
             s[  _len] = ' ';
             s[++_len] = '\0';
             if ((runtime_last_played_human(runtime_log, s + _len, len - _len - 2)) == 0)
@@ -1183,7 +1196,9 @@ void runtime_log_save(runtime_log_t *runtime_log)
 {
    char value_string[64]; /* 64 characters should be
                              enough for a very long runtime... :) */
-   RFILE *file            = NULL;
+   char dir[DIR_MAX_LENGTH];
+   int _len;
+   const char *buf;
    rjsonwriter_t* writer;
 
    if (!runtime_log)
@@ -1191,19 +1206,30 @@ void runtime_log_save(runtime_log_t *runtime_log)
 
    RARCH_LOG("[Runtime] Saving runtime log file: \"%s\".\n", runtime_log->path);
 
-   /* Attempt to open log file */
-   if (!(file = filestream_open(runtime_log->path,
-         RETRO_VFS_FILE_ACCESS_WRITE, RETRO_VFS_FILE_ACCESS_HINT_NONE)))
+   /* Create the log directory, if required (deferred from
+    * runtime_log_init(), which also runs on read-only paths
+    * that never write a log) */
+   fill_pathname_basedir(dir, runtime_log->path, sizeof(dir));
+
+   if (     !path_is_directory(dir)
+         && !path_mkdir(dir))
    {
-      RARCH_ERR("[Runtime] Failed to open runtime log file: \"%s\".\n", runtime_log->path);
+      RARCH_ERR("[Runtime] Failed to create directory for"
+            " runtime log: \"%s\".\n", dir);
       return;
    }
 
-   /* Initialise JSON writer */
-   if (!(writer = rjsonwriter_open_rfile(file)))
+   /* Serialise the whole log in memory and write it with a
+    * single filestream_write_file() call.  Opening the output
+    * before the JSON exists truncates the previous log, and any
+    * failure past that point - writer allocation, a write error,
+    * a crash mid-save - left a zero-length file behind in place
+    * of the log it destroyed.  The log is a few hundred bytes;
+    * nothing here needs to stream. */
+   if (!(writer = rjsonwriter_open_memory()))
    {
       RARCH_ERR("[Runtime] Failed to create JSON writer.\n");
-      goto end;
+      return;
    }
 
    /* Write output file */
@@ -1282,15 +1308,13 @@ void runtime_log_save(runtime_log_t *runtime_log)
    rjsonwriter_raw(writer, "}", 1);
    rjsonwriter_raw(writer, "\n", 1);
 
-   /* Free JSON writer */
-   if (!rjsonwriter_free(writer))
-   {
-      RARCH_ERR("[Runtime] Error writing runtime log file: \"%s\".\n", runtime_log->path);
-   }
+   /* NULL means the writer hit an error while serialising */
+   buf = rjsonwriter_get_memory_buffer(writer, &_len);
 
-end:
-   /* Close log file */
-   filestream_close(file);
+   if (!buf || !filestream_write_file(runtime_log->path, buf, _len))
+      RARCH_ERR("[Runtime] Error writing runtime log file: \"%s\".\n", runtime_log->path);
+
+   rjsonwriter_free(writer);
 }
 
 /* Utility functions */
@@ -1312,18 +1336,22 @@ void runtime_log_convert_usec2hms(retro_time_t usec,
 /* Updates specified playlist entry runtime values with
  * contents of associated log file */
 void runtime_update_playlist(
-      playlist_t *playlist, size_t idx,
-      const char *dir_runtime_log,
-      const char *dir_playlist,
-      bool log_per_core,
-      enum playlist_sublabel_last_played_style_type timedate_style,
-      enum playlist_sublabel_last_played_date_separator_type date_separator)
+      playlist_t *playlist, size_t idx)
 {
    char runtime_str[64];
    char last_played_str[64];
    runtime_log_t *runtime_log             = NULL;
    const struct playlist_entry *entry     = NULL;
    struct playlist_entry update_entry     = {0};
+   settings_t *settings                   = config_get_ptr();
+   const char *dir_runtime_log            = settings->paths.directory_runtime_log;
+   const char *dir_playlist               = settings->paths.directory_playlist;
+   unsigned runtime_type                  = settings->uints.playlist_sublabel_runtime_type;
+   bool log_per_core                      = (runtime_type == PLAYLIST_RUNTIME_PER_CORE);
+   enum playlist_sublabel_last_played_style_type
+         timedate_style                   = (enum playlist_sublabel_last_played_style_type)settings->uints.playlist_sublabel_last_played_style;
+   enum playlist_sublabel_last_played_date_separator_type
+         date_separator                   = (enum playlist_sublabel_last_played_date_separator_type)settings->uints.menu_timedate_date_separator;
 
    /* Sanity check */
    if (!playlist)
@@ -1334,7 +1362,7 @@ void runtime_update_playlist(
 
    /* Set fallback playlist 'runtime_status'
     * (saves 'if' checks later...) */
-   update_entry.runtime_status = PLAYLIST_RUNTIME_MISSING;
+   PLAYLIST_SET_RUNTIME_STATUS(&update_entry, PLAYLIST_RUNTIME_MISSING);
 
    /* 'Attach' runtime/last played strings */
    runtime_str[0]               = '\0';
@@ -1357,29 +1385,45 @@ void runtime_update_playlist(
       if (runtime_log_has_runtime(runtime_log))
       {
          /* Read current runtime */
-         runtime_log_get_runtime_hms(runtime_log,
-               &update_entry.runtime_hours,
-               &update_entry.runtime_minutes,
-               &update_entry.runtime_seconds);
+         {
+            unsigned rt_h = 0;
+            unsigned rt_m = 0;
+            unsigned rt_s = 0;
+
+            runtime_log_get_runtime_hms(runtime_log, &rt_h, &rt_m, &rt_s);
+            PLAYLIST_SET_RUNTIME_HOURS(&update_entry, rt_h);
+            PLAYLIST_SET_RUNTIME_MINUTES(&update_entry, rt_m);
+            PLAYLIST_SET_RUNTIME_SECONDS(&update_entry, rt_s);
+         }
 
          runtime_log_get_runtime_str(runtime_log,
                runtime_str, sizeof(runtime_str));
 
          /* Read last played timestamp */
-         runtime_log_get_last_played(runtime_log,
-               &update_entry.last_played_year,
-               &update_entry.last_played_month,
-               &update_entry.last_played_day,
-               &update_entry.last_played_hour,
-               &update_entry.last_played_minute,
-               &update_entry.last_played_second);
+         {
+            unsigned lp_y  = 0;
+            unsigned lp_mo = 0;
+            unsigned lp_d  = 0;
+            unsigned lp_h  = 0;
+            unsigned lp_mi = 0;
+            unsigned lp_s  = 0;
+
+            runtime_log_get_last_played(runtime_log,
+                  &lp_y, &lp_mo, &lp_d, &lp_h, &lp_mi, &lp_s);
+            PLAYLIST_SET_LAST_PLAYED_YEAR(&update_entry,   lp_y);
+            PLAYLIST_SET_LAST_PLAYED_MONTH(&update_entry,  lp_mo);
+            PLAYLIST_SET_LAST_PLAYED_DAY(&update_entry,    lp_d);
+            PLAYLIST_SET_LAST_PLAYED_HOUR(&update_entry,   lp_h);
+            PLAYLIST_SET_LAST_PLAYED_MINUTE(&update_entry, lp_mi);
+            PLAYLIST_SET_LAST_PLAYED_SECOND(&update_entry, lp_s);
+         }
 
          runtime_log_get_last_played_str(runtime_log,
                last_played_str, sizeof(last_played_str),
                timedate_style, date_separator);
 
          /* Playlist entry now contains valid runtime data */
-         update_entry.runtime_status = PLAYLIST_RUNTIME_VALID;
+         PLAYLIST_SET_RUNTIME_STATUS(&update_entry, PLAYLIST_RUNTIME_VALID);
       }
 
       /* Clean up */
@@ -1389,11 +1433,11 @@ void runtime_update_playlist(
 #if defined(HAVE_MENU) && (defined(HAVE_OZONE) || defined(HAVE_MATERIALUI))
    /* Ozone and GLUI require runtime/last played strings
     * to be populated even when no runtime is recorded */
-   if (update_entry.runtime_status != PLAYLIST_RUNTIME_VALID)
+   if (PLAYLIST_RUNTIME_STATUS(&update_entry) != PLAYLIST_RUNTIME_VALID)
    {
       const char *menu_ident = menu_driver_ident();
-      if (     memcmp(menu_ident, "ozone", 5) == 0
-            || memcmp(menu_ident, "glui", 4) == 0)
+      if (     !strcmp(menu_ident, "ozone")
+            || !strcmp(menu_ident, "glui"))
       {
          runtime_log_get_runtime_str(NULL,
                runtime_str, sizeof(runtime_str));
@@ -1403,7 +1447,7 @@ void runtime_update_playlist(
 
          /* While runtime data does not exist, the playlist
           * entry does now contain valid information... */
-         update_entry.runtime_status = PLAYLIST_RUNTIME_VALID;
+         PLAYLIST_SET_RUNTIME_STATUS(&update_entry, PLAYLIST_RUNTIME_VALID);
       }
    }
 #endif
@@ -1432,7 +1476,7 @@ void runtime_update_contentless_core(
    contentless_core_runtime_info_t runtime_info = {0};
 
    /* Sanity check */
-   if (    string_is_empty(core_path)
+   if (    (!core_path || !*core_path)
        || !core_info_find(core_path, &core_info)
        || !(core_info->flags & CORE_INFO_FLAG_SUPPORTS_NO_GAME))
       return;
@@ -1483,8 +1527,8 @@ void runtime_update_contentless_core(
    if (runtime_info.status != CONTENTLESS_CORE_RUNTIME_VALID)
    {
       const char *menu_ident = menu_driver_ident();
-      if (     memcmp(menu_ident, "ozone", 5) == 0
-            || memcmp(menu_ident, "glui", 4) == 0)
+      if (     !strcmp(menu_ident, "ozone")
+            || !strcmp(menu_ident, "glui"))
       {
          runtime_log_get_runtime_str(NULL,
                runtime_str, sizeof(runtime_str));

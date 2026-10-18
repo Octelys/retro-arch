@@ -37,13 +37,34 @@ fi
 
 mkdir -p "$OUTDIR"
 
-for dylib in $(find "$BASE_DIR"/modules -maxdepth 1 -type f -regex '.*libretro.*\.dylib$') ; do
+process_one() {
+    set -e
+    local dylib="$1"
+    local intermediate fwName fwDir build_sdk dSYMDir dylibName
+
     intermediate=$(basename "$dylib")
     intermediate="${intermediate/%.dylib/}"
     if [ -n "$SUFFIX" ] ; then
         intermediate="${intermediate/%$SUFFIX/}"
     fi
     fwName="${intermediate//_/.}"
+
+    # App Store Connect takes an iOS/tvOS binary only with an
+    # LC_ENCRYPTION_INFO_64 that is not yet encrypted (cryptid 0), which
+    # Apple's ld writes and other linkers do not; one core without it
+    # fails the whole upload (ITMS-90125). Leave such a core out of an
+    # App Store build and name it, rather than lose every other core.
+    if [ -n "$APPSTORE_BUILD" ] && [ "$PLATFORM_FAMILY_NAME" = "iOS" -o "$PLATFORM_FAMILY_NAME" = "tvOS" ] ; then
+        cryptid=$(otool -l "$dylib" | awk '/cmd LC_ENCRYPTION_INFO/ { f = 1 } f && $1 == "cryptid" { print $2; exit }')
+        if [ -z "$cryptid" ] ; then
+            echo "warning: leaving $fwName out of the App Store build: $(basename "$dylib") has no LC_ENCRYPTION_INFO_64 (not linked by Apple's ld)"
+            return 0
+        elif [ "$cryptid" != "0" ] ; then
+            echo "warning: leaving $fwName out of the App Store build: $(basename "$dylib") is already encrypted (cryptid $cryptid)"
+            return 0
+        fi
+    fi
+
     echo Making framework $fwName from $dylib
 
     fwDir="${OUTDIR}/${fwName}.framework"
@@ -87,7 +108,16 @@ for dylib in $(find "$BASE_DIR"/modules -maxdepth 1 -type f -regex '.*libretro.*
         # Update Info.plist with framework identifier
         /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.apple.xcode.dsym.$fwName" "$dSYMDir/Contents/Info.plist"
     fi
-done
+}
+export -f process_one
+export OUTDIR DSYM_OUTDIR SUFFIX PLATFORM_FAMILY_NAME PLATFORM \
+       DEPLOYMENT_TARGET CODE_SIGN_IDENTITY_FOR_ITEMS APPSTORE_BUILD
+
+JOBS=$(sysctl -n hw.ncpu)
+if [ "$JOBS" -gt 8 ] ; then JOBS=8 ; fi
+
+find "$BASE_DIR"/modules -maxdepth 1 -type f -regex '.*libretro.*\.dylib$' -print0 \
+    | xargs -0 -n1 -P"$JOBS" bash -c 'process_one "$0"' || exit 1
 
 # Copy in MoltenVK as an embedded library manually instead of having
 # Xcode do it. This makes it potentially easier to substitute out
@@ -101,6 +131,14 @@ MVK_PLATFORM_SUBDIR="${SWIFT_PLATFORM_TARGET_PREFIX}-$(echo $ARCHS_STANDARD_64_B
 if [ -d "${MOLTENVK_XCFRAMEWORK}/${MVK_PLATFORM_SUBDIR}/MoltenVK.framework" ] ; then
     echo copying moltenvk from "${MOLTENVK_XCFRAMEWORK}/${MVK_PLATFORM_SUBDIR}/MoltenVK.framework"
     cp -R "${MOLTENVK_XCFRAMEWORK}/${MVK_PLATFORM_SUBDIR}/MoltenVK.framework" "${OUTDIR}"
+    # tvOS App Store rejects arm64e; strip it from the fat MoltenVK binary
+    if [ "$PLATFORM_FAMILY_NAME" = "tvOS" -a "$APPSTORE_BUILD" = "1" ] ; then
+        MVK_BIN="${OUTDIR}/MoltenVK.framework/MoltenVK"
+        if lipo -info "$MVK_BIN" 2>/dev/null | grep -q arm64e ; then
+            echo "stripping arm64e from MoltenVK for tvOS App Store build"
+            lipo -remove arm64e "$MVK_BIN" -output "$MVK_BIN"
+        fi
+    fi
     codesign --force --verbose --sign "${CODE_SIGN_IDENTITY_FOR_ITEMS}" "${OUTDIR}/MoltenVK.framework"
 fi
 

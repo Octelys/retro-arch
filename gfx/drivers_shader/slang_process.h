@@ -75,10 +75,35 @@ enum slang_semantic
    SLANG_SEMANTIC_ACCELEROMETER         = 20,
    /* vec3, accelerometer rest position XYZ */
    SLANG_SEMANTIC_ACCELEROMETER_REST    = 21,
-   SLANG_NUM_BASE_SEMANTICS        = 22,
+   /* uint, presents completed before this frame's first present. Advances
+    * on every swap the display sees - core frames, BFI dark frames, shader
+    * sub-frames and repeats alike - so a shader can key an effect to the
+    * monitor's cadence rather than the core's. */
+   SLANG_SEMANTIC_SWAP_COUNT            = 22,
+   /* vec4s, where the frame lies in the texture bound for it; see
+    * slang_rect.h */
+   SLANG_SEMANTIC_ORIGINAL_RECT         = 23,
+   SLANG_SEMANTIC_ORIGINAL_CLAMP        = 24,
+   SLANG_SEMANTIC_ORIGINAL_TEXELS       = 25,
+   /* float, PaperWhiteNits alias of BrightnessNits */
+   SLANG_SEMANTIC_PAPER_WHITE_ALIAS    = 26,
+   /* float, effective HDR target luminance in nits */
+   SLANG_SEMANTIC_PEAK_NITS            = 27,
+   SLANG_SEMANTIC_MAX_NITS_ALIAS       = 28,
+   /* float, active HDR output as 0 or 1 */
+   SLANG_SEMANTIC_ENABLE_HDR          = 29,
+   /* float, minimum luminance in nits; zero when unknown */
+   SLANG_SEMANTIC_MIN_NITS            = 30,
+   /* uint, HDR curve: 0=rational */
+   SLANG_SEMANTIC_TONEMAP_OPERATOR    = 31,
+   /* uint, Original is native PQ Rec.2020 */
+   SLANG_SEMANTIC_SOURCE_HDR          = 32,
+   /* uint, native HDR ownership without creative curves or white scaling */
+   SLANG_SEMANTIC_PASSTHROUGH         = 33,
+   SLANG_NUM_BASE_SEMANTICS        = 34,
 
    /* float, user defined parameter, arrayed */
-   SLANG_SEMANTIC_FLOAT_PARAMETER  = 23,
+   SLANG_SEMANTIC_FLOAT_PARAMETER  = 34,
 
    SLANG_NUM_SEMANTICS,
    SLANG_INVALID_SEMANTIC          = -1
@@ -111,15 +136,24 @@ typedef struct
    size_t size_stride;
 } texture_map_t;
 
+/* A driver that sets uniforms[SLANG_SEMANTIC_ORIGINAL_RECT] (and the
+ * clamp's and texels') may bind the frame inside a larger texture:
+ * slang_process() rewrites each pass to read it through them where it
+ * can, as slang_rect.h describes. A first pass whose filter the preset
+ * leaves unspecified is read as frame_smooth says. */
 typedef struct
 {
    texture_map_t textures[SLANG_NUM_TEXTURE_SEMANTICS];
    void*         uniforms[SLANG_NUM_BASE_SEMANTICS];
+   bool          frame_smooth;
 } semantics_map_t;
 
 typedef struct
 {
    void*    data;
+   /* Or a shader parameter, whose value is read through
+    * video_shader_param_get() at the upload */
+   const struct video_shader_parameter *param;
    unsigned size;
    unsigned offset;
    char     id[64];
@@ -150,27 +184,238 @@ typedef struct
    texture_sem_t* textures;
    cbuffer_sem_t  cbuffers[SLANG_CBUFFER_MAX];
    enum glslang_format format;
+   /* True when 'format' came from a #pragma format in the shader source,
+    * false when it was derived from preset FBO flags.  Backends must only
+    * apply last-pass HDR heuristics to a shader-declared format. */
+   bool                explicit_format;
+   /* The pass reads the frame wherever it lies in its texture, through
+    * the rect semantics, or does not read it: see semantics_map_t. */
+   bool                frame_in_place;
+   /* It was rewritten for an unspecified filter, as frame_smooth was
+    * then: built again when that changes. */
+   bool                frame_unspec;
+   bool                frame_smooth;
 } pass_semantics_t;
 
-struct slang_texture_semantic_map
+
+/* ---- C reflection data model ------------------------------------- */
+
+/* Longest stored name: a pass alias (63 chars) plus the
+ * "FeedbackSize" suffix (12), or a LUT id (63) plus "Size". */
+#define SLANG_NAME_MAP_NAME_MAX 80
+
+typedef struct slang_texture_semantic_map_entry
 {
+   char name[SLANG_NAME_MAP_NAME_MAX];
+   unsigned char name_len;
    enum slang_texture_semantic semantic;
    unsigned index;
-};
+} slang_texture_semantic_map_entry;
 
-struct slang_semantic_map
+typedef struct slang_texture_semantic_name_map
 {
+   slang_texture_semantic_map_entry *entries; /* malloc'd, grows */
+   size_t count;
+   size_t cap;
+} slang_texture_semantic_name_map;
+
+typedef struct slang_semantic_map_entry
+{
+   char name[SLANG_NAME_MAP_NAME_MAX];
+   unsigned char name_len;
    enum slang_semantic semantic;
    unsigned index;
-};
+} slang_semantic_map_entry;
+
+typedef struct slang_semantic_name_map
+{
+   slang_semantic_map_entry *entries;         /* malloc'd, grows */
+   size_t count;
+   size_t cap;
+} slang_semantic_name_map;
+
+typedef struct slang_semantic_location
+{
+   int ubo_vertex;
+   int push_vertex;
+   int ubo_fragment;
+   int push_fragment;
+} slang_semantic_location;
+
+typedef struct slang_texture_semantic_meta
+{
+   size_t   ubo_offset;
+   size_t   push_constant_offset;
+   unsigned binding;
+   uint32_t stage_mask;
+
+   bool texture;
+   bool uniform;
+   bool push_constant;
+
+   /* For APIs which need location information ala legacy GL.
+    * API user fills this struct in; initialized to -1. */
+   slang_semantic_location location;
+} slang_texture_semantic_meta;
+
+typedef struct slang_semantic_meta
+{
+   size_t   ubo_offset;
+   size_t   push_constant_offset;
+   unsigned num_components;
+   bool     uniform;
+   bool     push_constant;
+
+   /* For APIs which need location information ala legacy GL. */
+   slang_semantic_location location;
+} slang_semantic_meta;
+
+typedef struct slang_texture_semantic_array
+{
+   slang_texture_semantic_meta *data;         /* malloc'd, grows */
+   size_t size;
+   size_t cap;
+} slang_texture_semantic_array;
+
+typedef struct slang_reflection
+{
+   size_t   ubo_size;
+   size_t   push_constant_size;
+
+   unsigned ubo_binding;
+   uint32_t ubo_stage_mask;
+   uint32_t push_constant_stage_mask;
+
+   slang_texture_semantic_array
+      semantic_textures[SLANG_NUM_TEXTURE_SEMANTICS];
+   slang_semantic_meta semantics[SLANG_NUM_SEMANTICS];
+   slang_semantic_meta *semantic_float_parameters; /* malloc'd, grows */
+   size_t num_float_parameters;
+   size_t cap_float_parameters;
+
+   const slang_texture_semantic_name_map *texture_semantic_map;
+   const slang_texture_semantic_name_map *texture_semantic_uniform_map;
+   const slang_semantic_name_map         *semantic_map;
+   unsigned pass_number;
+} slang_reflection;
 
 RETRO_BEGIN_DECLS
+
+/* Compiled slang shader output.  Plain C data model: SPIR-V words are
+ * malloc'd arrays with explicit word counts, parameters are a malloc'd
+ * grow-array, and strings are fixed buffers sized to match the
+ * video_shader_parameter fields they are ultimately copied into
+ * (id[64]/desc[64] in video_shader_parse.h) and the pass alias[64]
+ * they name.  Lifecycle: glslang_output_init() before first use,
+ * glslang_output_free() when done.  glslang_output_free() releases the
+ * arrays and re-initializes the structure to the empty state, so
+ * calling it twice - or calling it after a failed compile - is safe. */
+typedef struct glslang_parameter
+{
+   char  id[64];
+   char  desc[64];
+   float initial;
+   float minimum;
+   float maximum;
+   float step;
+} glslang_parameter;
+
+typedef struct glslang_meta
+{
+   glslang_parameter *parameters;      /* malloc'd, grows on demand */
+   size_t num_parameters;
+   size_t cap_parameters;
+   enum glslang_format rt_format;
+   char name[64];                      /* '\0' terminated, empty if unset */
+} glslang_meta;
+
+typedef struct glslang_output
+{
+   uint32_t *vertex;                   /* malloc'd SPIR-V words */
+   uint32_t *fragment;                 /* malloc'd SPIR-V words */
+   size_t vertex_len;                  /* in words */
+   size_t fragment_len;                /* in words */
+   glslang_meta meta;
+} glslang_output;
+
+void glslang_output_init(glslang_output *output);
+void glslang_output_free(glslang_output *output);
+
+/* Append a parameter to @meta, growing the array as needed.
+ * Returns false on allocation failure ONLY; duplicate checking
+ * is the caller's responsibility. */
+bool glslang_meta_add_parameter(glslang_meta *meta,
+      const glslang_parameter *param);
+
+/* Compile the .slang file at @shader_path into @output.
+ * @output is zero-initialized by these functions at entry and fully
+ * (re)populated; it must not hold live allocations when passed in.
+ * On failure the output is left in the freed/empty state.  On success
+ * the caller owns the result and must call glslang_output_free(). */
+bool glslang_compile_shader(const char *shader_path,
+      glslang_output *output);
+
+/* As glslang_compile_shader(), but expands '#include' directives
+ * through @include_cache (see glslang_include_cache_new).  A preset's
+ * passes share helper files, so one cache across a filter chain's pass
+ * loop reads each file once instead of once per pass.  A NULL cache
+ * behaves exactly like the uncached call. */
+bool glslang_compile_shader_cached(const char *shader_path,
+      glslang_output *output, void *include_cache);
+
+/* Merge parameters harvested into @meta into @shader, enforcing the
+ * duplicate-must-match rule.  @pass is the pass @meta was harvested
+ * from, and is recorded on each parameter this call adds, so that a
+ * parameter is owned by the first pass declaring it. */
+bool slang_preprocess_parse_parameters_meta(const glslang_meta *meta,
+      struct video_shader *shader, unsigned pass);
 
 /* Utility function to implement the same parameter reflection
  * which happens in the slang backend.
  * This does preprocess over the input file to handle #includes and so on. */
 bool slang_preprocess_parse_parameters(const char *shader_path,
-      struct video_shader *shader);
+      struct video_shader *shader, unsigned pass);
+
+/* As slang_preprocess_parse_parameters(), but expands '#include'
+ * directives through @include_cache (see glslang_include_cache_new).
+ * Harvesting parameters walks every pass of a preset, and the passes
+ * share helper files, so one cache across that walk avoids re-reading
+ * them per pass.  A NULL cache behaves exactly like the uncached call. */
+bool slang_preprocess_parse_parameters_cached(const char *shader_path,
+      struct video_shader *shader, unsigned pass, void *include_cache);
+
+/* Name-map lifecycle.  set_unique appends name -> (semantic, index);
+ * it fails on a duplicate name, an over-long name, or allocation
+ * failure.  The optional @suffix is concatenated after @name (used
+ * for the "Size"/"FeedbackSize" derived entries); pass NULL or ""
+ * for none.  free() releases the entries and re-initializes, so
+ * calling it on a zeroed map or twice is safe. */
+bool slang_texture_semantic_name_map_set_unique(
+      slang_texture_semantic_name_map *map,
+      const char *name, const char *suffix,
+      enum slang_texture_semantic semantic, unsigned index);
+void slang_texture_semantic_name_map_free(
+      slang_texture_semantic_name_map *map);
+bool slang_semantic_name_map_set_unique(
+      slang_semantic_name_map *map,
+      const char *name, const char *suffix,
+      enum slang_semantic semantic, unsigned index);
+void slang_semantic_name_map_free(slang_semantic_name_map *map);
+
+/* Reflection lifecycle: init() zeroes the structure, sizes the
+ * non-arrayed texture semantics (Original, Source) to one element
+ * and presets every GL location to -1; free() releases the arrays
+ * and re-initializes, so double-free is safe.  A reflection must be
+ * init()ed before slang_reflect_spirv() and free()d afterwards. */
+bool slang_reflection_init(slang_reflection *reflection);
+void slang_reflection_free(slang_reflection *reflection);
+
+/* Reflect the two SPIR-V stages into @reflection.  The name-map
+ * pointers and pass_number must be set by the caller after init(). */
+bool slang_reflect_spirv(
+      const uint32_t *vertex,   size_t vertex_len,
+      const uint32_t *fragment, size_t fragment_len,
+      slang_reflection *reflection);
 
 bool slang_process(
       struct video_shader*   shader_info,
@@ -183,139 +428,33 @@ bool slang_process(
 RETRO_END_DECLS
 
 #ifdef __cplusplus
-#include <vector>
-#include <string>
-#include <unordered_map>
-#include <spirv_cross.hpp>
+/* The DirectX SAL-compat shims (dxgi_common.h / dxsdk_sal_compat.h)
+ * #define annotation tokens such as __out / __in / __inout to nothing
+ * so the bundled DXSDK headers parse. Those names collide with real
+ * identifiers inside libstdc++ -- e.g. std::__convert_from_v() in
+ * <bits/c++locale.h> has a parameter literally named __out -- so if a
+ * SAL macro is still live when the STL headers below are parsed, the
+ * token is erased and the header fails to compile (this only bites
+ * under CXX_BUILD, where these .c files are compiled as C++ and pull
+ * in <vector>/<string>/<unordered_map>). Undef them here, after the
+ * DX headers have already consumed them and before the STL includes. */
+#undef __in
+#undef __out
+#undef __inout
+#undef __in_opt
+#undef __out_opt
+#undef __inout_opt
+#undef __in_ecount
+#undef __out_ecount
+#undef __in_ecount_opt
+#undef __out_ecount_opt
+#undef __in_bcount
+#undef __out_bcount
+#undef __in_bcount_opt
+#undef __out_bcount_opt
+#undef __out_bcount_part
+#undef __deref_out_ecount
 
-struct glslang_parameter
-{
-   std::string id;
-   std::string desc;
-   float initial;
-   float minimum;
-   float maximum;
-   float step;
-};
-
-struct glslang_meta
-{
-   std::vector<glslang_parameter> parameters;
-   std::string name;
-   glslang_format rt_format;
-
-   glslang_meta()
-   {
-	   rt_format = SLANG_FORMAT_UNKNOWN;
-   }
-};
-
-struct glslang_output
-{
-   std::vector<uint32_t> vertex;
-   std::vector<uint32_t> fragment;
-   glslang_meta meta;
-};
-
-bool glslang_compile_shader(const char *shader_path, glslang_output *output);
-
-bool slang_preprocess_parse_parameters(glslang_meta& meta,
-      struct video_shader *shader);
-
-struct slang_semantic_location
-{
-   int ubo_vertex;
-   int push_vertex;
-   int ubo_fragment;
-   int push_fragment;
-
-   slang_semantic_location()
-      : ubo_vertex(-1), push_vertex(-1),
-        ubo_fragment(-1), push_fragment(-1) {}
-};
-
-struct slang_texture_semantic_meta
-{
-   size_t   ubo_offset;
-   size_t   push_constant_offset;
-   unsigned binding;
-   uint32_t stage_mask;
-
-   bool texture;
-   bool uniform;
-   bool push_constant;
-
-   /* For APIs which need location information ala legacy GL.
-    * API user fills this struct in. */
-   slang_semantic_location location;
-
-   slang_texture_semantic_meta()
-      : ubo_offset(0), push_constant_offset(0),
-        binding(0), stage_mask(0),
-        texture(false), uniform(false), push_constant(false) {}
-};
-
-struct slang_semantic_meta
-{
-   size_t   ubo_offset;
-   size_t   push_constant_offset;
-   unsigned num_components;
-   bool     uniform;
-   bool     push_constant;
-
-   /* For APIs which need location information ala legacy GL. */
-   slang_semantic_location location;
-
-   slang_semantic_meta()
-      : ubo_offset(0), push_constant_offset(0),
-        num_components(0), uniform(false), push_constant(false) {}
-};
-
-struct slang_reflection
-{
-   slang_reflection();
-
-   size_t   ubo_size;
-   size_t   push_constant_size;
-
-   unsigned ubo_binding;
-   uint32_t ubo_stage_mask;
-   uint32_t push_constant_stage_mask;
-
-   std::vector<slang_texture_semantic_meta>
-      semantic_textures[SLANG_NUM_TEXTURE_SEMANTICS];
-   slang_semantic_meta semantics[SLANG_NUM_SEMANTICS];
-   std::vector<slang_semantic_meta> semantic_float_parameters;
-
-   const std::unordered_map<std::string, slang_texture_semantic_map> *texture_semantic_map;
-   const std::unordered_map<std::string, slang_texture_semantic_map> *texture_semantic_uniform_map;
-   const std::unordered_map<std::string, slang_semantic_map>         *semantic_map;
-   unsigned pass_number;
-};
-
-template <typename P>
-static bool slang_set_unique_map(std::unordered_map<std::string, P> &m,
-      const std::string &name, const P &p)
-{
-   typename std::unordered_map<std::string, P>::iterator itr = m.find(name);
-   /* Alias already exists? */
-   if (itr != m.end())
-      return false;
-   m[name] = p;
-   return true;
-}
-
-bool slang_reflect_spirv(
-      const std::vector<uint32_t> &vertex,
-      const std::vector<uint32_t> &fragment,
-      slang_reflection *reflection);
-
-bool slang_reflect(
-      const spirv_cross::Compiler &vertex_compiler,
-      const spirv_cross::Compiler &fragment_compiler,
-      const spirv_cross::ShaderResources &vertex,
-      const spirv_cross::ShaderResources &fragment,
-      slang_reflection *reflection);
 #endif
 
 #endif

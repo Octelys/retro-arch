@@ -23,6 +23,7 @@
 #include "../../retroarch.h"
 #include "../../tasks/tasks_internal.h"
 #include "../../verbosity.h"
+#include <compat/strl.h>
 
 #define S3_PFX "[S3] "
 
@@ -157,7 +158,7 @@ static bool s3_parse_url(const char *url, char *bucket,  char *region,
 
    scheme_sep = strstr(url, "://");
    authority  = scheme_sep ? scheme_sep + 3 : url;
-   if (string_is_empty(authority))
+   if (!authority || !*authority)
       return false;
 
    authority_end = strchr(authority, '/');
@@ -172,7 +173,7 @@ static bool s3_parse_url(const char *url, char *bucket,  char *region,
       strlcpy(host, authority, host_len + 1);
    }
 
-   if (string_is_empty(host))
+   if (!host || !*host)
       return false;
 
    if (*authority_end == '/')
@@ -227,13 +228,13 @@ static bool s3_parse_url(const char *url, char *bucket,  char *region,
          }
 
          /* Path-style endpoint (accountid.r2...) carries bucket in first path segment. */
-         if (string_is_empty(bucket) && !string_is_empty(first_path_seg))
+         if ((!bucket || !*bucket) && *first_path_seg)
          {
             RARCH_LOG(S3_PFX "Cloudflare R2 style: path-style\n");
             strlcpy(bucket, first_path_seg, NAME_MAX_LENGTH);
          }
       }
-      else if (!string_is_empty(first_label))
+      else if (*first_label)
       {
          /* Compatibility fallback for other cloudflarestorage host variants. */
          RARCH_LOG(S3_PFX "Cloudflare R2 style: fallback-host-label\n");
@@ -241,7 +242,7 @@ static bool s3_parse_url(const char *url, char *bucket,  char *region,
       }
 
       /* Cloudflare R2 uses region "auto" for AWS SigV4. */
-      strlcpy(region, "auto", NAME_MAX_LENGTH);
+      strlcpy_lit(region, "auto", NAME_MAX_LENGTH);
    }
    else if (strstr(host, ".amazonaws.com"))
    {
@@ -262,7 +263,7 @@ static bool s3_parse_url(const char *url, char *bucket,  char *region,
 
          /* Transfer acceleration endpoints do not encode bucket region in hostname.
           * Keep fallback-compatible behavior by using us-east-1 here. */
-         strlcpy(region, "us-east-1", NAME_MAX_LENGTH);
+         strlcpy_lit(region, "us-east-1", NAME_MAX_LENGTH);
       }
       else if (s3pos)
       {
@@ -295,7 +296,7 @@ static bool s3_parse_url(const char *url, char *bucket,  char *region,
       else
       {
          /* Path-style fallback: s3.<region>.amazonaws.com/<bucket>/... */
-         if (!string_is_empty(first_path_seg))
+         if (*first_path_seg)
             strlcpy(bucket, first_path_seg, NAME_MAX_LENGTH);
       }
    }
@@ -324,8 +325,9 @@ static bool s3_parse_url(const char *url, char *bucket,  char *region,
 
       if (s3pos && !b2_path_style_host)
       {
+         size_t bucket_len;
          RARCH_LOG(S3_PFX "Backblaze B2 style: virtual-hosted\n");
-         size_t bucket_len = s3pos - host;
+         bucket_len = s3pos - host;
          if (bucket_len > 0 && bucket_len < NAME_MAX_LENGTH)
             strlcpy(bucket, host, bucket_len + 1);
          s3pos += 4; /* skip ".s3." */
@@ -337,7 +339,7 @@ static bool s3_parse_url(const char *url, char *bucket,  char *region,
                strlcpy(region, s3pos, region_len + 1);
          }
       }
-      else if (!string_is_empty(first_path_seg))
+      else if (*first_path_seg)
       {
          RARCH_LOG(S3_PFX "Backblaze B2 style: path-style\n");
          strlcpy(bucket, first_path_seg, NAME_MAX_LENGTH);
@@ -345,7 +347,7 @@ static bool s3_parse_url(const char *url, char *bucket,  char *region,
    }
    else if (strstr(host, ".digitaloceanspaces.com") || strstr(host, ".linodeobjects.com"))
    {
-      if (!string_is_empty(first_label))
+      if (*first_label)
          strlcpy(bucket, first_label, NAME_MAX_LENGTH);
       if (first_dot)
       {
@@ -364,22 +366,22 @@ static bool s3_parse_url(const char *url, char *bucket,  char *region,
       /* Generic fallback:
        * - virtual-host: bucket.endpoint
        * - path-style: endpoint/bucket */
-      if (!string_is_empty(first_path_seg))
+      if (*first_path_seg)
          strlcpy(bucket, first_path_seg, NAME_MAX_LENGTH);
-      else if (!string_is_empty(first_label))
+      else if (*first_label)
          strlcpy(bucket, first_label, NAME_MAX_LENGTH);
    }
 
-   if (string_is_empty(region))
-      strlcpy(region, "us-east-1", NAME_MAX_LENGTH);
+   if (!region || !*region)
+      strlcpy_lit(region, "us-east-1", NAME_MAX_LENGTH);
 
-   if (string_is_empty(bucket))
+   if (!*bucket)
       RARCH_WARN(S3_PFX "Could not extract bucket from URL: %s\n", url);
 
    RARCH_LOG(S3_PFX "Extracted bucket: %s, region: %s, host: %s\n",
-             string_is_empty(bucket) ? "(none)" : bucket, region, host);
+             (!bucket || !*bucket) ? "(none)" : bucket, region, host);
 
-   return !string_is_empty(host) && !string_is_empty(bucket);
+   return (host && *host) && (bucket && *bucket);
 }
 
 /* Calculate SHA256 hash */
@@ -397,20 +399,24 @@ static char* s3_sha256_hash(const char *data, size_t len)
 /* URL encode a string according to RFC 3986 */
 static char* s3_url_encode(const char *input)
 {
-   size_t input_len = strlen(input);
+   size_t input_len;
    size_t output_pos = 0;
-
-   /* Worst case: every char needs encoding */
-   char *output = malloc(input_len * 3 + 1); 
-   
+   char *output;
    size_t i;
-   
-   if (!output)
-      return NULL;
-   
+
+   /* NULL-check input BEFORE calling strlen.  The previous form
+    * ran strlen(input) first (line-order: strlen, malloc, then
+    * 'if (!input)'), so the 'if (!input)' check was dead code -
+    * a NULL input segfaulted in strlen before we ever reached
+    * the guard. */
    if (!input)
       return NULL;
 
+   input_len = strlen(input);
+
+   /* Worst case: every char needs encoding */
+   if (!(output = malloc(input_len * 3 + 1)))
+      return NULL;
 
    for (i = 0; i < input_len; i++)
    {
@@ -418,10 +424,11 @@ static char* s3_url_encode(const char *input)
 
       /* RFC 3986 unreserved characters: A-Z, a-z, 0-9, -, ., _, ~ */
       /* Path delimiters that should not be encoded: / */
-      /* Query parameter delimiters that should not be encoded: &, =, ? */
+      /* This encodes the object key only, so '&', '=' and '?' are
+       * key characters and must be encoded like any other. */
       if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-          (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || 
-          c == '~' || c == '/' || c == '&' || c == '=' || c == '?')
+          (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' ||
+          c == '~' || c == '/')
       {
          output[output_pos++] = c;
       }
@@ -435,38 +442,6 @@ static char* s3_url_encode(const char *input)
    }
    output[output_pos] = '\0';
    return output;
-}
-
-/* Trim whitespace from string */
-static char* s3_trim_string(const char *input)
-{
-   size_t len = strlen(input);
-   size_t start = 0;
-   size_t end = len;
-   size_t trimmed_len = 0;
-   char *trimmed = NULL;
-
-   if (!input)
-      return NULL;
-
-   /* Find start of non-whitespace */
-   while (start < len && (input[start] == ' ' || input[start] == '\t'))
-      start++;
-
-   /* Find end of non-whitespace */
-   while (end > start && (input[end-1] == ' ' || input[end-1] == '\t'))
-      end--;
-
-   /* Create trimmed string */
-   trimmed_len = end - start;
-   trimmed = malloc(trimmed_len + 1);
-   if (!trimmed)
-      return NULL;
-
-   memcpy(trimmed, input + start, trimmed_len);
-   trimmed[trimmed_len] = '\0';
-
-   return trimmed;
 }
 
 /* Canonicalize query string parameters */
@@ -510,7 +485,10 @@ static uint8_t* s3_hmac_sha256_bin(const uint8_t *key, size_t key_len, const cha
       /* Convert hex to binary */
       for (i = 0; i < 32; i++)
       {
-         char hex_byte[3] = {temp_hash[i*2], temp_hash[i*2+1], 0};
+         char hex_byte[3];
+         hex_byte[0] = temp_hash[i*2];
+         hex_byte[1] = temp_hash[i*2+1];
+         hex_byte[2] = '\0';
          key_hash[i] = (uint8_t)strtol(hex_byte, NULL, 16);
       }
       key = key_hash;
@@ -555,7 +533,10 @@ static uint8_t* s3_hmac_sha256_bin(const uint8_t *key, size_t key_len, const cha
 
    for (i = 0; i < 32; i++)
    {
-      char hex_byte[3] = {inner_hash_hex[i*2], inner_hash_hex[i*2+1], 0};
+      char hex_byte[3];
+      hex_byte[0] = inner_hash_hex[i*2];
+      hex_byte[1] = inner_hash_hex[i*2+1];
+      hex_byte[2] = '\0';
       inner_hash_bin[i] = (uint8_t)strtol(hex_byte, NULL, 16);
    }
 
@@ -581,7 +562,10 @@ static uint8_t* s3_hmac_sha256_bin(const uint8_t *key, size_t key_len, const cha
    /* Convert final result to binary */
    for (i = 0; i < 32; i++)
    {
-      char hex_byte[3] = {final_hash_hex[i*2], final_hash_hex[i*2+1], 0};
+      char hex_byte[3];
+      hex_byte[0] = final_hash_hex[i*2];
+      hex_byte[1] = final_hash_hex[i*2+1];
+      hex_byte[2] = '\0';
       output[i] = (uint8_t)strtol(hex_byte, NULL, 16);
    }
 
@@ -589,53 +573,6 @@ static uint8_t* s3_hmac_sha256_bin(const uint8_t *key, size_t key_len, const cha
    free(inner_data);
 
    return output;
-}
-
-/* Calculate HMAC-SHA256 (legacy function for compatibility) */
-static char* s3_hmac_sha256(const char *key, const char *data, char *output)
-{
-   unsigned i;
-   char *hmac_hex = malloc(65);
-   uint8_t binary_key[64];
-   size_t key_len;
-   uint8_t result[32];
-
-   if (!hmac_hex)
-      return NULL;
-
-   key_len = strlen(key);
-
-   /* Convert key to binary */
-   if (key_len <= 64)
-   {
-      memset(binary_key, 0, 64);
-      memcpy(binary_key, key, key_len);
-   }
-   else
-   {
-      /* Hash the key if it's longer than 64 bytes */
-      char temp_hash[65];
-      sha256_hash(temp_hash, (const uint8_t*)key, key_len);
-      for (i = 0; i < 32; i++)
-      {
-         char hex_byte[3] = {temp_hash[i*2], temp_hash[i*2+1], 0};
-         binary_key[i] = (uint8_t)strtol(hex_byte, NULL, 16);
-      }
-      key_len = 32;
-   }
-
-   if (!s3_hmac_sha256_bin(binary_key, key_len, data, result))
-   {
-      free(hmac_hex);
-      return NULL;
-   }
-
-   /* Convert binary result to hex */
-   for (i = 0; i < 32; i++)
-      snprintf(hmac_hex + 2 * i, 3, "%02x", (unsigned)result[i]);
-
-   hmac_hex[64] = '\0';
-   return hmac_hex;
 }
 
 /* Calculate AWS Signature Version 4 signature with proper key derivation */
@@ -714,11 +651,16 @@ error:
 }
 
 /* AWS Signature Version 4 calculation with provided timestamp */
+/* @copy_source, when set, is the x-amz-copy-source value of a
+ * CopyObject request.  S3 requires every x-amz-* header a request
+ * carries to be signed, so it joins the canonical and signed headers
+ * in its sorted place, between x-amz-content-sha256 and x-amz-date. */
 static char* s3_calculate_signature_v4_with_time(const char *method, const char *canonical_uri,
                                       const char *query_string, const char *headers,
                                       const char *payload_hash, const char *region,
                                       const char *service, const char *access_key,
-                                      const char *secret_key, const char *host, time_t now)
+                                      const char *secret_key, const char *host,
+                                      const char *copy_source, time_t now)
 {
    char *signature = NULL;
    char date[16];
@@ -750,17 +692,26 @@ static char* s3_calculate_signature_v4_with_time(const char *method, const char 
        * x-amz-content-sha256
        * x-amz-date
        */
-      canonical_headers = malloc(512);
+      size_t canonical_len = 512 + (copy_source ? strlen(copy_source) : 0);
+      canonical_headers = malloc(canonical_len);
       if (canonical_headers)
       {
-         snprintf(canonical_headers, 512, "host:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n",
+         if (copy_source)
+            snprintf(canonical_headers, canonical_len,
+                  "host:%s\nx-amz-content-sha256:%s\nx-amz-copy-source:%s\nx-amz-date:%s\n",
+                  host, payload_hash, copy_source, datetime);
+         else
+            snprintf(canonical_headers, canonical_len,
+                  "host:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n",
                   host, payload_hash, datetime);
       }
 
    }
 
    /* Build signed headers list */
-   snprintf(signed_headers, sizeof(signed_headers), "host;x-amz-content-sha256;x-amz-date");
+   strlcpy(signed_headers, copy_source
+         ? "host;x-amz-content-sha256;x-amz-copy-source;x-amz-date"
+         : "host;x-amz-content-sha256;x-amz-date", sizeof(signed_headers));
 
    /* Build canonical query string */
    if (query_string)
@@ -809,9 +760,10 @@ static char* s3_calculate_signature_v4_with_time(const char *method, const char 
 
 
 /* Build S3 authorization header */
-static char* s3_build_auth_header(const char *method, const char *canonical_uri,
+static char* s3_build_auth_header_ex(const char *method, const char *canonical_uri,
                                  const char *query_string, const char *headers,
-                                 const char *payload_hash, s3_state_t *s3_st)
+                                 const char *payload_hash, const char *copy_source,
+                                 s3_state_t *s3_st)
 {
    char *auth_header = NULL;
    char *signature = NULL;
@@ -831,7 +783,7 @@ static char* s3_build_auth_header(const char *method, const char *canonical_uri,
    signature = s3_calculate_signature_v4_with_time(method, canonical_uri, query_string, headers,
                                         payload_hash, s3_st->region, S3_SERVICE,
                                         s3_st->access_key_id, s3_st->secret_access_key,
-                                        s3_st->host, now);
+                                        s3_st->host, copy_source, now);
 
    if (!signature)
       return NULL;
@@ -841,28 +793,65 @@ static char* s3_build_auth_header(const char *method, const char *canonical_uri,
             s3_st->access_key_id, date, s3_st->region, S3_SERVICE);
 
    /* Build authorization header */
-   auth_header = malloc(1024);
-   snprintf(auth_header, 1024,
-            "Authorization: %s Credential=%s, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=%s\r\n"
-            "x-amz-date: %s\r\n"
-            "x-amz-content-sha256: %s\r\n",
-            S3_SIGNATURE_VERSION, credential, signature, datetime, payload_hash);
+   /* NULL-check the malloc: snprintf-into-NULL segfaults.  Also
+    * free 'signature' on the OOM path - the success path at line
+    * below already free's it, but the pre-patch code would have
+    * crashed before reaching that free. */
+   {
+      size_t header_len = 1024 + (copy_source ? strlen(copy_source) : 0);
+      if (!(auth_header = malloc(header_len)))
+      {
+         free(signature);
+         return NULL;
+      }
+      if (copy_source)
+         snprintf(auth_header, header_len,
+               "Authorization: %s Credential=%s, SignedHeaders=host;x-amz-content-sha256;x-amz-copy-source;x-amz-date, Signature=%s\r\n"
+               "x-amz-date: %s\r\n"
+               "x-amz-content-sha256: %s\r\n"
+               "x-amz-copy-source: %s\r\n",
+               S3_SIGNATURE_VERSION, credential, signature, datetime, payload_hash,
+               copy_source);
+      else
+         snprintf(auth_header, header_len,
+               "Authorization: %s Credential=%s, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=%s\r\n"
+               "x-amz-date: %s\r\n"
+               "x-amz-content-sha256: %s\r\n",
+               S3_SIGNATURE_VERSION, credential, signature, datetime, payload_hash);
+   }
 
    free(signature);
    return auth_header;
 }
 
-static void s3_log_http_failure(const char *path, http_transfer_data_t *data)
+static char* s3_build_auth_header(const char *method, const char *canonical_uri,
+                                 const char *query_string, const char *headers,
+                                 const char *payload_hash, s3_state_t *s3_st)
 {
-   size_t i;
-   RARCH_WARN(S3_PFX "Failed: %s: HTTP %d\n", path ? path : "<unknown>", data->status);
-   for (i = 0; data->headers && i < data->headers->size; i++)
-      RARCH_WARN(S3_PFX "%s\n", data->headers->elems[i].data);
+   return s3_build_auth_header_ex(method, canonical_uri, query_string,
+         headers, payload_hash, NULL, s3_st);
+}
+
+static void s3_log_http_failure(const char *path,
+      http_transfer_data_t *data, const char *err)
+{
+   const char *h;
+   /* No status means the transport failed before the server answered;
+    * the task's error names the stage and its code, as in webdav.c. */
+   if (data->status < 0 && err && *err)
+      RARCH_WARN(S3_PFX "Failed: %s: HTTP %d (%s)\n",
+            path ? path : "<unknown>", data->status, err);
+   else
+      RARCH_WARN(S3_PFX "Failed: %s: HTTP %d\n",
+            path ? path : "<unknown>", data->status);
+   for (h = net_http_header_next(data->headers, NULL); h;
+         h = net_http_header_next(data->headers, h))
+      RARCH_WARN(S3_PFX "%s\n", h);
+   /* See webdav.c: the buffer is sized exactly to data->len, so
+    * writing a terminator at data->data[data->len] overflows the
+    * heap chunk by one byte.  Use the length-bounded form. */
    if (data->data)
-   {
-      data->data[data->len] = '\0';
-      RARCH_WARN(S3_PFX "%s\n", data->data);
-   }
+      RARCH_WARN(S3_PFX "%.*s\n", (int)data->len, (const char*)data->data);
 }
 
 static void s3_read_cb(retro_task_t *task, void *task_data, void *user_data, const char *err)
@@ -873,15 +862,15 @@ static void s3_read_cb(retro_task_t *task, void *task_data, void *user_data, con
    RFILE *file                   = NULL;
 
    (void)task;
-   (void)err;
 
    if (!s3_cb_st)
       return;
 
    if (!data)
-      RARCH_WARN(S3_PFX "Did not get HTTP data for read '%s'\n", s3_cb_st->path);
+      RARCH_WARN(S3_PFX "Did not get HTTP data for read '%s'%s%s\n",
+            s3_cb_st->path, (err && *err) ? ": " : "", (err && *err) ? err : "");
    else if (!success)
-      s3_log_http_failure(s3_cb_st->path, data);
+      s3_log_http_failure(s3_cb_st->path, data, err);
 
    if (success && data && data->status >= 200 && data->status < 300)
    {
@@ -913,15 +902,15 @@ static void s3_update_cb(retro_task_t *task, void *task_data, void *user_data, c
    bool success                  = (data && data->status >= 200 && data->status < 300);
 
    (void)task;
-   (void)err;
 
    if (!s3_cb_st)
       return;
 
    if (!data)
-      RARCH_WARN(S3_PFX "Did not get HTTP data for update '%s'\n", s3_cb_st->path);
+      RARCH_WARN(S3_PFX "Did not get HTTP data for update '%s'%s%s\n",
+            s3_cb_st->path, (err && *err) ? ": " : "", (err && *err) ? err : "");
    else if (!success)
-      s3_log_http_failure(s3_cb_st->path, data);
+      s3_log_http_failure(s3_cb_st->path, data, err);
 
    if (s3_cb_st->cb)
       s3_cb_st->cb(s3_cb_st->user_data, s3_cb_st->path, success, s3_cb_st->rfile);
@@ -935,15 +924,15 @@ static void s3_delete_cb(retro_task_t *task, void *task_data, void *user_data, c
    bool success                  = (data && data->status >= 200 && data->status < 300);
 
    (void)task;
-   (void)err;
 
    if (!s3_cb_st)
       return;
 
    if (!data)
-      RARCH_WARN(S3_PFX "Did not get HTTP data for delete '%s'\n", s3_cb_st->path);
+      RARCH_WARN(S3_PFX "Did not get HTTP data for delete '%s'%s%s\n",
+            s3_cb_st->path, (err && *err) ? ": " : "", (err && *err) ? err : "");
    else if (!success)
-      s3_log_http_failure(s3_cb_st->path, data);
+      s3_log_http_failure(s3_cb_st->path, data, err);
 
    if (s3_cb_st->cb)
       s3_cb_st->cb(s3_cb_st->user_data, s3_cb_st->path, success, NULL);
@@ -981,7 +970,7 @@ static char* s3_normalize_object_key(const char *path)
    size_t out = 0;
    bool prev_slash = false;
 
-   if (string_is_empty(path))
+   if (!path || !*path)
       return strdup("");
 
    while (*src == '/')
@@ -1020,10 +1009,10 @@ static bool s3_build_request_url(char *url, size_t url_size, s3_state_t *s3_st, 
    char *encoded_path = NULL;
    size_t base_len = 0;
 
-   if (!url || !s3_st || string_is_empty(s3_st->url))
+   if (!url || !s3_st || !*s3_st->url)
       return false;
 
-   if (string_is_empty(path))
+   if (!path || !*path)
    {
       strlcpy(url, s3_st->url, url_size);
       return true;
@@ -1045,7 +1034,7 @@ static bool s3_build_request_url(char *url, size_t url_size, s3_state_t *s3_st, 
    while (base_len > 0 && base_url[base_len - 1] == '/')
       base_url[--base_len] = '\0';
 
-   if (string_is_empty(encoded_path))
+   if (!encoded_path || !*encoded_path)
       strlcpy(url, base_url, url_size);
    else
       snprintf(url, url_size, "%s/%s", base_url, encoded_path);
@@ -1066,18 +1055,18 @@ static bool s3_build_canonical_uri_from_url(const char *url, char *canonical_uri
    const char *path_end = NULL;
    size_t path_len = 0;
 
-   if (string_is_empty(url) || !canonical_uri || canonical_uri_size == 0)
+   if ((!url || !*url) || !canonical_uri || canonical_uri_size == 0)
       return false;
 
    scheme_sep = strstr(url, "://");
    authority  = scheme_sep ? scheme_sep + 3 : url;
-   if (string_is_empty(authority))
+   if (!authority || !*authority)
       return false;
 
    path_start = strchr(authority, '/');
    if (!path_start)
    {
-      strlcpy(canonical_uri, "/", canonical_uri_size);
+      strlcpy_lit(canonical_uri, "/", canonical_uri_size);
       return true;
    }
 
@@ -1086,7 +1075,7 @@ static bool s3_build_canonical_uri_from_url(const char *url, char *canonical_uri
 
    if (path_len == 0)
    {
-      strlcpy(canonical_uri, "/", canonical_uri_size);
+      strlcpy_lit(canonical_uri, "/", canonical_uri_size);
       return true;
    }
 
@@ -1137,10 +1126,10 @@ static char* s3_build_url_with_query(const char *url, const char *query)
    size_t total = 0;
    char *result = NULL;
 
-   if (string_is_empty(url))
+   if (!url || !*url)
       return NULL;
 
-   total = strlen(url) + (query ? strlen(query) : 0) + 2;
+   total  = strlen(url) + (query ? strlen(query) : 0) + 2;
    result = (char*)malloc(total);
    if (!result)
       return NULL;
@@ -1162,7 +1151,7 @@ static char* s3_extract_xml_tag_value(const char *xml, const char *tag_name)
    size_t len = 0;
    char *value = NULL;
 
-   if (string_is_empty(xml) || string_is_empty(tag_name))
+   if ((!xml || !*xml) || (!tag_name || !*tag_name))
       return NULL;
 
    snprintf(open_tag, sizeof(open_tag), "<%s>", tag_name);
@@ -1189,45 +1178,25 @@ static char* s3_extract_xml_tag_value(const char *xml, const char *tag_name)
 
 static char* s3_extract_header_value(http_transfer_data_t *data, const char *header_name)
 {
-   size_t i;
-   char prefix[64];
+   const char *start;
+   const char *end;
+   size_t len;
+   char *out;
 
-   if (!data || !data->headers || string_is_empty(header_name))
+   if (!data || !header_name || !*header_name
+         || !(start = net_http_header_value(data->headers, header_name)))
       return NULL;
 
-   snprintf(prefix, sizeof(prefix), "%s:", header_name);
+   end = start + strlen(start);
+   while (end > start && (end[-1] == '\r' || end[-1] == '\n' || end[-1] == ' ' || end[-1] == '\t'))
+      end--;
 
-   for (i = 0; i < data->headers->size; i++)
-   {
-      const char *line = data->headers->elems[i].data;
-      const char *start = NULL;
-      const char *end = NULL;
-      size_t len = 0;
-      char *out = NULL;
-
-      if (string_is_empty(line))
-         continue;
-      if (!string_starts_with_case_insensitive(line, prefix))
-         continue;
-
-      start = line + strlen(prefix);
-      while (*start == ' ' || *start == '\t')
-         start++;
-
-      end = start + strlen(start);
-      while (end > start && (end[-1] == '\r' || end[-1] == '\n' || end[-1] == ' ' || end[-1] == '\t'))
-         end--;
-
-      len = (size_t)(end - start);
-      out = (char*)malloc(len + 1);
-      if (!out)
-         return NULL;
-      memcpy(out, start, len);
-      out[len] = '\0';
-      return out;
-   }
-
-   return NULL;
+   len = (size_t)(end - start);
+   if (!(out = (char*)malloc(len + 1)))
+      return NULL;
+   memcpy(out, start, len);
+   out[len] = '\0';
+   return out;
 }
 
 static void s3_multipart_free(s3_multipart_state_t *mp_st)
@@ -1295,28 +1264,27 @@ static bool s3_multipart_part_bounds(const s3_multipart_state_t *mp_st,
 static void s3_log_multipart_initiate_failure(
       s3_multipart_state_t *mp_st, http_transfer_data_t *data, const char *err)
 {
-   size_t i;
+   const char *h;
 
    if (!mp_st)
       return;
 
-   RARCH_WARN(S3_PFX "Multipart initiate diagnostic: path='%s' url_query='uploads=' canonical_query='uploads=' data=%s status=%d len=%zu headers=%zu err='%s'\n",
+   RARCH_WARN(S3_PFX "Multipart initiate diagnostic: path='%s' url_query='uploads=' canonical_query='uploads=' data=%s status=%d len=%zu headers=%s err='%s'\n",
          mp_st->cb_state ? mp_st->cb_state->path : "<unknown>",
          data ? "present" : "missing",
          data ? data->status : -1,
          data ? data->len : 0,
-         (data && data->headers) ? data->headers->size : 0,
+         (data && data->headers) ? "present" : "missing",
          (err && *err) ? err : "<none>");
 
-   if (data && data->headers)
-      for (i = 0; i < data->headers->size; i++)
-         RARCH_WARN(S3_PFX "Multipart initiate header[%zu]: %s\n", i, data->headers->elems[i].data);
+   if (data)
+      for (h = net_http_header_next(data->headers, NULL); h;
+            h = net_http_header_next(data->headers, h))
+         RARCH_WARN(S3_PFX "Multipart initiate header: %s\n", h);
 
    if (data && data->data && data->len > 0)
-   {
-      data->data[data->len] = '\0';
-      RARCH_WARN(S3_PFX "Multipart initiate body: %s\n", data->data);
-   }
+      RARCH_WARN(S3_PFX "Multipart initiate body: %.*s\n",
+            (int)data->len, (const char*)data->data);
 }
 
 static bool s3_multipart_fallback_single_put(s3_multipart_state_t *mp_st)
@@ -1360,17 +1328,18 @@ static bool s3_multipart_fallback_single_put(s3_multipart_state_t *mp_st)
    return true;
 }
 
-static void s3_multipart_fail(s3_multipart_state_t *mp_st, http_transfer_data_t *data, const char *phase)
+static void s3_multipart_fail(s3_multipart_state_t *mp_st,
+      http_transfer_data_t *data, const char *err, const char *phase)
 {
    if (!mp_st)
       return;
 
    if (data)
-      s3_log_http_failure(mp_st->cb_state ? mp_st->cb_state->path : phase, data);
+      s3_log_http_failure(mp_st->cb_state ? mp_st->cb_state->path : phase, data, err);
    else
       RARCH_WARN(S3_PFX "Multipart upload failed during %s\n", phase ? phase : "unknown phase");
 
-   if (!string_is_empty(mp_st->upload_id) && !mp_st->aborting)
+   if (mp_st->upload_id && *mp_st->upload_id && !mp_st->aborting)
       s3_multipart_abort(mp_st);
    else
       s3_multipart_finish(mp_st, false);
@@ -1402,7 +1371,7 @@ static void s3_multipart_abort(s3_multipart_state_t *mp_st)
    char *url_with_query = NULL;
    char *auth_header = NULL;
 
-   if (!mp_st || string_is_empty(mp_st->upload_id))
+   if (!mp_st || (!mp_st->upload_id || !*mp_st->upload_id))
    {
       s3_multipart_finish(mp_st, false);
       return;
@@ -1457,14 +1426,13 @@ static void s3_multipart_complete_cb(retro_task_t *task, void *task_data, void *
    bool success                  = (data && data->status >= 200 && data->status < 300);
 
    (void)task;
-   (void)err;
 
    if (!mp_st)
       return;
 
    if (!success)
    {
-      s3_multipart_fail(mp_st, data, "complete");
+      s3_multipart_fail(mp_st, data, err, "complete");
       return;
    }
 
@@ -1487,7 +1455,7 @@ static void s3_multipart_complete(s3_multipart_state_t *mp_st)
    size_t xml_len = 0;
    size_t xml_cap = 128;
 
-   if (!mp_st || string_is_empty(mp_st->upload_id))
+   if (!mp_st || (!mp_st->upload_id || !*mp_st->upload_id))
    {
       s3_multipart_finish(mp_st, false);
       return;
@@ -1495,9 +1463,9 @@ static void s3_multipart_complete(s3_multipart_state_t *mp_st)
 
    for (i = 0; i < mp_st->part_count; i++)
    {
-      if (string_is_empty(mp_st->part_etags[i]))
+      if (!mp_st->part_etags[i] || !*mp_st->part_etags[i])
       {
-         s3_multipart_fail(mp_st, NULL, "complete missing ETag");
+         s3_multipart_fail(mp_st, NULL, NULL, "complete missing ETag");
          return;
       }
       xml_cap += strlen(mp_st->part_etags[i]) + 96;
@@ -1506,7 +1474,7 @@ static void s3_multipart_complete(s3_multipart_state_t *mp_st)
    xml_body = (char*)malloc(xml_cap);
    if (!xml_body)
    {
-      s3_multipart_fail(mp_st, NULL, "complete allocation");
+      s3_multipart_fail(mp_st, NULL, NULL, "complete allocation");
       return;
    }
 
@@ -1554,7 +1522,7 @@ fail:
    free(payload_hash);
    free(auth_header);
    free(xml_body);
-   s3_multipart_fail(mp_st, NULL, "complete start");
+   s3_multipart_fail(mp_st, NULL, NULL, "complete start");
 }
 
 static void s3_multipart_upload_part_cb(retro_task_t *task, void *task_data, void *user_data, const char *err)
@@ -1565,14 +1533,13 @@ static void s3_multipart_upload_part_cb(retro_task_t *task, void *task_data, voi
    char *etag = NULL;
 
    (void)task;
-   (void)err;
 
    if (!mp_st)
       return;
 
    if (!success)
    {
-      s3_multipart_fail(mp_st, data, "upload part");
+      s3_multipart_fail(mp_st, data, err, "upload part");
       return;
    }
 
@@ -1580,7 +1547,7 @@ static void s3_multipart_upload_part_cb(retro_task_t *task, void *task_data, voi
    if (!etag)
    {
       RARCH_WARN(S3_PFX "Missing ETag for multipart part %u\n", (unsigned)(mp_st->current_part + 1));
-      s3_multipart_fail(mp_st, data, "upload part missing etag");
+      s3_multipart_fail(mp_st, data, err, "upload part missing etag");
       return;
    }
 
@@ -1654,7 +1621,7 @@ fail:
    free(query);
    free(url_with_query);
    free(auth_header);
-   s3_multipart_fail(mp_st, NULL, "upload part start");
+   s3_multipart_fail(mp_st, NULL, NULL, "upload part start");
 }
 
 static void s3_multipart_initiate_cb(retro_task_t *task, void *task_data, void *user_data, const char *err)
@@ -1665,7 +1632,6 @@ static void s3_multipart_initiate_cb(retro_task_t *task, void *task_data, void *
    char *response_xml            = NULL;
 
    (void)task;
-   (void)err;
 
    if (!mp_st)
       return;
@@ -1689,20 +1655,20 @@ static void s3_multipart_initiate_cb(retro_task_t *task, void *task_data, void *
 
       if (err && *err)
          RARCH_WARN(S3_PFX "Multipart initiate transport error: %s\n", err);
-      s3_multipart_fail(mp_st, data, "initiate");
+      s3_multipart_fail(mp_st, data, err, "initiate");
       return;
    }
 
-   if (!data || string_is_empty(data->data))
+   if (!data || (!data->data || !*data->data))
    {
-      s3_multipart_fail(mp_st, data, "initiate empty response");
+      s3_multipart_fail(mp_st, data, err, "initiate empty response");
       return;
    }
 
    response_xml = (char*)malloc(data->len + 1);
    if (!response_xml)
    {
-      s3_multipart_fail(mp_st, data, "initiate allocation");
+      s3_multipart_fail(mp_st, data, err, "initiate allocation");
       return;
    }
    memcpy(response_xml, data->data, data->len);
@@ -1710,10 +1676,10 @@ static void s3_multipart_initiate_cb(retro_task_t *task, void *task_data, void *
 
    mp_st->upload_id = s3_extract_xml_tag_value(response_xml, "UploadId");
    free(response_xml);
-   if (string_is_empty(mp_st->upload_id))
+   if (!mp_st->upload_id || !*mp_st->upload_id)
    {
       RARCH_WARN(S3_PFX "Multipart initiation response missing UploadId\n");
-      s3_multipart_fail(mp_st, data, "initiate missing upload id");
+      s3_multipart_fail(mp_st, data, err, "initiate missing upload id");
       return;
    }
 
@@ -1781,8 +1747,9 @@ static bool s3_sync_begin(cloud_sync_complete_handler_t cb, void *user_data)
       RARCH_WARN(S3_PFX "Could not parse bucket/region from URL, using defaults\n");
 
    /* Validate configuration */
-   if (string_is_empty(s3_st->url) || string_is_empty(s3_st->access_key_id) ||
-       string_is_empty(s3_st->secret_access_key))
+   if (   !*s3_st->url
+       || !*s3_st->access_key_id
+       || !*s3_st->secret_access_key)
    {
       RARCH_ERR(S3_PFX "Missing S3 configuration\n");
       return false;
@@ -1872,7 +1839,7 @@ cleanup:
 }
 
 /* Update file to S3 */
-static bool s3_update(const char *path, RFILE *file, cloud_sync_complete_handler_t cb, void *user_data)
+static bool s3_update_upload(const char *path, RFILE *file, cloud_sync_complete_handler_t cb, void *user_data)
 {
    s3_cb_state_t *s3_cb_st = (s3_cb_state_t*)calloc(1, sizeof(s3_cb_state_t));
    s3_multipart_state_t *mp_st = NULL;
@@ -2016,7 +1983,7 @@ cleanup:
 }
 
 /* Delete file from S3 */
-static bool s3_free(const char *path, cloud_sync_complete_handler_t cb, void *user_data)
+static bool s3_delete_object(const char *path, cloud_sync_complete_handler_t cb, void *user_data)
 {
    s3_cb_state_t *s3_cb_st = (s3_cb_state_t*)calloc(1, sizeof(s3_cb_state_t));
    s3_state_t *s3_st = s3_state_get_ptr();
@@ -2066,6 +2033,196 @@ cleanup:
    return success;
 }
 
+/* With destructive sync off, cloud sync promises not to throw away the
+ * server's copy of a file: before a delete or an upload replaces it,
+ * the object is copied to deleted/<path>-<yymmdd-hhmmss>, the name the
+ * WebDAV driver uses.  CopyObject is server-side, so the data does not
+ * come down and go back up.  The server manifest is rewritten every
+ * sync and is not backed up. */
+typedef struct
+{
+   char path[PATH_MAX_LENGTH];
+   RFILE *rfile;
+   cloud_sync_complete_handler_t cb;
+   void *user_data;
+   bool is_delete;
+} s3_backup_state_t;
+
+static bool s3_wants_backup(const char *path)
+{
+   settings_t *settings = config_get_ptr();
+   return settings
+       && !settings->bools.cloud_sync_destructive
+       && !string_is_equal(path, CLOUD_SYNC_SERVER_MANIFEST);
+}
+
+static bool s3_backup_key(char *s, size_t len, const char *path)
+{
+   struct tm tm_;
+   time_t    cur_time = time(NULL);
+   size_t    _len;
+
+   while (*path == '/')
+      path++;
+   _len = strlcpy_lit(s, "deleted/", len);
+   if (_len >= len)
+      return false;
+   _len += strlcpy(s + _len, path, len - _len);
+   if (_len >= len)
+      return false;
+   rtime_localtime(&cur_time, &tm_);
+   return strftime(s + _len, len - _len, "-%y%m%d-%H%M%S", &tm_) != 0;
+}
+
+/* x-amz-copy-source is /<bucket>/<key>, URL-encoded, whichever
+ * addressing style the endpoint uses.  The request's canonical URI
+ * already is that for a path-style endpoint (/<bucket>/<key>); a
+ * virtual-hosted one carries the bucket in the host, so it goes in
+ * front. */
+static bool s3_copy_source(char *s, size_t len, s3_state_t *s3_st,
+      const char *canonical_uri)
+{
+   size_t bucket_len = strlen(s3_st->bucket);
+   bool   virtual_hosted;
+
+   if (!bucket_len)
+      return false;
+
+   virtual_hosted = !strncmp(s3_st->host, s3_st->bucket, bucket_len)
+                 && s3_st->host[bucket_len] == '.';
+   if (virtual_hosted)
+      return (size_t)snprintf(s, len, "/%s%s", s3_st->bucket, canonical_uri) < len;
+   return strlcpy(s, canonical_uri, len) < len;
+}
+
+/* A CopyObject that fails part way can still answer 200, with an
+ * <Error> document for a body. */
+static bool s3_body_has_error(const http_transfer_data_t *data)
+{
+   static const char tag[] = "<Error>";
+   size_t i;
+
+   if (!data->data || data->len < sizeof(tag) - 1)
+      return false;
+   for (i = 0; i + sizeof(tag) - 1 <= data->len; i++)
+      if (!memcmp(data->data + i, tag, sizeof(tag) - 1))
+         return true;
+   return false;
+}
+
+static void s3_backup_cb(retro_task_t *task, void *task_data, void *user_data, const char *err)
+{
+   s3_backup_state_t    *st   = (s3_backup_state_t*)user_data;
+   http_transfer_data_t *data = (http_transfer_data_t*)task_data;
+   bool copied, missing;
+
+   (void)task;
+
+   if (!st)
+      return;
+
+   copied  = data && data->status >= 200 && data->status < 300
+          && !s3_body_has_error(data);
+   /* 404: nothing on the server yet, so nothing to keep. */
+   missing = data && data->status == 404;
+
+   if (copied || missing)
+   {
+      bool started = st->is_delete
+         ? s3_delete_object(st->path, st->cb, st->user_data)
+         : s3_update_upload(st->path, st->rfile, st->cb, st->user_data);
+      /* Past this point the request is asynchronous: a start that
+       * fails has to be reported here, since the caller was already
+       * told it began. */
+      if (!started)
+         st->cb(st->user_data, st->path, false, st->is_delete ? NULL : st->rfile);
+      free(st);
+      return;
+   }
+
+   if (data)
+      s3_log_http_failure(st->path, data, err);
+   else
+      RARCH_WARN(S3_PFX "Did not get HTTP data for backup of '%s'%s%s\n",
+            st->path, (err && *err) ? ": " : "", (err && *err) ? err : "");
+   RARCH_ERR(S3_PFX "Not %s '%s': the copy on the server could not be backed up.\n",
+         st->is_delete ? "deleting" : "replacing", st->path);
+   st->cb(st->user_data, st->path, false, st->is_delete ? NULL : st->rfile);
+   free(st);
+}
+
+static bool s3_backup_then(const char *path, RFILE *file, bool is_delete,
+      cloud_sync_complete_handler_t cb, void *user_data)
+{
+   s3_state_t        *s3_st       = s3_state_get_ptr();
+   s3_backup_state_t *st          = NULL;
+   char              *auth_header = NULL;
+   char key[PATH_MAX_LENGTH];
+   char src_url[PATH_MAX_LENGTH];
+   char src_uri[PATH_MAX_LENGTH];
+   char dest_url[PATH_MAX_LENGTH];
+   char dest_uri[PATH_MAX_LENGTH];
+   char copy_source[PATH_MAX_LENGTH + NAME_MAX_LENGTH];
+
+   if (   !s3_backup_key(key, sizeof(key), path)
+       || !s3_build_request_url(src_url, sizeof(src_url), s3_st, path)
+       || !s3_build_canonical_uri_from_url(src_url, src_uri, sizeof(src_uri))
+       || !s3_build_request_url(dest_url, sizeof(dest_url), s3_st, key)
+       || !s3_build_canonical_uri_from_url(dest_url, dest_uri, sizeof(dest_uri))
+       || !s3_copy_source(copy_source, sizeof(copy_source), s3_st, src_uri))
+   {
+      RARCH_ERR(S3_PFX "Not %s '%s': could not name a backup for it.\n",
+            is_delete ? "deleting" : "replacing", path);
+      return false;
+   }
+
+   if (!(st = (s3_backup_state_t*)calloc(1, sizeof(*st))))
+      return false;
+   strlcpy(st->path, path, sizeof(st->path));
+   st->rfile     = file;
+   st->cb        = cb;
+   st->user_data = user_data;
+   st->is_delete = is_delete;
+
+   /* CopyObject: a PUT on the new key, empty body, naming the source. */
+   auth_header = s3_build_auth_header_ex("PUT", dest_uri, "",
+         "host;x-amz-content-sha256;x-amz-copy-source;x-amz-date",
+         S3_EMPTY_PAYLOAD_SHA256, copy_source, s3_st);
+   if (!auth_header)
+   {
+      RARCH_ERR(S3_PFX "Failed to build authorization header\n");
+      free(st);
+      return false;
+   }
+
+   RARCH_DBG(S3_PFX "COPY %s -> %s\n", copy_source, dest_url);
+   if (!task_push_http_transfer_with_content(dest_url, "PUT", NULL, 0, NULL,
+            true, false, auth_header, s3_backup_cb, st))
+   {
+      RARCH_ERR(S3_PFX "Failed to start backup of '%s'\n", path);
+      free(auth_header);
+      free(st);
+      return false;
+   }
+
+   free(auth_header);
+   return true;
+}
+
+static bool s3_update(const char *path, RFILE *file, cloud_sync_complete_handler_t cb, void *user_data)
+{
+   if (s3_wants_backup(path))
+      return s3_backup_then(path, file, false, cb, user_data);
+   return s3_update_upload(path, file, cb, user_data);
+}
+
+static bool s3_free(const char *path, cloud_sync_complete_handler_t cb, void *user_data)
+{
+   if (s3_wants_backup(path))
+      return s3_backup_then(path, NULL, true, cb, user_data);
+   return s3_delete_object(path, cb, user_data);
+}
+
 /* S3 cloud sync driver */
 cloud_sync_driver_t cloud_sync_s3 = {
    s3_sync_begin,
@@ -2073,5 +2230,6 @@ cloud_sync_driver_t cloud_sync_s3 = {
    s3_read,
    s3_update,
    s3_free,
-   "s3"
+   "s3",
+   0
 };
