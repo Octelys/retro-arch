@@ -2,7 +2,6 @@ name: CI Emscripten
 
 on:
   push:
-    branches: [master]
   pull_request:
   repository_dispatch:
     types: [run_build]
@@ -13,16 +12,11 @@ permissions:
 env:
   ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
-
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     container:
-      image: reallibretroretroarch/libretro-build-emscripten:latest
+      image: git.libretro.com:5050/libretro-infrastructure/libretro-build-emscripten:latest
       options: --user root
 
     steps:
@@ -32,3 +26,8 @@ jobs:
       run: |
         emmake make -f Makefile.emscripten -j$(getconf _NPROCESSORS_ONLN) clean
         emmake make -f Makefile.emscripten -j$(getconf _NPROCESSORS_ONLN) HAVE_STATIC_DUMMY=1
+
+    - name: Get short SHA
+      id: slug
+      run: echo "::set-output name=sha8::$(echo ${GITHUB_SHA} | cut -c1-8)"
+
