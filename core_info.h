@@ -183,6 +183,13 @@ bool core_info_init_list(const char *path_info, const char *dir_cores,
       const char *exts, bool show_hidden_files,
       bool enable_cache, bool *cache_supported);
 
+/* Returns true if the current core info list was built with the
+ * given parameters, i.e. a rescan with these parameters would be
+ * redundant. */
+bool core_info_list_is_current(const char *path_info,
+      const char *dir_cores, bool dir_show_hidden_files,
+      bool enable_cache);
+
 bool core_info_get_list(core_info_list_t **core);
 
 /* Returns number of installed cores */
@@ -195,9 +202,12 @@ bool core_info_find(const char *core_path,
 
 bool core_info_load(const char *core_path);
 
-bool core_info_database_supports_content_path(const char *database_path, const char *path);
-
-bool core_info_database_match_archive_member(const char *database_path);
+/* The extensions of every core that claims the database at
+ * 'database_path', merged into one list the caller frees, or NULL
+ * when no core claims it. 'match_archive_member' is set when any of
+ * those cores matches archive members. */
+struct string_list *core_info_database_claim(
+      const char *database_path, bool *match_archive_member);
 
 void core_info_qsort(core_info_list_t *core_info_list, enum core_info_list_qsort_type qsort_type);
 
@@ -209,6 +219,16 @@ bool core_info_list_get_info(core_info_list_t *core_info_list,
  * the currently loaded core. If no core is
  * loaded, will return 'true' (since full
  * savestate functionality is assumed by default) */
+/* Runtime savestate probe seam. The frontend may register a callback that
+ * reports whether the currently running core can serialize its state (a
+ * nonzero retro_serialize_size()). When registered, it lets a running core
+ * override stale info-file metadata for BASIC savestate support. It is
+ * optional: core_info.c stays linkable without the runloop/retroarch
+ * backend (e.g. the database-task CI sample) when no probe is set. */
+typedef bool (*core_info_savestate_probe_t)(void);
+
+void core_info_set_savestate_probe(core_info_savestate_probe_t probe);
+
 bool core_info_current_supports_savestate(void);
 bool core_info_current_supports_rewind(void);
 bool core_info_current_supports_netplay(void);

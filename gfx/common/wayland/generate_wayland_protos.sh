@@ -33,10 +33,10 @@ done
 WAYSCAN="$(exists wayland-scanner || :)"
 
 if [ -n "${CROSS_COMPILE:-}" ] && echo "${CROSS_COMPILE:-}" | grep -q "webos"; then
-   if [ -z "${SDK_PATH:-}" ]; then
-      die 1 "Error: WEBOS=1 but SDK_PATH not set"
+   if [ -z "${STAGING_DIR:-}" ]; then
+      die 1 "Error: WEBOS=1 but STAGING_DIR not set"
    fi
-   WAYSCAN="$SDK_PATH/bin/wayland-scanner"
+   WAYSCAN="$STAGING_DIR/../../bin/wayland-scanner"
 fi
 
 PKGCONFIG="$(exists pkg-config || :)"
@@ -60,15 +60,48 @@ else
    CODEGEN=private-code
 fi
 
+# A scanner older than the protocol files validates them against a DTD
+# without the newer attributes and warns on every file using them. It
+# ignores them all the same, so they are stripped before it sees them:
+# the event type attribute (wayland 1.20) and deprecated-since (1.23).
+SCANNER_MINOR="$("$WAYSCAN" --version 2>&1 |
+   sed -n 's/.*wayland-scanner 1\.\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+STRIP_SED=''
+if [ -n "$SCANNER_MINOR" ]; then
+   if [ "$SCANNER_MINOR" -lt 20 ]; then
+      STRIP_SED="$STRIP_SED -e '/<event /s/ type=\"[^\"]*\"//'"
+   fi
+   if [ "$SCANNER_MINOR" -lt 23 ]; then
+      STRIP_SED="$STRIP_SED -e 's/ deprecated-since=\"[^\"]*\"//'"
+   fi
+fi
+STRIP_FILE=''
+if [ -n "$STRIP_SED" ]; then
+   STRIP_FILE="$(mktemp "${TMPDIR:-/tmp}/wlproto.XXXXXX")"
+   trap 'rm -f "$STRIP_FILE"' EXIT
+fi
+
 generate_source () {
    PROTO_DIR="$1"
    PROTO_NAME="$2"
    PROTO_FILE="$WAYLAND_PROTOS/$PROTO_DIR/$PROTO_NAME.xml"
 
+   # A protocol newer than the installed wayland-protocols comes from
+   # the bundled copy rather than failing the build.
+   if [ ! -f "$PROTO_FILE" ]; then
+      PROTO_FILE="../../../deps/wayland-protocols/$PROTO_DIR/$PROTO_NAME.xml"
+   fi
+
+   if [ -n "$STRIP_FILE" ]; then
+      eval "sed $STRIP_SED" < "$PROTO_FILE" > "$STRIP_FILE"
+      PROTO_FILE="$STRIP_FILE"
+   fi
+
    "$WAYSCAN" client-header "$PROTO_FILE" "./$PROTO_NAME.h"
    "$WAYSCAN" $CODEGEN "$PROTO_FILE" "./$PROTO_NAME.c"
 }
 
+generate_source 'stable/presentation-time' 'presentation-time'
 generate_source 'stable/viewporter' 'viewporter'
 generate_source 'stable/xdg-shell' 'xdg-shell'
 generate_source 'unstable/xdg-decoration' 'xdg-decoration-unstable-v1'
@@ -81,13 +114,23 @@ generate_source 'staging/cursor-shape' 'cursor-shape-v1'
 generate_source 'unstable/tablet' 'tablet-unstable-v2'
 generate_source 'staging/content-type' 'content-type-v1'
 generate_source 'staging/single-pixel-buffer' 'single-pixel-buffer-v1'
+generate_source 'staging/tearing-control' 'tearing-control-v1'
+generate_source 'staging/color-management' 'color-management-v1'
+# KWin's output protocols, from plasma-wayland-protocols (MIT-CMU); no
+# system wayland-protocols carries them, so the bundled copy is used
+generate_source 'kde' 'kde-output-device-v2'
+generate_source 'kde' 'kde-output-management-v2'
+# wlroots' output management (sway, Hyprland, river), from wlr-protocols
+generate_source 'wlr' 'wlr-output-management-unstable-v1'
 generate_source 'staging/xdg-toplevel-icon' 'xdg-toplevel-icon-v1'
+generate_source 'staging/xdg-toplevel-tag' 'xdg-toplevel-tag-v1'
+generate_source 'staging/drm-lease' 'drm-lease-v1'
 
 if [ -n "${CROSS_COMPILE:-}" ] && echo "${CROSS_COMPILE:-}" | grep -q "webos"; then
-   if [ -z "${SDK_PATH:-}" ]; then
-      die 1 "Error: WEBOS=1 but SDK_PATH not set"
+   if [ -z "${STAGING_DIR:-}" ]; then
+      die 1 "Error: WEBOS=1 but STAGING_DIR not set"
    fi
-   WAYLAND_PROTOS="$SDK_PATH/arm-webos-linux-gnueabi/sysroot/usr/share"
+   WAYLAND_PROTOS="$STAGING_DIR/usr/share"
 
    generate_source 'wayland-webos' 'webos-shell'
    generate_source 'wayland-webos' 'webos-foreign'

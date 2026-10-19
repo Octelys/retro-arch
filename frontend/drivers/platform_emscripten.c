@@ -72,6 +72,7 @@
 #endif
 
 #include "platform_emscripten.h"
+#include <compat/strl.h>
 
 void emscripten_mainloop(void);
 
@@ -106,8 +107,9 @@ typedef struct
    int main_loop_blockers;
    int deferred_sleep_ms;
    int raf_interval;
-   int canvas_width;
-   int canvas_height;
+   /* One word, stored and loaded whole: JS sets it from its own
+    * thread, so two halves could be read from different resizes. */
+   unsigned canvas_dims;
    int power_state_discharge_time;
    float power_state_level;
    bool has_async_atomics;
@@ -280,8 +282,8 @@ void platform_emscripten_update_canvas_dimensions_cb(int width, int height, doub
    emscripten_set_canvas_element_size("#canvas", width, height);
    if (!emscripten_platform_data)
       return;
-   PLATFORM_SETVAL(u32, &emscripten_platform_data->canvas_width,        width);
-   PLATFORM_SETVAL(u32, &emscripten_platform_data->canvas_height,       height);
+   PLATFORM_SETVAL(u32, &emscripten_platform_data->canvas_dims,
+         VIDEO_SCALE_PACK(width, height));
    PLATFORM_SETVAL(f64, &emscripten_platform_data->device_pixel_ratio, *dpr);
 }
 
@@ -403,17 +405,15 @@ size_t platform_emscripten_command_read(char **into, size_t max_len)
     }, &emscripten_platform_data->command_flag, into, max_len);
 }
 
-void platform_emscripten_get_canvas_size(int *width, int *height)
+unsigned platform_emscripten_get_canvas_dims(void)
 {
-   *width  = PLATFORM_GETVAL(u32, &emscripten_platform_data->canvas_width);
-   *height = PLATFORM_GETVAL(u32, &emscripten_platform_data->canvas_height);
+   unsigned dims = PLATFORM_GETVAL(u32, &emscripten_platform_data->canvas_dims);
 
-   if (*width != 0 || *height != 0)
-      return;
+   if (dims)
+      return dims;
 
-   *width  = 800;
-   *height = 600;
    RARCH_ERR("[EMSCRIPTEN] Could not get screen dimensions.\n");
+   return VIDEO_SCALE_PACK(800, 600);
 }
 
 double platform_emscripten_get_dpr(void)
@@ -582,12 +582,13 @@ void platform_emscripten_set_wake_lock(bool state)
    PlatformEmscriptenSetWakeLock(state);
 }
 
-void platform_emscripten_set_canvas_size(int width, int height)
+void platform_emscripten_set_canvas_size(unsigned dims)
 {
    if (!emscripten_platform_data->enable_set_canvas_size)
       return;
 
-   PlatformEmscriptenSetCanvasSize(width, height);
+   PlatformEmscriptenSetCanvasSize((int)VIDEO_SCALE_W(dims),
+         (int)VIDEO_SCALE_H(dims));
 }
 
 enum platform_emscripten_browser platform_emscripten_get_browser(void)
@@ -618,32 +619,32 @@ static void frontend_emscripten_get_env(int *argc, char *argv[],
    if (home)
    {
       size_t _len = strlcpy(base_path, home, sizeof(base_path));
-      strlcpy(base_path + _len, "/retroarch", sizeof(base_path) - _len);
+      strlcpy_lit(base_path + _len, "/retroarch", sizeof(base_path) - _len);
 #ifndef HAVE_EXTRA_WASMFS
       /* can be removed when the new web player replaces the old one */
       _len = strlcpy(user_path, home, sizeof(user_path));
-      strlcpy(user_path + _len,
+      strlcpy_lit(user_path + _len,
          "/retroarch/userdata", sizeof(user_path) - _len);
       _len = strlcpy(bundle_path, home, sizeof(bundle_path));
-      strlcpy(bundle_path + _len,
+      strlcpy_lit(bundle_path + _len,
          "/retroarch/bundle", sizeof(bundle_path) - _len);
 #else
       _len = strlcpy(user_path, home, sizeof(user_path));
-      strlcpy(user_path + _len, "/retroarch", sizeof(user_path) - _len);
+      strlcpy_lit(user_path + _len, "/retroarch", sizeof(user_path) - _len);
       _len = strlcpy(bundle_path, home, sizeof(bundle_path));
-      strlcpy(bundle_path + _len, "/retroarch", sizeof(bundle_path) - _len);
+      strlcpy_lit(bundle_path + _len, "/retroarch", sizeof(bundle_path) - _len);
 #endif
    }
    else
    {
-      strlcpy(base_path, "retroarch", sizeof(base_path));
+      strlcpy_lit(base_path, "retroarch", sizeof(base_path));
 #ifndef HAVE_EXTRA_WASMFS
       /* can be removed when the new web player replaces the old one */
-      strlcpy(user_path, "retroarch/userdata", sizeof(user_path));
-      strlcpy(bundle_path, "retroarch/bundle", sizeof(bundle_path));
+      strlcpy_lit(user_path, "retroarch/userdata", sizeof(user_path));
+      strlcpy_lit(bundle_path, "retroarch/bundle", sizeof(bundle_path));
 #else
-      strlcpy(user_path, "retroarch", sizeof(user_path));
-      strlcpy(bundle_path, "retroarch", sizeof(bundle_path));
+      strlcpy_lit(user_path, "retroarch", sizeof(user_path));
+      strlcpy_lit(bundle_path, "retroarch", sizeof(bundle_path));
 #endif
    }
 
@@ -732,24 +733,7 @@ static enum frontend_powerstate frontend_emscripten_get_powerstate(int *seconds,
    return ret;
 }
 
-static uint64_t frontend_emscripten_get_total_mem(void)
-{
-   if (!emscripten_platform_data)
-      return 0;
-   return PLATFORM_GETVAL(u64, &emscripten_platform_data->memory_limit);
-}
 
-static uint64_t frontend_emscripten_get_free_mem(void)
-{
-   if (!emscripten_platform_data)
-      return 0;
-#ifndef PROXY_TO_PTHREAD
-   uint64_t used = PLATFORM_GETVAL(u64, &emscripten_platform_data->memory_used);
-#else
-   uint64_t used = mallinfo().uordblks;
-#endif
-   return (PLATFORM_GETVAL(u64, &emscripten_platform_data->memory_limit) - used);
-}
 
 #ifdef HAVE_AUDIOWORKLET
 void audioworklet_close(void);
@@ -811,6 +795,14 @@ static void platform_emscripten_mount_filesystems(void)
       backend_t opfs = wasmfs_create_opfs_backend();
       {
          char *parent = strdup(opfs_mount);
+         /* NULL-check strdup: path_parent_dir/strlen on NULL parent
+          * NULL-derefs.  Match the abort() policy used for all
+          * other failures in this boot-time init path. */
+         if (!parent)
+         {
+            printf("[OPFS] out of memory duplicating mount path\n");
+            abort();
+         }
          path_parent_dir(parent, strlen(parent));
          if (!path_mkdir(parent))
          {
@@ -860,6 +852,22 @@ static void platform_emscripten_mount_filesystems(void)
         abort();
       }
       char *line = calloc(sizeof(char), max_line_len);
+      /* NULL-check the calloc: getline below receives &line and
+       * will realloc it if needed, but the getline interface
+       * requires the initial pointer to be either NULL (fine)
+       * or a valid malloc'd buffer.  On OOM 'line' stays NULL
+       * which the getline glibc implementation tolerates (it
+       * will allocate itself), but e.g. musl's getline also
+       * tolerates NULL so behaviour is consistent.  However,
+       * if the calloc succeeded and then later in this function
+       * we strdup(line) at line ~869 / line ~899, those would
+       * NULL-deref if line were NULL.  Simplest correct path:
+       * abort on OOM like the other boot-init failures. */
+      if (!line)
+      {
+         printf("[FetchFS] out of memory allocating manifest line buffer\n");
+         abort();
+      }
       __len = max_line_len;
       if (getline(&line, &__len, file) == -1 || __len == 0)
          printf("[FetchFS] missing base URL suggest empty manifest, skipping fetch initialization\n");
@@ -867,6 +875,17 @@ static void platform_emscripten_mount_filesystems(void)
       {
          backend_t fetch = NULL;
          char *base_url  = strdup(line);
+         /* NULL-check strdup before the two base_url[...] = '\0'
+          * writes below NULL-deref.  FetchFS init is a boot-time
+          * operation on the web build; other init failures in
+          * this function (missing env vars, missing manifest file,
+          * fetch backend construction failure) all abort(), so
+          * match that policy here. */
+         if (!base_url)
+         {
+            printf("[FetchFS] out of memory duplicating base URL\n");
+            abort();
+         }
          base_url[strcspn(base_url, "\r\n")] = '\0'; /* drop newline */
          base_url[__len-1] = '\0'; /* drop newline */
          __len = max_line_len;
@@ -898,6 +917,14 @@ static void platform_emscripten_mount_filesystems(void)
             /* Make the directories for link path */
             {
                char *parent = strdup(realfs_path);
+               /* NULL-check: same pattern as opfs_mount strdup
+                * above - path_parent_dir/strlen on NULL would
+                * crash, abort to match boot-init policy. */
+               if (!parent)
+               {
+                  printf("[FetchFS] out of memory duplicating realfs path\n");
+                  abort();
+               }
                path_parent_dir(parent, strlen(parent));
                if (!path_mkdir(parent))
                {
@@ -909,6 +936,12 @@ static void platform_emscripten_mount_filesystems(void)
             /* Make the directories for URL path */
             {
                char *parent = strdup(fetchfs_path);
+               /* NULL-check: same pattern, abort on OOM. */
+               if (!parent)
+               {
+                  printf("[FetchFS] out of memory duplicating fetchfs path\n");
+                  abort();
+               }
                path_parent_dir(parent, strlen(parent));
                if (!path_mkdir(parent))
                {
@@ -987,8 +1020,17 @@ int main(int argc, char *argv[])
    pthread_attr_t attr;
    pthread_t thread;
 #endif
-   /* this never gets freed */
+   /* this never gets freed - emscripten_platform_data is held
+    * for the lifetime of the web-build process */
    emscripten_platform_data = (emscripten_platform_data_t *)calloc(1, sizeof(emscripten_platform_data_t));
+   /* NULL-check: the field writes a few lines down
+    * (emscripten_platform_data->browser, ->os, ->...) NULL-deref
+    * on OOM.  This is main() at process entry - if we can't even
+    * allocate the platform state struct there's no viable path
+    * forward; bail with non-zero so the browser shim can surface
+    * the failure. */
+   if (!emscripten_platform_data)
+      return 1;
 
    PlatformEmscriptenGetSystemInfo(&host_browser, &host_os);
    emscripten_platform_data->browser = host_browser;
@@ -1076,8 +1118,6 @@ frontend_ctx_driver_t frontend_ctx_emscripten = {
    NULL,                                /* get_architecture */
    frontend_emscripten_get_powerstate,  /* get_powerstate */
    NULL,                                /* parse_drive_list */
-   frontend_emscripten_get_total_mem,   /* get_total_mem */
-   frontend_emscripten_get_free_mem,    /* get_free_mem  */
    NULL,                                /* install_sighandlers */
    NULL,                                /* get_signal_handler_state */
    NULL,                                /* set_signal_handler_state */
@@ -1086,14 +1126,13 @@ frontend_ctx_driver_t frontend_ctx_emscripten = {
    NULL,                                /* detach_console */
    NULL,                                /* get_lakka_version */
    NULL,                                /* set_screen_brightness */
-   NULL,                                /* watch_path_for_changes */
-   NULL,                                /* check_for_path_changes */
    NULL,                                /* set_sustained_performance_mode */
    NULL,                                /* get_cpu_model_name */
    NULL,                                /* get_user_language */
    NULL,                                /* is_narrator_running */
    NULL,                                /* accessibility_speak */
    NULL,                                /* set_gamemode        */
+   NULL, /* get_display_type */
    "emscripten",                        /* ident               */
    NULL                                 /* get_video_driver    */
 };

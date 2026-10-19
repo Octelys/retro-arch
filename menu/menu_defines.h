@@ -51,7 +51,11 @@ enum menu_state_flags
    MENU_ST_FLAG_SCREENSAVER_ACTIVE          = (1 << 11),
    MENU_ST_FLAG_PENDING_RELOAD_CORE         = (1 << 12),
    MENU_ST_FLAG_PENDING_STARTUP_PAGE        = (1 << 13),
-   MENU_ST_FLAG_BLOCK_ALL_INPUT             = (1 << 14)
+   MENU_ST_FLAG_BLOCK_ALL_INPUT             = (1 << 14),
+   /* When enabled, a configuration file load (full driver/menu
+    * reinit) has been requested and will be performed on the next
+    * frame, outside of menu iteration */
+   MENU_ST_FLAG_PENDING_CONFIG_REPLACE      = (1 << 15)
 };
 
 enum menu_scroll_mode
@@ -72,7 +76,10 @@ enum action_iterate_type
    ITERATE_TYPE_DEFAULT = 0,
    ITERATE_TYPE_HELP,
    ITERATE_TYPE_INFO,
-   ITERATE_TYPE_BIND
+   ITERATE_TYPE_CONFIRM,
+   ITERATE_TYPE_BIND,
+   ITERATE_TYPE_REMAP_FIND,
+   ITERATE_TYPE_ENTRY_CAPTURE
 };
 
 enum menu_startup_page_type
@@ -168,6 +175,22 @@ enum menu_remember_selection_type
    MENU_REMEMBER_SELECTION_PLAYLISTS,
    MENU_REMEMBER_SELECTION_MAIN,
    MENU_REMEMBER_SELECTION_LAST
+};
+
+enum menu_file_browser_extension_display_type
+{
+   MENU_FILE_BROWSER_EXTENSION_DISPLAY_ALWAYS = 0,
+   MENU_FILE_BROWSER_EXTENSION_DISPLAY_DUPLICATES_ONLY,
+   MENU_FILE_BROWSER_EXTENSION_DISPLAY_NEVER,
+   MENU_FILE_BROWSER_EXTENSION_DISPLAY_LAST
+};
+
+/* How a single file browser entry draws its name */
+enum menu_file_browser_extension_state
+{
+   MENU_FILE_BROWSER_EXTENSION_STATE_FULL = 0, /* name.ext */
+   MENU_FILE_BROWSER_EXTENSION_STATE_HIDDEN,   /* name */
+   MENU_FILE_BROWSER_EXTENSION_STATE_HINT      /* name (ext) */
 };
 
 /* Note: These must be kept synchronised with
@@ -422,6 +445,7 @@ enum rgui_aspect_ratio
    RGUI_ASPECT_RATIO_5_3,
    RGUI_ASPECT_RATIO_5_3_CENTRE,
    RGUI_ASPECT_RATIO_AUTO,
+   RGUI_ASPECT_RATIO_1_1,
    RGUI_ASPECT_RATIO_LAST
 };
 
@@ -443,26 +467,6 @@ enum rgui_particle_animation_effect
    RGUI_PARTICLE_EFFECT_VORTEX,
    RGUI_PARTICLE_EFFECT_STARFIELD,
    RGUI_PARTICLE_EFFECT_LAST
-};
-
-enum ozone_color_theme
-{
-   OZONE_COLOR_THEME_BASIC_WHITE = 0,
-   OZONE_COLOR_THEME_BASIC_BLACK,
-   OZONE_COLOR_THEME_NORD,
-   OZONE_COLOR_THEME_GRUVBOX_DARK,
-   OZONE_COLOR_THEME_BOYSENBERRY,
-   OZONE_COLOR_THEME_HACKING_THE_KERNEL,
-   OZONE_COLOR_THEME_TWILIGHT_ZONE,
-   OZONE_COLOR_THEME_DRACULA,
-   OZONE_COLOR_THEME_SOLARIZED_DARK,
-   OZONE_COLOR_THEME_SOLARIZED_LIGHT,
-   OZONE_COLOR_THEME_GRAY_DARK,
-   OZONE_COLOR_THEME_GRAY_LIGHT,
-   OZONE_COLOR_THEME_PURPLE_RAIN,
-   OZONE_COLOR_THEME_SELENIUM,
-   OZONE_COLOR_THEME_EVERGARDEN,
-   OZONE_COLOR_THEME_LAST
 };
 
 enum ozone_header_icon
@@ -594,6 +598,11 @@ struct menu_dialog
 {
    unsigned              current_id;
    enum menu_dialog_type current_type;
+   unsigned              confirm_msg;
+   unsigned              confirm_cmd;
+   unsigned              pending_cmd;
+   bool                  confirm_hover_ok;
+   bool                  confirm_hover_back;
    bool                  pending_push;
 };
 

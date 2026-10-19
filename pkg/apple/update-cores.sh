@@ -213,6 +213,7 @@ appstore_cores=(
     geargrafx
     gearlynx
     gearsystem
+    geartowns
     genesis_plus_gx
     genesis_plus_gx_wide
     geolith
@@ -220,6 +221,7 @@ appstore_cores=(
     gpsp
     gw
     handy
+    hatarib
     holani
     jollycv
     kronos
@@ -241,6 +243,7 @@ appstore_cores=(
     mrboom
     mu
     mupen64plus_next
+    native32emu
     neocd
     nestopia
     noods
@@ -264,6 +267,7 @@ appstore_cores=(
     quicknes
     race
     reminiscence
+    rustynes
     sameboy
     sameduck
     scummvm
@@ -277,6 +281,7 @@ appstore_cores=(
     stella2023
     tgbdual
     theodore
+    tia
     tic80
     tyrquake
     uzem

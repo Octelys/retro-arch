@@ -25,6 +25,56 @@
 
 #include "joypad_connection.h"
 
+#ifdef HAVE_THREADS
+#include <rthreads/rthreads.h>
+#endif
+
+#define CONNECTION_LIVE 1
+#define CONNECTION_USER 2
+
+bool pad_connection_acquire(joypad_connection_t *joyconn)
+{
+   int state = retro_atomic_fetch_add_int(&joyconn->gate, CONNECTION_USER);
+   if (state & CONNECTION_LIVE)
+      return true;
+   (void)retro_atomic_fetch_sub_int(&joyconn->gate, CONNECTION_USER);
+   return false;
+}
+
+void pad_connection_release(joypad_connection_t *joyconn)
+{
+   (void)retro_atomic_fetch_sub_int(&joyconn->gate, CONNECTION_USER);
+}
+
+/* Preserve rejected readers still leaving a closed slot. */
+static void slot_publish(joypad_connection_t *joyconn)
+{
+   (void)retro_atomic_fetch_or_int(&joyconn->gate, CONNECTION_LIVE);
+}
+
+/* No new reader goes in; returns once none is inside. */
+static void slot_retire(joypad_connection_t *joyconn)
+{
+   (void)retro_atomic_fetch_and_int(&joyconn->gate, ~CONNECTION_LIVE);
+   while (retro_atomic_load_acquire_int(&joyconn->gate))
+   {
+#ifdef HAVE_THREADS
+      sthread_yield();
+#endif
+   }
+}
+
+/* Clears a retired slot for reuse, keeping its counters. */
+static void slot_clear(joypad_connection_t *joyconn)
+{
+   joyconn->iface        = NULL;
+   joyconn->input_driver = NULL;
+   joyconn->data         = NULL;
+   joyconn->connection   = NULL;
+   joyconn->connected    = false;
+   pad_connection_release_slot(joyconn);
+}
+
 static joypad_connection_entry_t pad_map[] = {
    { "Nintendo RVL-CNT-01",
       VID_NINTENDO,
@@ -117,14 +167,51 @@ static bool joypad_is_end_of_list(joypad_connection_t *pad)
       &&  (pad->data == (void *)0xdeadbeef);
 }
 
+/* claimed: free, taken, or the list's end marker */
+#define SLOT_FREE  0
+#define SLOT_TAKEN 1
+#define SLOT_END   2
+
+static bool slot_claim(joypad_connection_t *joyconn)
+{
+#ifdef RETRO_ATOMIC_HAS_CAS
+   return retro_atomic_cas_int(&joyconn->claimed, SLOT_FREE, SLOT_TAKEN) != 0;
+#else
+   if (retro_atomic_load_acquire_int(&joyconn->claimed) != SLOT_FREE)
+      return false;
+   retro_atomic_store_release_int(&joyconn->claimed, SLOT_TAKEN);
+   return true;
+#endif
+}
+
+void pad_connection_mark_end(joypad_connection_t *joyconn)
+{
+   joyconn->connected = false;
+   joyconn->iface     = NULL;
+   joyconn->data      = (void *)0xdeadbeef;
+   retro_atomic_int_init(&joyconn->gate, 0);
+   retro_atomic_int_init(&joyconn->claimed, SLOT_END);
+}
+
+void pad_connection_release_slot(joypad_connection_t *joyconn)
+{
+   if (joyconn)
+      retro_atomic_store_release_int(&joyconn->claimed, SLOT_FREE);
+}
+
+/* Reads nothing but the claims: the fields of a slot belong to the
+ * thread that holds it. */
 int pad_connection_find_vacant_pad(joypad_connection_t *joyconn)
 {
    if (joyconn)
    {
       int i;
-      for (i = 0; !joypad_is_end_of_list(&joyconn[i]); i++)
+      for (i = 0; ; i++)
       {
-         if (!joyconn[i].connected)
+         int state = retro_atomic_load_acquire_int(&joyconn[i].claimed);
+         if (state == SLOT_END)
+            break;
+         if (state == SLOT_FREE && slot_claim(&joyconn[i]))
             return i;
       }
    }
@@ -154,26 +241,22 @@ joypad_connection_t *pad_connection_init(unsigned pads)
    for (i = 0; i < (int)pads; i++)
    {
       joypad_connection_t *conn  = (joypad_connection_t*)&joyconn[i];
+      retro_atomic_int_init(&conn->gate, 0);
+      retro_atomic_int_init(&conn->claimed, 0);
 
       conn->connected            = false;
       conn->iface                = NULL;
       conn->data                 = NULL;
    }
 
-   /* Set end of list */
-   {
-      joypad_connection_t *entry = (joypad_connection_t *)&joyconn[pads];
-      entry->connected           = false;
-      entry->iface               = NULL;
-      entry->data                = (void*)0xdeadbeef;
-   }
+   pad_connection_mark_end(&joyconn[pads]);
 
    return joyconn;
 }
 joypad_connection_entry_t *find_connection_entry(uint16_t vid, uint16_t pid, const char *name)
 {
    unsigned i;
-   const bool has_name = !string_is_empty(name);
+   const bool has_name = name && *name;
    size_t name_len     = strlen(name);
 
    for (i = 0; pad_map[i].name != NULL; i++)
@@ -230,8 +313,9 @@ void legacy_pad_connection_pad_deregister(joypad_connection_t *pad_list, pad_con
    {
       if (pad_list[i].connection == pad_data)
       {
+         slot_retire(&pad_list[i]);
          input_autoconfigure_disconnect(i, iface ? iface->get_name(pad_data) : NULL);
-         memset(&pad_list[i], 0, sizeof(joypad_connection_t));
+         slot_clear(&pad_list[i]);
          return;
       }
    }
@@ -253,9 +337,10 @@ void pad_connection_pad_deregister(joypad_connection_t *joyconn,
       int slot = joypad_to_slot(joyconn, iface->joypad(pad_data, i));
       if (slot >= 0)
       {
+         slot_retire(&joyconn[slot]);
          input_autoconfigure_disconnect(slot, iface->get_name(joyconn[slot].connection));
          iface->pad_deinit(joyconn[slot].connection);
-         memset(&joyconn[slot], 0, sizeof(joypad_connection_t));
+         slot_clear(&joyconn[slot]);
       }
    }
 }
@@ -284,11 +369,12 @@ void pad_connection_pad_refresh(joypad_connection_t *joyconn,
          case PAD_CONNECT_BOUND:
             joypad = iface->joypad(device_data, i);
             slot   = joypad_to_slot(joyconn, joypad);
+            slot_retire(joypad);
             input_autoconfigure_disconnect(slot,
                   iface->get_name(joypad->connection));
 
             iface->pad_deinit(joypad->connection);
-            memset(joypad, 0, sizeof(joypad_connection_t));
+            slot_clear(joypad);
             break;
             /* The joypad is connected but has not been bound */
          case PAD_CONNECT_READY:
@@ -301,6 +387,7 @@ void pad_connection_pad_refresh(joypad_connection_t *joyconn,
                joypad->iface        = iface;
                joypad->input_driver = input_driver;
                joypad->connected    = true;
+               slot_publish(joypad);
                input_pad_connect(slot, input_driver);
             }
             break;
@@ -356,6 +443,7 @@ void pad_connection_pad_register(joypad_connection_t *joyconn,
          joyconn[found_slot].connection   = connection;
          joyconn[found_slot].input_driver = input_driver;
          joyconn[found_slot].connected    = true;
+         slot_publish(&joyconn[found_slot]);
 
          RARCH_LOG("[Joypad] Connecting pad to slot %d.\n", found_slot);
          input_pad_connect(found_slot, input_driver);
@@ -390,6 +478,7 @@ int32_t pad_connection_pad_init_entry(joypad_connection_t *joyconn,
    }
    conn->data          = data;
    conn->connected     = true;
+   slot_publish(conn);
 
    return pad;
 }
@@ -408,6 +497,8 @@ void pad_connection_pad_deinit(joypad_connection_t *joyconn,
    if (!joyconn || !joyconn->connected)
        return;
 
+   slot_retire(joyconn);
+
    if (joyconn->iface)
    {
       joyconn->iface->set_rumble(joyconn->connection,
@@ -422,24 +513,32 @@ void pad_connection_pad_deinit(joypad_connection_t *joyconn,
    joyconn->iface      = NULL;
    joyconn->connected  = false;
    joyconn->connection = NULL;
+   pad_connection_release_slot(joyconn);
 }
 
 void pad_connection_packet(joypad_connection_t *joyconn, uint32_t pad,
       uint8_t* data, uint32_t length)
 {
-   if (     joyconn
-         && joyconn->connected
-         && joyconn->connection
+   if (!joyconn || !pad_connection_acquire(joyconn))
+      return;
+   if (     joyconn->connection
          && joyconn->iface
          && joyconn->iface->packet_handler)
       joyconn->iface->packet_handler(joyconn->connection, data, length);
+   pad_connection_release(joyconn);
 }
 
 void pad_connection_get_buttons(joypad_connection_t *joyconn,
       unsigned pad, input_bits_t *state)
 {
-   if (joyconn && joyconn->iface)
-      joyconn->iface->get_buttons(joyconn->connection, state);
+   if (joyconn && pad_connection_acquire(joyconn))
+   {
+      if (joyconn->iface)
+         joyconn->iface->get_buttons(joyconn->connection, state);
+      else
+         BIT256_CLEAR_ALL_PTR( state );
+      pad_connection_release(joyconn);
+   }
    else
       BIT256_CLEAR_ALL_PTR( state );
 }
@@ -447,17 +546,26 @@ void pad_connection_get_buttons(joypad_connection_t *joyconn,
 int16_t pad_connection_get_axis(joypad_connection_t *joyconn,
    unsigned idx, unsigned i)
 {
-   if (joyconn && joyconn->iface)
-      return joyconn->iface->get_axis(joyconn->connection, i);
-   return 0;
+   int16_t val = 0;
+   if (joyconn && pad_connection_acquire(joyconn))
+   {
+      if (joyconn->iface)
+         val = joyconn->iface->get_axis(joyconn->connection, i);
+      pad_connection_release(joyconn);
+   }
+   return val;
 }
 
 bool pad_connection_has_interface(joypad_connection_t *joyconn,
       unsigned pad)
 {
-   return (     joyconn && pad < MAX_USERS
-             && joyconn[pad].connected
-             && joyconn[pad].iface);
+   bool ret = false;
+   if (joyconn && pad < MAX_USERS && pad_connection_acquire(&joyconn[pad]))
+   {
+      ret = joyconn[pad].iface != NULL;
+      pad_connection_release(&joyconn[pad]);
+   }
+   return ret;
 }
 
 void pad_connection_destroy(joypad_connection_t *joyconn)
@@ -473,17 +581,27 @@ void pad_connection_destroy(joypad_connection_t *joyconn)
 bool pad_connection_rumble(joypad_connection_t *joyconn,
    unsigned pad, enum retro_rumble_effect effect, uint16_t strength)
 {
-   if (!joyconn->connected || !joyconn->iface || !joyconn->iface->set_rumble)
+   bool ret = false;
+   if (!pad_connection_acquire(joyconn))
       return false;
-
-   joyconn->iface->set_rumble(joyconn->connection, effect, strength);
-   return true;
+   if (joyconn->iface && joyconn->iface->set_rumble)
+   {
+      joyconn->iface->set_rumble(joyconn->connection, effect, strength);
+      ret = true;
+   }
+   pad_connection_release(joyconn);
+   return ret;
 }
 
 const char* pad_connection_get_name(joypad_connection_t *joyconn,
       unsigned pad)
 {
-   if (joyconn && joyconn->iface && joyconn->iface->get_name)
-      return joyconn->iface->get_name(joyconn->connection);
-   return NULL;
+   const char *name = NULL;
+   if (joyconn && pad_connection_acquire(joyconn))
+   {
+      if (joyconn->iface && joyconn->iface->get_name)
+         name = joyconn->iface->get_name(joyconn->connection);
+      pad_connection_release(joyconn);
+   }
+   return name;
 }

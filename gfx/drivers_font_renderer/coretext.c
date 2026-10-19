@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
+#include <math.h>
 
 #include <CoreFoundation/CFString.h>
 
@@ -24,426 +25,368 @@
 #include "../../config.h"
 #endif
 
-#ifdef IOS
+#if TARGET_OS_IPHONE
 #include <CoreText/CoreText.h>
 #include <CoreGraphics/CoreGraphics.h>
 #else
 #include <ApplicationServices/ApplicationServices.h>
 #endif
 
-#include <file/file_path.h>
 
 #include "../font_driver.h"
+#ifdef __MACH__
+#include <TargetConditionals.h>
+#endif
 
-#define CT_ATLAS_ROWS 16
-#define CT_ATLAS_COLS 16
-#define CT_ATLAS_SIZE (CT_ATLAS_ROWS * CT_ATLAS_COLS)
-
-typedef struct coretext_atlas_slot
+typedef struct coretext_face
 {
-   struct font_glyph glyph;
-   unsigned charcode;
-   unsigned last_used;
-   struct coretext_atlas_slot *next;
-} coretext_atlas_slot_t;
-
-typedef struct coretext_renderer
-{
-   struct font_atlas atlas;
-   coretext_atlas_slot_t atlas_slots[CT_ATLAS_SIZE];
-   coretext_atlas_slot_t *uc_map[0x100];
-   struct font_line_metrics line_metrics;
-   unsigned usage_counter;
    CTFontRef font_face;
-   CFDictionaryRef attr_dict;  /* Reused for all glyphs */
-   float cached_ascent;        /* Cached font ascent */
-} ct_font_renderer_t;
+   CFDictionaryRef attr_dict;  /* Reused for every glyph */
+   struct font_line_metrics line_metrics;
+   float cached_ascent;
+   /* The cell every glyph is drawn into, packed. */
+   unsigned cell_dims;
+} ct_face_t;
 
-static bool coretext_font_renderer_render_glyph(CTFontRef face, ct_font_renderer_t *handle, coretext_atlas_slot_t *slot, uint32_t charcode);
-
-static struct font_atlas *font_renderer_ct_get_atlas(void *data)
+static void font_rasterizer_ct_free(void *data)
 {
-   ct_font_renderer_t *handle = (ct_font_renderer_t*)data;
-   if (!handle)
-      return NULL;
-   return &handle->atlas;
-}
+   ct_face_t *self = (ct_face_t*)data;
 
-static coretext_atlas_slot_t* coretext_font_renderer_get_slot(ct_font_renderer_t *handle)
-{
-   int i, map_id;
-   unsigned oldest = 0;
-
-   for (i = 1; i < CT_ATLAS_SIZE; i++)
-      if ((handle->usage_counter - handle->atlas_slots[i].last_used) >
-            (handle->usage_counter - handle->atlas_slots[oldest].last_used))
-         oldest = i;
-
-   /* remove from map */
-   map_id = handle->atlas_slots[oldest].charcode & 0xFF;
-   if (handle->uc_map[map_id] == &handle->atlas_slots[oldest])
-      handle->uc_map[map_id] = handle->atlas_slots[oldest].next;
-   else if (handle->uc_map[map_id])
-   {
-      coretext_atlas_slot_t* ptr = handle->uc_map[map_id];
-      while (ptr->next && ptr->next != &handle->atlas_slots[oldest])
-         ptr = ptr->next;
-      ptr->next = handle->atlas_slots[oldest].next;
-   }
-
-   return &handle->atlas_slots[oldest];
-}
-
-static const struct font_glyph *font_renderer_ct_get_glyph(
-      void *data, uint32_t charcode)
-{
-   unsigned map_id;
-   coretext_atlas_slot_t *atlas_slot = NULL;
-   ct_font_renderer_t        *handle = (ct_font_renderer_t*)data;
-
-   if (!handle)
-      return NULL;
-
-   map_id = charcode & 0xFF;
-   atlas_slot = handle->uc_map[map_id];
-
-   while (atlas_slot)
-   {
-      if (atlas_slot->charcode == charcode)
-      {
-         atlas_slot->last_used = handle->usage_counter++;
-         return &atlas_slot->glyph;
-      }
-      atlas_slot = atlas_slot->next;
-   }
-
-   /* Character not found, need to create it */
-   atlas_slot = coretext_font_renderer_get_slot(handle);
-   atlas_slot->charcode = charcode;
-   atlas_slot->next = handle->uc_map[map_id];
-   handle->uc_map[map_id] = atlas_slot;
-
-   /* Render the glyph on demand */
-   if (handle->font_face)
-      coretext_font_renderer_render_glyph(handle->font_face, handle, atlas_slot, charcode);
-
-   atlas_slot->last_used = handle->usage_counter++;
-   handle->atlas.dirty = true;
-   return &atlas_slot->glyph;
-}
-
-static void font_renderer_ct_free(void *data)
-{
-   ct_font_renderer_t *handle = (ct_font_renderer_t*)data;
-
-   if (!handle)
+   if (!self)
       return;
-
-   if (handle->font_face)
-   {
-      CFRelease(handle->font_face);
-      handle->font_face = NULL;
-   }
-
-   if (handle->attr_dict)
-   {
-      CFRelease(handle->attr_dict);
-      handle->attr_dict = NULL;
-   }
-
-   free(handle->atlas.buffer);
-   free(handle);
+   if (self->font_face)
+      CFRelease(self->font_face);
+   if (self->attr_dict)
+      CFRelease(self->attr_dict);
+   free(self);
 }
 
-static bool coretext_font_renderer_create_atlas(CTFontRef face, ct_font_renderer_t *handle, float font_size)
+/* UTF-16 encoding of a codepoint: one unit for the BMP, a surrogate
+ * pair beyond it. 0 for a value that is not a scalar value. */
+static CFIndex ct_utf16(uint32_t code, UniChar *utf16)
 {
-   unsigned i, x, y;
-   coretext_atlas_slot_t* slot = NULL;
-   int max_glyph_size          = (font_size < 0) ? -font_size : font_size;
-   float ascent, descent;
-
-   handle->atlas.width         = max_glyph_size * CT_ATLAS_COLS;
-   handle->atlas.height        = max_glyph_size * CT_ATLAS_ROWS;
-
-   handle->atlas.buffer        = (uint8_t*)calloc(
-         handle->atlas.width * handle->atlas.height, 1);
-
-   if (!handle->atlas.buffer)
-      return false;
-
-   ascent  = CTFontGetAscent(face);
-   descent = CTFontGetDescent(face);
-
-   /* Cache ascent for performance */
-   handle->cached_ascent = ascent;
-
-   handle->line_metrics.ascender  = ascent;
-   handle->line_metrics.descender = (descent < 0.0f) ? (-1.0f * descent) : descent;
-   handle->line_metrics.height    = handle->line_metrics.ascender + handle->line_metrics.descender +
-         (float)CTFontGetLeading(face);
-
-   slot = handle->atlas_slots;
-
-   for (y = 0; y < CT_ATLAS_ROWS; y++)
+   if (code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF))
+      return 0;
+   if (code > 0xFFFF)
    {
-      for (x = 0; x < CT_ATLAS_COLS; x++)
-      {
-         slot->glyph.atlas_offset_x = x * max_glyph_size;
-         slot->glyph.atlas_offset_y = y * max_glyph_size;
-         slot->glyph.width          = max_glyph_size;
-         slot->glyph.height         = max_glyph_size;
-         slot++;
-      }
+      uint32_t v = code - 0x10000;
+      utf16[0]   = (UniChar)(0xD800 + (v >> 10));
+      utf16[1]   = (UniChar)(0xDC00 + (v & 0x3FF));
+      return 2;
    }
-
-   /* Pre-generate common ASCII characters */
-   for (i = 32; i < 128; i++)
-      font_renderer_ct_get_glyph(handle, i);
-
-   return true;
+   utf16[0] = (UniChar)code;
+   return 1;
 }
 
-static bool coretext_font_renderer_render_glyph(CTFontRef face, ct_font_renderer_t *handle, coretext_atlas_slot_t *slot, uint32_t charcode)
+static unsigned font_rasterizer_ct_glyph_index(void *data, uint32_t code)
 {
-   CGGlyph glyph;
-   CGRect bounds;
-   CGSize advance;
-   CGContextRef offscreen;
-   void *bitmapData;
-   UniChar character = (UniChar)charcode;
-   CFStringRef glyph_cfstr;
-   CFAttributedStringRef attrString;
-   CTLineRef line;
-   uint8_t *dst;
-   const uint8_t *src;
+   CGGlyph glyphs[2];
+   UniChar utf16[2];
+   ct_face_t *self = (ct_face_t*)data;
+   CFIndex len     = ct_utf16(code, utf16);
+
+   if (!len || !CTFontGetGlyphsForCharacters(self->font_face, utf16,
+            glyphs, len))
+      return 0;
+   /* Offset by one so that glyph 0 still reads as present */
+   return (unsigned)glyphs[0] + 1;
+}
+
+/* The missing-glyph mark: a rectangle inset into the cell */
+static void ct_render_missing(ct_face_t *self, uint8_t *dst,
+      unsigned pitch, unsigned cell_dims,
+      enum font_atlas_format fmt, struct font_glyph *glyph)
+{
    unsigned r, c;
+   unsigned cell_w = VIDEO_SCALE_W(cell_dims);
+   unsigned cell_h = VIDEO_SCALE_H(cell_dims);
+   bool fmt16      = (fmt == FONT_ATLAS_FORMAT_A16);
+   size_t esz      = fmt16 ? sizeof(uint16_t) : sizeof(uint8_t);
 
-   /* Get glyph for character */
-   bool has_glyph = CTFontGetGlyphsForCharacters(face, &character, &glyph, 1);
+   for (r = 0; r < cell_h; r++)
+      memset(dst + (size_t)r * pitch * esz, 0, (size_t)cell_w * esz);
 
-   /* If character is not available in font, render a missing glyph rectangle */
-   if (!has_glyph)
+   if (cell_w >= 6 && cell_h >= 6)
    {
-      /* Draw rectangle directly in atlas buffer */
-      dst = (uint8_t*)handle->atlas.buffer +
-            slot->glyph.atlas_offset_x +
-            slot->glyph.atlas_offset_y * handle->atlas.width;
+      unsigned max_r = cell_h - 2;
+      unsigned max_c = cell_w - 2;
 
-      /* Only draw rectangle if glyph is large enough and within atlas bounds */
-      if (slot->glyph.width >= 6 && slot->glyph.height >= 6)
+      if (fmt16)
       {
-         unsigned max_r = slot->glyph.height - 2;
-         unsigned max_c = slot->glyph.width - 2;
-         int atlas_size = handle->atlas.width * handle->atlas.height;
-
-         /* Draw 2-pixel border rectangle */
+         uint16_t *d16 = (uint16_t*)(void*)dst;
          for (r = 2; r < max_r; r++)
          {
-            int left_pos = r * handle->atlas.width + 2;
-            int right_pos = r * handle->atlas.width + max_c - 1;
-            if (left_pos < atlas_size && right_pos < atlas_size)
-            {
-               dst[left_pos] = 255;   /* Left */
-               dst[right_pos] = 255;  /* Right */
-            }
+            d16[r * pitch + 2]         = 0xFFFF;
+            d16[r * pitch + max_c - 1] = 0xFFFF;
          }
          for (c = 2; c < max_c; c++)
          {
-            int top_pos = 2 * handle->atlas.width + c;
-            int bottom_pos = (max_r - 1) * handle->atlas.width + c;
-            if (top_pos < atlas_size && bottom_pos < atlas_size)
-            {
-               dst[top_pos] = 255;    /* Top */
-               dst[bottom_pos] = 255; /* Bottom */
-            }
+            d16[2 * pitch + c]           = 0xFFFF;
+            d16[(max_r - 1) * pitch + c] = 0xFFFF;
          }
       }
-
-      /* Set basic metrics using cached ascent */
-      slot->glyph.draw_offset_x = 0;
-      slot->glyph.draw_offset_y = (int)floor(-handle->cached_ascent);
-      slot->glyph.advance_x     = slot->glyph.width;
-      slot->glyph.advance_y     = 0;
-      return true;
+      else
+      {
+         for (r = 2; r < max_r; r++)
+         {
+            dst[r * pitch + 2]         = 255;
+            dst[r * pitch + max_c - 1] = 255;
+         }
+         for (c = 2; c < max_c; c++)
+         {
+            dst[2 * pitch + c]           = 255;
+            dst[(max_r - 1) * pitch + c] = 255;
+         }
+      }
    }
 
-   CTFontGetBoundingRectsForGlyphs(face,
-#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1080
-         kCTFontOrientationDefault,
-#else
-         kCTFontDefaultOrientation,
-#endif
-         &glyph, &bounds, 1);
+   glyph->dims          = cell_dims;
+   glyph->draw_offset_x = 0;
+   glyph->draw_offset_y = (int)floor(-self->cached_ascent);
+   glyph->advance_x     = cell_w;
+   glyph->advance_y     = 0;
+}
 
-   CTFontGetAdvancesForGlyphs(face,
-#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1080
-         kCTFontOrientationDefault,
-#else
-         kCTFontDefaultOrientation,
-#endif
-         &glyph, &advance, 1);
+static bool font_rasterizer_ct_render_glyph(void *data, uint32_t code,
+      unsigned gi, uint8_t *dst, unsigned pitch, unsigned cell_dims,
+      enum font_atlas_format fmt, struct font_glyph *glyph)
+{
+   CGGlyph glyphs[1];
+   CGRect bounds;
+   CGSize advance;
+   CGContextRef offscreen;
+   UniChar utf16[2];
+   CFIndex utf16_len;
+   CFStringRef glyph_cfstr;
+   CFAttributedStringRef attr_string;
+   CTLineRef line;
+   unsigned r, cell_w, cell_h;
+   ct_face_t *self = (ct_face_t*)data;
+   bool fmt16      = (fmt == FONT_ATLAS_FORMAT_A16);
+   size_t esz      = fmt16 ? sizeof(uint16_t) : sizeof(uint8_t);
 
-   /* Set up glyph metrics using cached ascent */
-   slot->glyph.draw_offset_x = (int)ceil(bounds.origin.x);
-   slot->glyph.draw_offset_y = (int)floor(-bounds.origin.y) - (int)floor(handle->cached_ascent) + 1;
-   slot->glyph.advance_x     = (int)round(advance.width);
-   slot->glyph.advance_y     = (int)round(advance.height);
+   if (!gi || !(utf16_len = ct_utf16(code, utf16)))
+   {
+      ct_render_missing(self, dst, pitch, cell_dims, fmt, glyph);
+      return true;
+   }
+   cell_w    = VIDEO_SCALE_W(cell_dims);
+   cell_h    = VIDEO_SCALE_H(cell_dims);
+   glyphs[0] = (CGGlyph)(gi - 1);
 
-   /* Create bitmap context */
-   bitmapData = calloc(slot->glyph.height, slot->glyph.width);
-   offscreen  = CGBitmapContextCreate(bitmapData, slot->glyph.width, slot->glyph.height,
-                                      8, slot->glyph.width, NULL, kCGImageAlphaOnly);
+   /* kCTFontDefaultOrientation was renamed kCTFontOrientationDefault
+    * in 10.8; both are zero and both still work, so the value goes in
+    * rather than either name. */
+   CTFontGetBoundingRectsForGlyphs(self->font_face, (CTFontOrientation)0,
+         glyphs, &bounds, 1);
+   CTFontGetAdvancesForGlyphs(self->font_face, (CTFontOrientation)0,
+         glyphs, &advance, 1);
+
+   glyph->dims          = cell_dims;
+   glyph->draw_offset_x = (int)ceil(bounds.origin.x);
+   glyph->draw_offset_y = (int)floor(-bounds.origin.y)
+      - (int)floor(self->cached_ascent) + 1;
+   /* round() is C99; advances are non-negative so floor(x + 0.5)
+    * is equivalent */
+   glyph->advance_x     = (int)floor(advance.width + 0.5);
+   glyph->advance_y     = (int)floor(advance.height + 0.5);
+
+   /* Drawn straight into the cell: rows run top first in memory, as
+    * the atlas's do, and a context writes only its own width of each */
+   if (fmt16)
+   {
+      /* 16 bits-per-component DeviceGray, host byte order:
+       * white-on-transparent gray is 16-bit coverage */
+      CGColorSpaceRef gray = CGColorSpaceCreateDeviceGray();
+      if (!gray)
+         return false;
+      offscreen = CGBitmapContextCreate(dst, cell_w, cell_h,
+            16, (size_t)pitch * 2, gray,
+            kCGImageAlphaNone | kCGBitmapByteOrder16Host);
+      CGColorSpaceRelease(gray);
+   }
+   else
+      /* 8-bit alpha-only coverage */
+      offscreen = CGBitmapContextCreate(dst, cell_w, cell_h,
+            8, pitch, NULL, kCGImageAlphaOnly);
 
    if (!offscreen)
+      return false;
+
+   /* Fill color for kCTForegroundColorFromContextAttributeName:
+    * full-white coverage in the gray context, ignored by the
+    * alpha-only one */
+   CGContextSetGrayFillColor(offscreen, 1.0f, 1.0f);
+   CGContextSetTextMatrix(offscreen, CGAffineTransformIdentity);
+
+   /* Each CF/CT allocation is checked: passing NULL onwards or
+    * CFRelease(NULL) would crash rather than fail. Nothing is
+    * written to the cell until all of them are had. */
+   if (!(glyph_cfstr = CFStringCreateWithCharacters(NULL, utf16, utf16_len)))
    {
-      free(bitmapData);
+      CGContextRelease(offscreen);
+      return false;
+   }
+   attr_string = CFAttributedStringCreate(NULL, glyph_cfstr, self->attr_dict);
+   CFRelease(glyph_cfstr);
+   if (!attr_string)
+   {
+      CGContextRelease(offscreen);
+      return false;
+   }
+   line = CTLineCreateWithAttributedString(attr_string);
+   CFRelease(attr_string);
+   if (!line)
+   {
+      CGContextRelease(offscreen);
       return false;
    }
 
-   CGContextSetTextMatrix(offscreen, CGAffineTransformIdentity);
+   for (r = 0; r < cell_h; r++)
+      memset(dst + (size_t)r * pitch * esz, 0, (size_t)cell_w * esz);
 
-   /* Create string from Unicode character using cached dictionary */
-   glyph_cfstr = CFStringCreateWithCharacters(NULL, &character, 1);
-   attrString  = CFAttributedStringCreate(NULL, glyph_cfstr, handle->attr_dict);
-   CFRelease(glyph_cfstr);
-   line        = CTLineCreateWithAttributedString(attrString);
-   CFRelease(attrString);
-
-   /* Render glyph */
    CGContextSetTextPosition(offscreen, -bounds.origin.x, -bounds.origin.y);
    CTLineDraw(line, offscreen);
    CFRelease(line);
-
-   /* Copy bitmap to atlas */
-   dst = (uint8_t*)handle->atlas.buffer +
-         slot->glyph.atlas_offset_x +
-         slot->glyph.atlas_offset_y * handle->atlas.width;
-   src = (const uint8_t*)bitmapData;
-
-   for (r = 0; r < slot->glyph.height; r++)
-      for (c = 0; c < slot->glyph.width; c++)
-         dst[r * handle->atlas.width + c] = src[r * slot->glyph.width + c];
-
    CGContextRelease(offscreen);
-   free(bitmapData);
-
    return true;
 }
 
-static void *font_renderer_ct_init(const char *font_path, float font_size)
+static unsigned font_rasterizer_ct_cell_dims(void *data)
 {
-   char err                       = 0;
-   CFStringRef cf_font_path       = NULL;
+   return ((ct_face_t*)data)->cell_dims;
+}
+
+static void font_rasterizer_ct_get_line_metrics(void *data,
+      struct font_line_metrics *metrics)
+{
+   *metrics = ((ct_face_t*)data)->line_metrics;
+}
+
+/* CoreGraphics calls this when it is done with the buffer, which is
+ * how ownership of the bytes handed to init() is discharged. */
+static void ct_font_data_release(void *info, const void *data, size_t size)
+{
+   (void)info;
+   (void)size;
+   free((void*)data);
+}
+
+static void *font_rasterizer_ct_init(uint8_t *font_data,
+      size_t font_data_len, unsigned face_index, float font_size)
+{
+   float ascent, descent;
+   int max_glyph_size;
    CTFontRef face                 = NULL;
-   CFURLRef url                   = NULL;
    CGDataProviderRef dataProvider = NULL;
    CGFontRef theCGFont            = NULL;
-   ct_font_renderer_t *handle     = (ct_font_renderer_t*)calloc(1, sizeof(*handle));
+   ct_face_t *self                = (ct_face_t*)calloc(1, sizeof(*self));
 
-   if (!handle || !path_is_valid(font_path))
+   /* CoreText has no collection index in this path. */
+   (void)face_index;
+
+   if (!self || !font_data || !font_data_len || font_size < 1.0f)
    {
-      err = 1;
+      free(font_data);
       goto error;
    }
 
-   if (!(cf_font_path = CFStringCreateWithCString(
-                     NULL, font_path, kCFStringEncodingASCII)))
+   /* The provider takes the bytes, and releases them through
+    * ct_font_data_release() when CoreGraphics is finished - so from
+    * here on they are not freed in this function. */
+   if (!(dataProvider = CGDataProviderCreateWithData(
+               NULL, font_data, font_data_len, ct_font_data_release)))
    {
-      err = 1;
+      free(font_data);
       goto error;
    }
-
-   url          = CFURLCreateWithFileSystemPath(
-         kCFAllocatorDefault, cf_font_path, kCFURLPOSIXPathStyle, false);
-   dataProvider = CGDataProviderCreateWithURL(url);
-   theCGFont    = CGFontCreateWithDataProvider(dataProvider);
-   face         = CTFontCreateWithGraphicsFont(theCGFont, font_size, NULL, NULL);
-
-   if (!face)
-   {
-      err = 1;
+   if (!(theCGFont = CGFontCreateWithDataProvider(dataProvider)))
       goto error;
-   }
+   if (!(face = CTFontCreateWithGraphicsFont(theCGFont, font_size,
+               NULL, NULL)))
+      goto error;
 
-   /* Store the font face for on-demand glyph rendering */
-   handle->font_face = face;
+   self->font_face = face;
    CFRetain(face);
 
-   /* Create reusable attribute dictionary for performance */
    {
-      CFTypeRef values[1] = {face};
-      CFStringRef keys[1] = {kCTFontAttributeName};
-      handle->attr_dict = CFDictionaryCreate(NULL, (const void **)&keys, (const void **)&values,
-            1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+      /* C89: block-scope aggregate initializers must be constant */
+      CFTypeRef values[2];
+      CFStringRef keys[2];
+      values[0] = face;
+      keys[0]   = kCTFontAttributeName;
+      /* Take the fill color from the context: required for the 16-bit
+       * DeviceGray (A16) context, where the default black foreground
+       * on a zeroed buffer would render nothing. */
+      values[1] = kCFBooleanTrue;
+      keys[1]   = kCTForegroundColorFromContextAttributeName;
+      self->attr_dict = CFDictionaryCreate(NULL, (const void **)&keys,
+            (const void **)&values, 2, &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks);
    }
-
-   if (!coretext_font_renderer_create_atlas(face, handle, font_size))
-   {
-      err = 1;
+   if (!self->attr_dict)
       goto error;
-   }
+
+   /* Clamp the cell so the atlas stays within common GPU texture
+    * limits; font_size comes from user configuration. */
+   max_glyph_size = (int)font_size;
+   if (max_glyph_size > 127)
+      max_glyph_size = 127;
+   self->cell_dims = VIDEO_SCALE_PACK(max_glyph_size, max_glyph_size);
+
+   ascent  = CTFontGetAscent(face);
+   descent = CTFontGetDescent(face);
+   self->cached_ascent            = ascent;
+   self->line_metrics.ascender    = ascent;
+   self->line_metrics.descender   = (descent < 0.0f) ? -descent : descent;
+   self->line_metrics.height      = self->line_metrics.ascender
+      + self->line_metrics.descender + (float)CTFontGetLeading(face);
+
+   CFRelease(face);
+   CFRelease(dataProvider);
+   CFRelease(theCGFont);
+   return self;
 
 error:
-   if (err)
-   {
-      font_renderer_ct_free(handle);
-      handle = NULL;
-   }
-
-   if (cf_font_path)
-   {
-      CFRelease(cf_font_path);
-      cf_font_path = NULL;
-   }
-
+   font_rasterizer_ct_free(self);
    if (face)
-   {
       CFRelease(face);
-      face = NULL;
-   }
-
-   if (url)
-   {
-      CFRelease(url);
-      url = NULL;
-   }
-
    if (dataProvider)
-   {
       CFRelease(dataProvider);
-      dataProvider = NULL;
-   }
-
    if (theCGFont)
-   {
       CFRelease(theCGFont);
-      theCGFont = NULL;
-   }
-
-   return handle;
+   return NULL;
 }
 
-static const char *font_renderer_ct_get_default_font(void)
+static const char * const *font_renderer_ct_get_default_fonts(
+      const char *requested, unsigned *face_index)
 {
-   /* We can't tell if a font is going to be there until we actually
-      initialize CoreText and the best way to get fonts is by name, not
-      by path. */
-   return "Verdana";
+   /* A name rather than a path: CoreText looks fonts up by name, and
+    * there is no way to know one is present without initialising it.
+    * font_renderer_create_default() will not find this on disk, which
+    * matches the previous behaviour - init() rejected it too. */
+   static const char * const names[] = { "Verdana", NULL };
+
+   (void)face_index;
+
+   /* An explicit request wins; this is only the no-path default. */
+   if (requested && *requested)
+      return NULL;
+   return names;
 }
 
-static void font_renderer_ct_get_line_metrics(
-      void* data, struct font_line_metrics **metrics)
-{
-   ct_font_renderer_t *handle   = (ct_font_renderer_t*)data;
-   *metrics = &handle->line_metrics;
-}
-
-font_renderer_driver_t coretext_font_renderer = {
-   font_renderer_ct_init,
-   font_renderer_ct_get_atlas,
-   font_renderer_ct_get_glyph,
-   font_renderer_ct_free,
-   font_renderer_ct_get_default_font,
+const font_rasterizer_t coretext_font_rasterizer = {
+   font_rasterizer_ct_init,
+   font_rasterizer_ct_free,
+   font_rasterizer_ct_glyph_index,
+   font_rasterizer_ct_render_glyph,
+   font_rasterizer_ct_cell_dims,
+   font_rasterizer_ct_get_line_metrics,
+   font_renderer_ct_get_default_fonts,
    "font_renderer_ct",
-   font_renderer_ct_get_line_metrics
+   false                       /* borrows_font_data: the buffer goes to
+                                * CGDataProviderCreateWithData and is
+                                * released by CoreGraphics on its own
+                                * schedule, so this rasterizer takes a
+                                * private copy and owns it. */
 };
