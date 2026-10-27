@@ -50,7 +50,13 @@
 
 #ifdef ANDROID
 #include <android/log.h>
+#include <android/native_window_jni.h>
 #include <sys/system_properties.h>
+#include <lists/string_list.h>
+#include "../../audio/common/android_audio.h"
+#ifdef HAVE_AAUDIO
+#include "../../audio/audio_driver.h"
+#endif
 #ifdef HAVE_SAF
 #include <vfs/vfs_implementation_saf.h>
 #include "../../menu/menu_cbs.h"
@@ -331,6 +337,313 @@ static void android_app_set_window(struct android_app *android_app,
          (int)ticket, true, -1);
 }
 
+void android_second_surface_free(struct android_second_surface *node)
+{
+   ANativeWindow_release(node->window);
+   free(node);
+}
+
+void android_second_display_request(unsigned ordinal, bool given_up)
+{
+   JNIEnv *env;
+   unsigned number;
+   struct android_app *android_app = (struct android_app*)g_android;
+   struct android_second_display *second;
+
+   if (!android_app || !android_app->setSecondDisplay)
+      return;
+   if (!(env = jni_thread_getenv()))
+      return;
+   second = &android_app->second_display;
+   number = (unsigned)retro_atomic_fetch_add_int(&second->requests, 1) + 1;
+   /* Before Java can act on the hide */
+   if (given_up && !ordinal)
+      retro_atomic_store_release_int(&second->released, (int)number);
+   CALL_VOID_METHOD_PARAM(env, android_app->activity->clazz,
+         android_app->setSecondDisplay, (jint)ordinal, (jint)number);
+}
+
+/* UI thread: the second display's window goes. Never waits for the
+ * renderer: its own references keep the window alive, a frame still
+ * drawing into it gets an error from the abandoned queue, and the
+ * next frame lets it go (android_windows_poll()). */
+static void android_second_surface_term(struct android_app *android_app)
+{
+   struct android_second_display *second = &android_app->second_display;
+   struct android_second_surface *node   = (struct android_second_surface*)
+      retro_atomic_exchange_ptr(&second->surface, NULL);
+
+   if (node)
+      android_second_surface_free(node);
+   retro_atomic_store_release_int(&second->surface_gone,
+         retro_atomic_load_acquire_int(&second->surface_generation));
+   android_app->posted_second_window = NULL;
+   android_app->posted_second_dims   = 0;
+   /* A failure the going surface caused is not held against the next */
+   if (!android_app_thread_gone(android_app))
+      android_app_write_cmd(android_app, APP_CMD_SECOND_WINDOW_CHANGED);
+}
+
+JNIEXPORT void JNICALL Java_com_retroarch_browser_retroactivity_SecondDisplayController_nativeDisplaysChanged(
+      JNIEnv *env, jclass clazz, jintArray connections, jintArray flags,
+      jintArray widths, jintArray heights, jobjectArray names)
+{
+   video_window_display_t list[VIDEO_WINDOW_DISPLAYS_MAX];
+   jint conn[VIDEO_WINDOW_DISPLAYS_MAX];
+   jint bits[VIDEO_WINDOW_DISPLAYS_MAX];
+   jint w[VIDEO_WINDOW_DISPLAYS_MAX];
+   jint h[VIDEO_WINDOW_DISPLAYS_MAX];
+   jsize i, count;
+   struct android_app *android_app = g_android_early;
+
+   if (     !android_app || !connections || !flags || !widths || !heights
+         || !names)
+      return;
+   count = (*env)->GetArrayLength(env, connections);
+   if (count > VIDEO_WINDOW_DISPLAYS_MAX)
+      count = VIDEO_WINDOW_DISPLAYS_MAX;
+   if (     (*env)->GetArrayLength(env, flags)   < count
+         || (*env)->GetArrayLength(env, widths)  < count
+         || (*env)->GetArrayLength(env, heights) < count
+         || (*env)->GetArrayLength(env, names)   < count)
+      return;
+   (*env)->GetIntArrayRegion(env, connections, 0, count, conn);
+   (*env)->GetIntArrayRegion(env, flags, 0, count, bits);
+   (*env)->GetIntArrayRegion(env, widths, 0, count, w);
+   (*env)->GetIntArrayRegion(env, heights, 0, count, h);
+
+   for (i = 0; i < count; i++)
+   {
+      video_window_display_t *d = &list[i];
+      jstring name              = (jstring)
+         (*env)->GetObjectArrayElement(env, names, i);
+      memset(d, 0, sizeof(*d));
+      d->ordinal    = (unsigned)i + 1;
+      d->connection = (conn[i] >= 0
+            && conn[i] <= VIDEO_WINDOW_CONNECTION_TRANSITIVE)
+         ? (unsigned)conn[i] : VIDEO_WINDOW_CONNECTION_UNKNOWN;
+      d->own        = (bits[i] & ANDROID_DISPLAY_OWN)      != 0;
+      d->valid      = (bits[i] & ANDROID_DISPLAY_VALID)    != 0;
+      d->on         = (bits[i] & ANDROID_DISPLAY_ON)       != 0;
+      d->is_private = (bits[i] & ANDROID_DISPLAY_PRIVATE)  != 0;
+      d->physical   = (bits[i] & ANDROID_DISPLAY_PHYSICAL) != 0;
+      d->dims       = (w[i] > 0 && h[i] > 0)
+         ? VIDEO_SCALE_PACK(w[i], h[i]) : 0;
+      if (name)
+      {
+         const char *utf = (*env)->GetStringUTFChars(env, name, NULL);
+         if (utf)
+         {
+            strlcpy(d->name, utf, sizeof(d->name));
+            (*env)->ReleaseStringUTFChars(env, name, utf);
+         }
+         else
+            JNI_EXCEPTION(env);
+         (*env)->DeleteLocalRef(env, name);
+      }
+   }
+
+   video_driver_publish_window_displays(list, (unsigned)count);
+   android_app_write_cmd(android_app, APP_CMD_SECOND_WINDOW_CHANGED);
+}
+
+JNIEXPORT jint JNICALL Java_com_retroarch_browser_retroactivity_SecondDisplayController_nativeSurfaceChanged(
+      JNIEnv *env, jclass clazz, jobject surface, jint width, jint height,
+      jint request)
+{
+   ANativeWindow *window;
+   struct android_second_surface *node;
+   struct android_second_surface *stale;
+   unsigned dims;
+   int generation;
+   struct android_app *android_app = g_android_early;
+   struct android_second_display *second;
+
+   if (!android_app || !surface || width <= 0 || height <= 0)
+      return 0;
+   if (!(window = ANativeWindow_fromSurface(env, surface)))
+   {
+      RARCH_ERR("[Android] Second display: its surface has no window.\n");
+      return 0;
+   }
+   second     = &android_app->second_display;
+   dims       = VIDEO_SCALE_PACK(width, height);
+   generation = retro_atomic_load_acquire_int(&second->surface_generation);
+
+   if (window == android_app->posted_second_window)
+   {
+      if (dims == android_app->posted_second_dims)
+      {
+         ANativeWindow_release(window);
+         return generation;
+      }
+   }
+   else
+   {
+      if (android_app->posted_second_window)
+         android_second_surface_term(android_app);
+      if (++generation <= 0)
+         generation = 1;
+      retro_atomic_store_release_int(&second->surface_generation,
+            generation);
+   }
+
+   if (!(node = (struct android_second_surface*)malloc(sizeof(*node))))
+   {
+      ANativeWindow_release(window);
+      return 0;
+   }
+   node->window                       = window;
+   node->dims                         = dims;
+   node->generation                   = generation;
+   node->request                      = (int)request;
+   android_app->posted_second_window  = window;
+   android_app->posted_second_dims    = dims;
+
+   if ((stale = (struct android_second_surface*)retro_atomic_exchange_ptr(
+               &second->surface, node)))
+      android_second_surface_free(stale);
+   android_app_write_cmd(android_app, APP_CMD_SECOND_WINDOW_CHANGED);
+   return generation;
+}
+
+JNIEXPORT void JNICALL Java_com_retroarch_browser_retroactivity_SecondDisplayController_nativeSurfaceDestroyed(
+      JNIEnv *env, jclass clazz)
+{
+   struct android_app *android_app = g_android_early;
+
+   if (android_app && android_app->posted_second_window)
+      android_second_surface_term(android_app);
+}
+
+/* UI thread: an app thread asleep in its looper while paused reads the
+ * second display's rings only once woken */
+static void android_second_wake(struct android_app *android_app)
+{
+   ALooper *looper = (ALooper*)retro_atomic_load_acquire_ptr(
+         &android_app->looper_to_wake);
+   if (looper)
+      ALooper_wake(looper);
+}
+
+/* For each pointer of a touch on the second display. Downs and moves
+ * keep room in the ring for every finger's up. */
+JNIEXPORT void JNICALL Java_com_retroarch_browser_retroactivity_SecondDisplayController_nativeTouch(
+      JNIEnv *env, jclass clazz, jint pointer_id, jint x, jint y,
+      jboolean down, jint generation)
+{
+   /* Ids whose last record written was a down; UI thread only */
+   static uint32_t down_ids        = 0;
+   android_second_touch_t touch;
+   uint32_t bit;
+   size_t room;
+   struct android_app *android_app = g_android_early;
+
+   if (!android_app)
+      return;
+#ifdef DEBUG_ANDROID_INPUT
+   RARCH_LOG("[RA Input] Second display touch id=%d x=%d y=%d down=%d"
+         " surface=%d\n", (int)pointer_id, (int)x, (int)y,
+         (int)(down != JNI_FALSE), (int)generation);
+#endif
+   /* MotionEvent ids are 0-31 */
+   if (pointer_id < 0 || pointer_id > 31)
+      return;
+   bit  = (uint32_t)1 << pointer_id;
+   room = retro_spsc_write_avail(&android_app->second_display.touches);
+   if (down != JNI_FALSE)
+   {
+      if (room < (MAX_TOUCH + 1) * sizeof(touch))
+         return;
+      down_ids |= bit;
+   }
+   else
+   {
+      if (!(down_ids & bit) || room < sizeof(touch))
+         return;
+      down_ids &= ~bit;
+   }
+   touch.pointer_id = pointer_id;
+   touch.x          = x;
+   touch.y          = y;
+   touch.generation = generation;
+   touch.down       = (down != JNI_FALSE);
+   retro_spsc_write(&android_app->second_display.touches, &touch,
+         sizeof(touch));
+   android_second_wake(android_app);
+}
+
+/* A down or a move keeps room in the ring for ups */
+static void android_second_input_write(struct android_app *android_app,
+      const android_input_fields_t *in, bool up)
+{
+   retro_spsc_t *ring = &android_app->second_display.inputs;
+   size_t need        = up ? sizeof(*in)
+      : (ANDROID_SECOND_INPUT_UPS + 1) * sizeof(*in);
+
+   if (retro_spsc_write_avail(ring) < need)
+      return;
+   retro_spsc_write(ring, in, sizeof(*in));
+   android_second_wake(android_app);
+}
+
+/* A key the second display's window received; @event_time is
+ * KeyEvent.getEventTime(), milliseconds */
+JNIEXPORT void JNICALL Java_com_retroarch_browser_retroactivity_SecondDisplayController_nativeKey(
+      JNIEnv *env, jclass clazz, jint device_id, jint source, jint action,
+      jint keycode, jint flags, jint meta_state, jlong event_time)
+{
+   android_input_fields_t key;
+   struct android_app *android_app = g_android_early;
+
+   if (!android_app)
+      return;
+   memset(&key, 0, sizeof(key));
+   key.event_time = (int64_t)event_time * 1000000;
+   key.type       = AINPUT_EVENT_TYPE_KEY;
+   key.device_id  = device_id;
+   key.source     = source;
+   key.action     = action;
+   key.keycode    = keycode;
+   key.flags      = flags;
+   key.meta_state = meta_state;
+   android_second_input_write(android_app, &key,
+         action == AKEY_EVENT_ACTION_UP);
+}
+
+/* A stick or hat move the second display's window received: the axes
+ * in ANDROID_JOYSTICK_AXES' order */
+JNIEXPORT void JNICALL Java_com_retroarch_browser_retroactivity_SecondDisplayController_nativeMotion(
+      JNIEnv *env, jclass clazz, jint device_id, jint source,
+      jfloatArray axes)
+{
+   android_input_fields_t move;
+   struct android_app *android_app = g_android_early;
+
+   if (     !android_app || !axes
+         || (*env)->GetArrayLength(env, axes) < ANDROID_JOYSTICK_AXES)
+      return;
+   memset(&move, 0, sizeof(move));
+   move.type      = AINPUT_EVENT_TYPE_MOTION;
+   move.device_id = device_id;
+   move.source    = source;
+   (*env)->GetFloatArrayRegion(env, axes, 0, ANDROID_JOYSTICK_AXES,
+         move.axes);
+   android_second_input_write(android_app, &move, false);
+}
+
+/* The second display's window gained or lost focus; Java also sends a
+ * loss when it dismisses it */
+JNIEXPORT void JNICALL Java_com_retroarch_browser_retroactivity_SecondDisplayController_nativeFocusChanged(
+      JNIEnv *env, jclass clazz, jboolean focused)
+{
+   struct android_app *android_app = g_android_early;
+
+   if (android_app)
+      android_app_write_cmd(android_app, focused != JNI_FALSE
+            ? APP_CMD_SECOND_GAINED_FOCUS : APP_CMD_SECOND_LOST_FOCUS);
+}
+
 /* Upper bound on how long a lifecycle callback will block waiting for the
  * app thread to pick the command up. The app thread only reads the command
  * pipe between frames, so anything that keeps it out of the looper - a core
@@ -413,10 +726,31 @@ static void android_app_free(struct android_app* android_app)
 
    sthread_join(android_app->thread);
 
+   {
+      ALooper *looper = (ALooper*)retro_atomic_exchange_ptr(
+            &android_app->looper_to_wake, NULL);
+      if (looper)
+         ALooper_release(looper);
+   }
+
    close(android_app->msgread);
    close(android_app->msgwrite);
    android_lifecycle_free(&android_app->lc);
+   {
+      struct android_second_surface *node = (struct android_second_surface*)
+         retro_atomic_exchange_ptr(&android_app->second_display.surface,
+               NULL);
+      if (node)
+         android_second_surface_free(node);
+   }
+   retro_spsc_free(&android_app->second_display.touches);
+   retro_spsc_free(&android_app->second_display.inputs);
+   retro_spsc_free(&android_app->input_reader.events);
+   retro_eventcount_free(&android_app->input_reader.room);
 
+   /* A re-created activity's create may have replaced it already */
+   if (g_android_early == android_app)
+      g_android_early = NULL;
    free(android_app);
 }
 
@@ -686,6 +1020,13 @@ static struct android_app* android_app_create(ANativeActivity* activity,
    android_app->msgread  = msgpipe[0];
    android_app->msgwrite = msgpipe[1];
 
+   /* A ring that cannot be made drops the second display's touches or
+    * keys; nothing else depends on them */
+   retro_spsc_init(&android_app->second_display.touches,
+         64 * sizeof(android_second_touch_t));
+   retro_spsc_init(&android_app->second_display.inputs,
+         ANDROID_SECOND_INPUTS * sizeof(android_input_fields_t));
+
    android_app->thread   = sthread_create(android_app_entry, android_app);
    /* NULL-check sthread_create: on OOM the thread won't be
     * spawned and nothing will set ANDROID_LC_RUNNING, so the wait
@@ -698,6 +1039,8 @@ static struct android_app* android_app_create(ANativeActivity* activity,
       close(msgpipe[1]);
       if (android_app->savedState)
          free(android_app->savedState);
+      retro_spsc_free(&android_app->second_display.touches);
+      retro_spsc_free(&android_app->second_display.inputs);
       android_lifecycle_free(&android_app->lc);
       free(android_app);
       g_android_early = NULL;
@@ -732,6 +1075,8 @@ static struct android_app* android_app_create(ANativeActivity* activity,
       close(android_app->msgwrite);
       if (android_app->savedState)
          free(android_app->savedState);
+      retro_spsc_free(&android_app->second_display.touches);
+      retro_spsc_free(&android_app->second_display.inputs);
       android_lifecycle_free(&android_app->lc);
       free(android_app);
       g_android_early = NULL;
@@ -833,6 +1178,214 @@ void frontend_android_get_version_sdk(int32_t *sdk)
    *sdk = 0;
    if (os_version_str[0])
       *sdk = (int32_t)strtol(os_version_str, NULL, 10);
+}
+
+static const char *android_audio_device_type(jint type)
+{
+   switch (type)
+   {
+      case 1:  return "earpiece";
+      case 2:  return "speaker";
+      case 3:  return "wired headset";
+      case 4:  return "wired headphones";
+      case 5:  return "analog line";
+      case 6:  return "digital line";
+      case 7:  return "Bluetooth SCO";
+      case 8:  return "Bluetooth A2DP";
+      case 9:  return "HDMI";
+      case 10: return "HDMI ARC";
+      case 11: return "USB device";
+      case 12: return "USB accessory";
+      case 13: return "dock";
+      case 21: return "bus";
+      case 22: return "USB headset";
+      case 23: return "hearing aid";
+      case 26: return "BLE headset";
+      case 27: return "BLE speaker";
+      case 29: return "HDMI eARC";
+      case 30: return "BLE broadcast";
+      default: break;
+   }
+   return NULL;
+}
+
+/* The largest entry of an int[] from Java; 0 when it is empty. With
+ * find, whether find is among them instead (1 or 0). */
+static jint android_int_array_scan(JNIEnv *env, jobject arr, jint find,
+      bool want_find)
+{
+   jsize n, k;
+   jint best = 0;
+   jint *v;
+   if (!arr)
+      return 0;
+   n = (*env)->GetArrayLength(env, (jintArray)arr);
+   if (n <= 0 || !(v = (*env)->GetIntArrayElements(env, (jintArray)arr, NULL)))
+      return 0;
+   for (k = 0; k < n; k++)
+   {
+      if (want_find && v[k] == find)
+         best = 1;
+      else if (!want_find && v[k] > best)
+         best = v[k];
+   }
+   (*env)->ReleaseIntArrayElements(env, (jintArray)arr, v, JNI_ABORT);
+   return best;
+}
+
+/* Walks AudioManager's outputs: appends each to list where one is
+ * given, and fills the caps of the output with want_id where that is
+ * not zero. True when that output was found. */
+static bool android_audio_outputs_walk(struct string_list *list,
+      int32_t want_id, unsigned *max_channels, bool *ac3)
+{
+   union string_list_elem_attr attr;
+   jclass ctx_class, am_class, dev_class = NULL;
+   jmethodID get_service, get_devices;
+   jmethodID get_id = NULL, get_type = NULL, get_name = NULL, to_string = NULL;
+   jmethodID get_counts = NULL, get_encodings = NULL;
+   jobject am, devices;
+   jstring svc;
+   jsize i, count;
+   bool found  = false;
+   JNIEnv *env = jni_thread_getenv();
+
+   if (!env || !g_android || !g_android->activity)
+      return false;
+   if ((*env)->PushLocalFrame(env, 16) != 0)
+   {
+      JNI_EXCEPTION(env);
+      return false;
+   }
+   attr.i = 0;
+
+   svc = (*env)->NewStringUTF(env, "audio");
+   GET_OBJECT_CLASS(env, ctx_class, g_android->activity->clazz);
+   if (!svc || !ctx_class)
+      goto done;
+   GET_METHOD_ID(env, get_service, ctx_class, "getSystemService",
+         "(Ljava/lang/String;)Ljava/lang/Object;");
+   if (!get_service)
+      goto done;
+   CALL_OBJ_METHOD_PARAM(env, am, g_android->activity->clazz,
+         get_service, svc);
+   if (!am)
+      goto done;
+   GET_OBJECT_CLASS(env, am_class, am);
+   if (!am_class)
+      goto done;
+   GET_METHOD_ID(env, get_devices, am_class, "getDevices",
+         "(I)[Landroid/media/AudioDeviceInfo;");
+   if (!get_devices)
+      goto done;
+   /* AudioManager.GET_DEVICES_OUTPUTS */
+   CALL_OBJ_METHOD_PARAM(env, devices, am, get_devices, (jint)2);
+   if (!devices)
+      goto done;
+
+   count = (*env)->GetArrayLength(env, (jobjectArray)devices);
+   for (i = 0; i < count && !found; i++)
+   {
+      jobject dev;
+      jint     id   = 0;
+      jint     type = 0;
+
+      if ((*env)->PushLocalFrame(env, 8) != 0)
+      {
+         JNI_EXCEPTION(env);
+         break;
+      }
+      dev = (*env)->GetObjectArrayElement(env, (jobjectArray)devices, i);
+      JNI_EXCEPTION(env);
+      if (dev && !dev_class)
+      {
+         jclass obj_class;
+         /* Popped with the frame below; the IDs outlive it. */
+         GET_OBJECT_CLASS(env, dev_class, dev);
+         FIND_CLASS(env, obj_class, "java/lang/Object");
+         if (dev_class)
+         {
+            GET_METHOD_ID(env, get_id,        dev_class, "getId", "()I");
+            GET_METHOD_ID(env, get_type,      dev_class, "getType", "()I");
+            GET_METHOD_ID(env, get_name,      dev_class, "getProductName",
+                  "()Ljava/lang/CharSequence;");
+            GET_METHOD_ID(env, get_counts,    dev_class, "getChannelCounts", "()[I");
+            GET_METHOD_ID(env, get_encodings, dev_class, "getEncodings", "()[I");
+         }
+         if (obj_class)
+            GET_METHOD_ID(env, to_string, obj_class, "toString",
+                  "()Ljava/lang/String;");
+      }
+      if (!dev || !get_id || !get_type)
+      {
+         (*env)->PopLocalFrame(env, NULL);
+         continue;
+      }
+      CALL_INT_METHOD(env, id, dev, get_id);
+      CALL_INT_METHOD(env, type, dev, get_type);
+
+      if (want_id && id == want_id)
+      {
+         jobject counts = NULL, encodings = NULL;
+         found = true;
+         if (get_counts)
+            CALL_OBJ_METHOD(env, counts, dev, get_counts);
+         if (get_encodings)
+            CALL_OBJ_METHOD(env, encodings, dev, get_encodings);
+         if (max_channels)
+            *max_channels = (unsigned)android_int_array_scan(env, counts, 0, false);
+         /* AudioFormat.ENCODING_AC3 */
+         if (ac3)
+            *ac3 = android_int_array_scan(env, encodings, 5, true) != 0;
+      }
+
+      /* Telephony and remote submix are not places to play to. */
+      if (list && get_name && to_string && id > 0 && type != 18 && type != 25)
+      {
+         char entry[256];
+         const char *name = NULL;
+         const char *kind = android_audio_device_type(type);
+         jobject cs  = NULL;
+         jstring str = NULL;
+         CALL_OBJ_METHOD(env, cs, dev, get_name);
+         if (cs)
+            CALL_OBJ_METHOD(env, str, cs, to_string);
+         if (str)
+            name = (*env)->GetStringUTFChars(env, str, NULL);
+         if (kind)
+            snprintf(entry, sizeof(entry), "%d (%s, %s)", (int)id,
+                  (name && *name) ? name : "Unknown", kind);
+         else
+            snprintf(entry, sizeof(entry), "%d (%s)", (int)id,
+                  (name && *name) ? name : "Unknown");
+         if (name)
+            (*env)->ReleaseStringUTFChars(env, str, name);
+         string_list_append(list, entry, attr);
+      }
+      (*env)->PopLocalFrame(env, NULL);
+   }
+
+done:
+   (*env)->PopLocalFrame(env, NULL);
+   return found;
+}
+
+struct string_list *frontend_android_audio_outputs_new(void)
+{
+   struct string_list *list = string_list_new();
+   if (list)
+      android_audio_outputs_walk(list, 0, NULL, NULL);
+   return list;
+}
+
+bool frontend_android_audio_device_caps(int32_t id,
+      unsigned *max_channels, bool *ac3)
+{
+   *max_channels = 0;
+   *ac3          = false;
+   if (id <= 0)
+      return false;
+   return android_audio_outputs_walk(NULL, id, max_channels, ac3);
 }
 
 static bool device_is_xperia_play(const char *name)
@@ -3229,8 +3782,7 @@ static void android_app_destroy(struct android_app *android_app)
       retro_vfs_deinit_saf();
 #endif
 
-   if (android_app->inputQueue)
-      AInputQueue_detachLooper(android_app->inputQueue);
+   android_input_reader_stop(android_app);
 
    AConfiguration_delete(android_app->config);
    android_lifecycle_set_flags(&android_app->lc, ANDROID_LC_DESTROYED);
@@ -3338,6 +3890,16 @@ static void frontend_unix_init(void *data)
    if (!android_app)
       return;
 
+#ifdef HAVE_AAUDIO
+   /* AAudio is Android 8.0 (API 26) and up. */
+   {
+      int32_t sdk = 0;
+      frontend_android_get_version_sdk(&sdk);
+      if (sdk < 26)
+         audio_driver_list_remove(&audio_aaudio);
+   }
+#endif
+
    android_app->config             = AConfiguration_new();
    AConfiguration_fromAssetManager(android_app->config,
          android_app->activity->assetManager);
@@ -3346,12 +3908,23 @@ static void frontend_unix_init(void *data)
    ALooper_addFd(looper, android_app->msgread, LOOPER_ID_MAIN,
          ALOOPER_EVENT_INPUT, NULL, NULL);
    android_app->looper = looper;
+   /* Held for the UI thread's wakes until android_app_free() */
+   ALooper_acquire(looper);
    retro_atomic_store_release_ptr(&android_app->looper_to_wake, looper);
    retro_atomic_thread_fence_seq_cst();
    android_lifecycle_set_flags(&android_app->lc, ANDROID_LC_RUNNING);
 
    memset(&g_android, 0, sizeof(g_android));
    g_android = (struct android_app*)android_app;
+
+   /* Before the first command is read: it may hand over the input
+    * queue, which only the reader reads */
+   if (!android_input_reader_start(android_app))
+   {
+      frontend_unix_deinit(android_app);
+      frontend_android_shutdown(android_app);
+      return;
+   }
 
    while (!android_app_window(android_app))
    {
@@ -3457,6 +4030,8 @@ static void frontend_unix_init(void *data)
          "showKeyboard", "(Ljava/lang/String;Ljava/lang/String;)V");
    GET_METHOD_ID(env, android_app->hideKeyboard, class,
          "hideKeyboard", "()V");
+   GET_METHOD_ID(env, android_app->setSecondDisplay, class,
+         "setSecondDisplay", "(II)V");
 
    CALL_BOOLEAN_METHOD(env, android_app->is_play_store_build,
          android_app->activity->clazz, android_app->isPlayStoreBuild);

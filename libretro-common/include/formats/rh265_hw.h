@@ -73,7 +73,7 @@ static INLINE int rh265_hw_prepare(const rh265_hw_state_t *s,
    if (!out) return -1;
    memset(out, 0, sizeof(*out));
    if (!s || !params || !au || !s->slots || s->slots > 32 || !s->serial
-         || s->serial == UINT64_MAX || !au->num_slices || params->chroma_format_idc != 1
+         || s->serial == (uint64_t)-1 || !au->num_slices || params->chroma_format_idc != 1
          || (params->bit_depth != 8 && params->bit_depth != 10)
          || params->width <= 0 || params->height <= 0
          || params->log2_max_poc_lsb < 4 || params->log2_max_poc_lsb > 16
@@ -133,7 +133,7 @@ static INLINE int rh265_hw_prepare(const rh265_hw_state_t *s,
    out->epoch = s->epoch;
    if (anchor && s->started)
    {
-      if (s->epoch == UINT64_MAX) goto invalid;
+      if (s->epoch == (uint64_t)-1) goto invalid;
       out->epoch++;
    }
    out->keep_outputs = anchor && h->no_output_of_prior_pics ? 0 : s->outputs;
@@ -222,7 +222,7 @@ invalid:
 static INLINE bool rh265_hw_commit(rh265_hw_state_t *s, const rh265_hw_picture_t *p)
 {
    uint32_t bit;
-   if (!s || !p || p->serial != s->serial || !s->serial || s->serial == UINT64_MAX
+   if (!s || !p || p->serial != s->serial || !s->serial || s->serial == (uint64_t)-1
          || p->slot >= s->slots || p->slot >= 32 || p->num_refs > 15
          || (p->keep_references & ~s->references)) return false;
    bit = UINT32_C(1) << p->slot;
@@ -274,6 +274,8 @@ typedef struct rh265_hw_ops
          const rh265_access_unit_t *au, const rh265_nal_t *slices,
          const rh265_hw_picture_t *picture);
    int (*output)(void *decoder, unsigned slot, video_hw_frame_t *frame);
+   /* Optional EOF submission: 0 accepted, 1 busy, negative failure. */
+   int (*drain)(void *decoder);
 } rh265_hw_ops_t;
 
 typedef struct rh265_hw_backend

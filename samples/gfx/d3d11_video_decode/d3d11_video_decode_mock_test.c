@@ -1120,7 +1120,7 @@ static void test_hevc_registry(void)
    rh265_video_close(v);
 }
 
-static void test_vp9(int depth)
+static void test_vp9(int depth, int color_space)
 {
    static rvp9_hw_picture_t p;
    static const uint8_t packet[7] = {0x82, 0x49, 0x83, 0x42, 1, 2, 3};
@@ -1145,9 +1145,13 @@ static void test_vp9(int depth)
             !d3d11_video_decode_vp9_open(&p.header, 10, &ops) && live == before);
    d3d11vd.import_formats = IMAGE_PIXFMT_NV12 | IMAGE_PIXFMT_P010;
    check("VP9: insufficient DPB refused", !d3d11_video_decode_vp9_open(&p.header, 9, &ops));
-   p.header.color_space = 5;
-   check("VP9: unsupported output matrix refused", !d3d11_video_decode_vp9_open(&p.header, 10, &ops));
-   p.header.color_space = 2; views = views_ok = 0;
+   p.header.color_space = 4;
+   check("VP9: unsupported SMPTE240 output matrix refused", !d3d11_video_decode_vp9_open(&p.header, 10, &ops));
+   p.header.color_space = 6;
+   check("VP9: reserved color space refused", !d3d11_video_decode_vp9_open(&p.header, 10, &ops));
+   p.header.color_space = 7;
+   check("VP9: RGB color space refused", !d3d11_video_decode_vp9_open(&p.header, 10, &ops));
+   p.header.color_space = color_space; views = views_ok = 0;
    if (!d3d11_video_decode_vp9_open(&p.header, 10, &ops))
    { check("VP9: decoder opens", 0); d3d11vd.import_formats = formats; return; }
    d = (d3d11vd_dec_t*)ops.decoder;
@@ -1176,7 +1180,7 @@ static void test_vp9(int depth)
       check("VP9: independent output lease", !ops.output(d, 0, &frames[i])
             && frames[i].width == 320 && frames[i].height == 192
             && frames[i].pixfmt == (unsigned)(depth == 10 ? IMAGE_PIXFMT_P010 : IMAGE_PIXFMT_NV12)
-            && frames[i].yuv == (IMAGE_YUV_FLAG_BT709 | IMAGE_YUV_FLAG_FULL_RANGE));
+            && frames[i].yuv == ((color_space == 2 ? IMAGE_YUV_FLAG_BT709 : 0) | IMAGE_YUV_FLAG_FULL_RANGE));
    old_copies = copies;
    check("VP9: held leases apply backpressure without a copy", ops.output(d, 0, &extra) == 1 && copies == old_copies);
    d3d11_video_decode_vp9_close(&ops);
@@ -1263,6 +1267,29 @@ static void test_shared_dpb(int depth)
    check("fallback retires resources", live == before);
 }
 
+static void test_packed_vp9_registry(void)
+{
+   mock_t *adapter = mock_new(K_ADAPTER);
+   rvp9_hw_backend_t replacement;
+   memset(&replacement, 0, sizeof(replacement));
+   check("packed renderer starts without taking H264",
+         d3d11_video_decode_init_packed_adapter(adapter, IMAGE_PIXFMT_YUV8_FP16, false)
+         && !d3d11vd.h264_owned);
+   check("packed renderer retains VP9 configuration admission",
+         d3d11vd.vp9.open_config != NULL);
+   check("packed renderer publishes VP9", rvp9_unset_hw_backend(&d3d11vd.vp9));
+   rvp9_set_hw_backend(&d3d11vd.vp9);
+   d3d11_video_decode_deinit();
+   check("packed teardown withdraws VP9", !rvp9_unset_hw_backend(&d3d11vd.vp9));
+   check("packed renderer restarts", d3d11_video_decode_init_packed_adapter(
+            adapter, IMAGE_PIXFMT_YUV8_FP16, false));
+   rvp9_set_hw_backend(&replacement);
+   d3d11_video_decode_deinit();
+   check("packed teardown preserves a replacement VP9 owner",
+         rvp9_unset_hw_backend(&replacement));
+   m_release(adapter);
+}
+
 int main(void)
 {
    ID3D11Device *dev;
@@ -1303,8 +1330,9 @@ int main(void)
    test_hevc();
    test_hevc_main10();
    test_hevc_registry();
-   test_vp9(8);
-   test_vp9(10);
+   test_vp9(8, 2);
+   test_vp9(10, 2);
+   test_vp9(10, 5);
 
    d3d11_video_decode_deinit();
    check("P010 renderer backend starts", d3d11_video_decode_init_formats(dev,
@@ -1342,6 +1370,8 @@ int main(void)
    test_shared_dpb(10);
    d3d11_video_decode_deinit();
    check("deinit lets the adapter go", live == live0);
+   test_packed_vp9_registry();
+   check("packed registry releases its adapter", live == live0);
    m_release(m);
    check("no mock object left", live == 0);
    subs_free();

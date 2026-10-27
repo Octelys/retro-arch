@@ -40,82 +40,51 @@
 #define RAR_MAGIC     "Rar!\x1A\x07"
 #define RAR_MAGIC_LEN 6
 
-/* rrar_archive parses from a buffer rather than a stream.
- *
- * archive_file.c has already opened the file and, for archives up to
- * 256 MiB, mapped it before this backend is entered. Where that
- * mapping exists it is used directly, as the zip, 7z and zstd backends
- * do; only when there is none does this read the file itself, and
- * owns_data records which of the two happened. */
+/* archive_file.c has already opened the file and, where it could,
+ * mapped it before this backend is entered. Where that mapping exists
+ * rrar_archive parses it in place, as the zip, 7z and zstd backends
+ * do. Without one (no mapping on the platform, a network share, an
+ * archive over a 32-bit host's ceiling) it reads the open stream through
+ * file_archive_read_at(): headers at open, a member's packed bytes
+ * only when that member is extracted. */
 struct rar_context_t
 {
    rrar_archive_t *archive;
-   const uint8_t  *data;
-   size_t          data_len;
+   file_archive_transfer_t *state;
    /* The last extracted member, owned here so the handle handed to the
     * caller stays valid until the next call. */
    uint8_t        *output;
    uint32_t        parse_index;
    uint32_t        decompress_index;
-   int             owns_data;
+   bool            to_sink;   /* the member goes to the file as it comes */
 };
 
-/* Read a whole file into memory, for the no-mapping case only. */
-static uint8_t *rar_slurp(const char *path, size_t *out_len)
+/* A member bound for a file, bigger than this, goes to it as it is
+ * unpacked rather than whole through memory */
+#define RAR_SINK_OVER (256 * 1024)
+
+static int rar_sink_write(void *ud, const uint8_t *data, size_t len)
 {
-   RFILE   *f;
-   int64_t  len;
-   uint8_t *buf;
-
-   if (string_is_empty(path))
-      return NULL;
-
-   if (!(f = filestream_open(path, RETRO_VFS_FILE_ACCESS_READ,
-         RETRO_VFS_FILE_ACCESS_HINT_NONE)))
-      return NULL;
-
-   filestream_seek(f, 0, SEEK_END);
-   len = filestream_tell(f);
-   filestream_seek(f, 0, SEEK_SET);
-
-   if (     len <= 0
-         || (uint64_t)len > (uint64_t)((size_t)-1)
-         || !(buf = (uint8_t *)malloc((size_t)len)))
-   {
-      filestream_close(f);
-      return NULL;
-   }
-
-   if (filestream_read(f, buf, (int64_t)len) != len)
-   {
-      free(buf);
-      filestream_close(f);
-      return NULL;
-   }
-
-   filestream_close(f);
-   *out_len = (size_t)len;
-   return buf;
+   return filestream_write((RFILE*)ud, data, (int64_t)len) != (int64_t)len;
 }
 
-static int rar_bind_data(struct rar_context_t *ctx,
-      file_archive_transfer_t *state, const char *file)
+static int rar_crc_write(void *ud, const uint8_t *data, size_t len)
+{
+   *(uint32_t*)ud = encoding_crc32(*(uint32_t*)ud, data, len);
+   return 0;
+}
+
+static int rar_open_archive(struct rar_context_t *ctx,
+      file_archive_transfer_t *state)
 {
 #ifdef VFS_HAVE_FILE_MAPPING
    if (state->archive_mmap_data && state->archive_size > 0)
-   {
-      ctx->data      = state->archive_mmap_data;
-      ctx->data_len  = (size_t)state->archive_size;
-      ctx->owns_data = 0;
-      return 1;
-   }
-#else
-   (void)state;
+      return rrar_archive_open(&ctx->archive, state->archive_mmap_data,
+            (size_t)state->archive_size) == RRAR_OK;
 #endif
-   if (!(ctx->data = rar_slurp(file, &ctx->data_len)))
-      return 0;
-   ctx->owns_data = 1;
-   return 1;
+   return rrar_archive_open_read(&ctx->archive,
+         (uint64_t)state->archive_size,
+         file_archive_read_at, state->archive_file) == RRAR_OK;
 }
 
 static void rar_parse_file_free(void *context)
@@ -126,10 +95,9 @@ static void rar_parse_file_free(void *context)
       return;
 
    free(ctx->output);
+   /* The mapping and the stream belong to archive_file.c, which
+    * releases them after this. */
    rrar_archive_close(ctx->archive);
-   /* The mapping belongs to archive_file.c and is unmapped there. */
-   if (ctx->owns_data)
-      free((void*)ctx->data);
    free(ctx);
 }
 
@@ -148,7 +116,7 @@ typedef struct
 static int rar_file_decompressed(
       const char *name, const char *valid_exts,
       const uint8_t *cdata, unsigned cmode,
-      uint32_t csize, uint32_t size,
+      uint64_t csize, uint64_t size,
       uint32_t crc32, struct archive_extract_userdata *userdata)
 {
    rar_decomp_state_t *st = (rar_decomp_state_t*)userdata->cb_data;
@@ -252,20 +220,20 @@ static int64_t rar_file_read(
 
 static bool rar_stream_decompress_data_to_file_init(
       void *context, file_archive_file_handle_t *handle,
-      const uint8_t *cdata, unsigned cmode, uint32_t csize, uint32_t size)
+      const uint8_t *cdata, unsigned cmode, uint64_t csize, uint64_t size)
 {
    struct rar_context_t *ctx = (struct rar_context_t*)context;
 
    (void)handle;
    (void)cmode;
    (void)csize;
-   (void)size;
 
    if (!ctx)
       return false;
 
    /* The parse step hands the entry index through cdata. */
    ctx->decompress_index = (uint32_t)(size_t)cdata;
+   ctx->to_sink          = ctx->state->pending_sink && size > RAR_SINK_OVER;
    return true;
 }
 
@@ -278,9 +246,22 @@ static int rar_stream_decompress_data_to_file_iterate(
    uint8_t *member     = NULL;
    size_t   member_len = 0;
 
-   if (     !ctx || !ctx->archive
-         || rrar_archive_extract(ctx->archive, ctx->decompress_index,
-               &member, &member_len) != RRAR_OK)
+   if (!ctx || !ctx->archive)
+      return -1;
+
+   /* in the file as it comes, whole */
+   if (ctx->to_sink)
+   {
+      if (rrar_archive_extract_sink(ctx->archive, ctx->decompress_index,
+               rar_sink_write, ctx->state->pending_sink) != RRAR_OK)
+         return -1;
+      if (handle)
+         handle->data = NULL;
+      return 1;
+   }
+
+   if (rrar_archive_extract(ctx->archive, ctx->decompress_index,
+            &member, &member_len) != RRAR_OK)
       return -1;
 
    /* The caller reads through handle->data until it calls back in, so
@@ -300,6 +281,8 @@ static int rar_parse_file_init(file_archive_transfer_t *state,
    uint8_t magic_buf[RAR_MAGIC_LEN];
    struct rar_context_t *ctx = NULL;
 
+   (void)file;
+
    if (state->archive_size < RRAR_SIGNATURE_SIZE)
       goto error;
 
@@ -315,12 +298,9 @@ static int rar_parse_file_init(file_archive_transfer_t *state,
       goto error;
 
    state->context = ctx;
+   ctx->state     = state;
 
-   if (!rar_bind_data(ctx, state, file))
-      goto error;
-
-   if (rrar_archive_open(&ctx->archive, ctx->data, ctx->data_len)
-         != RRAR_OK)
+   if (!rar_open_archive(ctx, state))
       goto error;
 
    state->step_total = rrar_archive_num_entries(ctx->archive);
@@ -352,29 +332,30 @@ static int rar_parse_file_iterate_step(void *context,
 
    entry = rrar_archive_entry(ctx->archive, ctx->parse_index);
 
-   /* Directories, members this reader cannot unpack (solid, encrypted,
-    * an older packer) and members of 4 GiB or more, which the uint32_t
-    * sizes here cannot describe, are passed over: the rest of the
+   /* Directories and members this reader cannot unpack (solid,
+    * encrypted, an older packer) are passed over: the rest of the
     * archive stays usable. */
-   if (     entry
-         && !entry->is_dir
-         && entry->supported
-         && entry->size <= (uint64_t)0xFFFFFFFFu)
+   if (entry && !entry->is_dir && entry->supported)
    {
-      uint32_t size = (uint32_t)entry->size;
-
       strlcpy(userdata->current_file_path, entry->name,
             sizeof(userdata->current_file_path));
       userdata->crc  = entry->crc;
-      userdata->size = size;
+      userdata->size = entry->size;
+
+      /* A RAR 5 member may have a BLAKE2 hash in place of its CRC */
+      if (userdata->crc_wanted && !entry->has_crc)
+      {
+         userdata->crc = 0;
+         if (rrar_archive_extract_sink(ctx->archive, ctx->parse_index,
+                  rar_crc_write, &userdata->crc) != RRAR_OK)
+            return -1;
+      }
 
       /* The entry index travels in cdata; the packed size is reported
        * only for progress. */
       if (file_cb && !file_cb(userdata->current_file_path, valid_exts,
                (const uint8_t*)(size_t)ctx->parse_index, 0,
-               entry->packed_size > (uint64_t)0xFFFFFFFFu
-               ? 0xFFFFFFFFu : (uint32_t)entry->packed_size,
-               size, entry->crc, userdata))
+               entry->packed_size, entry->size, userdata->crc, userdata))
          return 0;
    }
 

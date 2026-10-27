@@ -1,5 +1,4 @@
-/* winraw: the keyboard and mouse read in bulk by the poll (the
- * default; RETROARCH_RAWINPUT_POLL=0 turns it off).
+/* winraw: the keyboard and mouse read in bulk by the poll.
  *
  * The real driver, cross-built with mingw-w64 and run under Wine on a
  * virtual display. The window that has the focus is made and pumped
@@ -9,10 +8,7 @@
  *
  * Checked here:
  *
- * - with the switch off the driver is as it was: its window is made by
- *   init, on init's thread, and nothing is read in bulk;
- * - with it on, init makes no window; the first poll does, on the
- *   polling thread;
+ * - init makes no window; the first poll does, on the polling thread;
  * - keys injected with SendInput() while nothing pumps are all there
  *   after one poll: in the key table, and as key events delivered on
  *   the polling thread, in order, with the modifier held at the time;
@@ -35,8 +31,6 @@
  *   driver;
  * - which modifier keys are held is read from the key table, and only
  *   the lock keys' toggles from the published value;
- * - background input is refused, unless registered as a sink with the
- *   main window focused;
  * - free takes the window down, and twenty restarts each do the same;
  * - with everything on one thread, as without threaded video, the
  *   same holds.
@@ -153,7 +147,9 @@ void input_driver_publish_touches(const uint32_t *pos, unsigned count,
       unsigned present, unsigned down)
 { (void)pos; (void)count; (void)present; (void)down; }
 unsigned input_driver_pointer_read_as(unsigned i) { (void)i; return 0; }
-uintptr_t video_driver_window_get(void) { return 0; }
+/* the main window, as the video driver has it */
+static HWND stub_video_window;
+uintptr_t video_driver_window_get(void) { return (uintptr_t)stub_video_window; }
 void win32_clip_window(bool grab) { (void)grab; }
 void win32_hotplug_arm(void) { }
 bool win32_hotplug_due(void) { return false; }
@@ -184,10 +180,6 @@ enum retro_key input_keymaps_translate_keysym_to_rk(unsigned sym)
 
 static uint16_t published_mods;
 uint16_t win32_get_keyboard_mods(void) { return published_mods; }
-
-/* whether the controller driver can stay across a video restart */
-static bool joypad_can_stay;
-bool winraw_joypad_survives_video(void) { return joypad_can_stay; }
 
 /* the controller driver's entry for reports read in bulk */
 static unsigned hid_taken;
@@ -325,37 +317,10 @@ int main(void)
    if (!vt_window)
       printf("   note no display for a window: injected input is not checked\n");
 
-   /* ---- the switch off: as it was -------------------------------- */
-   _putenv("RETROARCH_RAWINPUT_POLL=0");
    wr = (winraw_input_t*)init_on_video_thread();
-   CHECK(wr != NULL, "init with the switch off");
+   CHECK(wr != NULL, "init");
    if (!wr)
       return 1;
-   CHECK(!wr->poll_drain, "reading in bulk with the switch off");
-   CHECK(wr->window && GetWindowThreadProcessId(wr->window, NULL) == vt_tid,
-         "with the switch off the window is not made by init, on init's thread");
-   CHECK(winraw_drain_tid == 0, "a bulk-read thread is set with the switch off");
-   joypad_can_stay = true;
-   CHECK(!input_winraw.survives_video(wr),
-         "not read by the poll, the driver says it survives a video restart");
-   winraw_poll(wr);
-   CHECK(wr->drain_reads == 0, "a bulk read was made with the switch off");
-   raw_window = wr->window;
-   /* destroyed by its own thread, as the frontend does */
-   SetWindowLongPtr(raw_window, GWLP_USERDATA, 0);
-   PostMessageA(raw_window, WM_CLOSE, 0, 0);
-   wr->window = NULL;
-   winraw_free(wr);
-   printf("   ok   =0: the window is made by init on init's thread, nothing read in bulk\n");
-
-   /* ---- the switch on -------------------------------------------- */
-   /* unset: on is the default */
-   _putenv("RETROARCH_RAWINPUT_POLL=");
-   wr = (winraw_input_t*)init_on_video_thread();
-   CHECK(wr != NULL, "init with nothing set");
-   if (!wr)
-      return 1;
-   CHECK(wr->poll_drain && !wr->sink, "not reading in bulk by default");
    CHECK(!wr->window, "init made the window");
    winraw_poll(wr);
    raw_window = wr->window;
@@ -365,19 +330,13 @@ int main(void)
          "the window belongs to thread %lu; the poll's is %lu, init's %lu",
          (unsigned long)GetWindowThreadProcessId(raw_window, NULL),
          (unsigned long)main_tid, (unsigned long)vt_tid);
-   printf("   ok   by default: init makes no window; the first poll does, on the polling thread\n");
+   printf("   ok   init makes no window; the first poll does, on the polling thread\n");
 
    /* ---- left running across a video driver restart ---------------- */
-   /* Read by the poll, with a joypad driver that can stay too: yes.
-    * With one that cannot: no. */
-   joypad_can_stay = true;
+   /* Read by the poll: yes. The joypad driver answers for itself. */
    CHECK(input_winraw.survives_video && input_winraw.survives_video(wr),
          "read by the poll, the driver does not say it survives a video restart");
-   joypad_can_stay = false;
-   CHECK(!input_winraw.survives_video(wr),
-         "the driver says it survives with a joypad driver that does not");
-   joypad_can_stay = true;
-   printf("   ok   survives a video driver restart: yes read by the poll, no if the joypad driver cannot\n");
+   printf("   ok   survives a video driver restart: yes read by the poll\n");
 
    /* ---- injected keys, read in bulk by one poll ------------------ */
    if (vt_window)
@@ -629,21 +588,61 @@ int main(void)
       printf("   ok   modifiers: held keys from the key table, toggles from the published value\n");
    }
 
-   /* ---- background input ----------------------------------------- */
+   /* ---- focus, read once a poll ---------------------------------- */
    {
-      CHECK(!winraw_in_background(wr, RIM_INPUT), "foreground input refused");
-      CHECK(winraw_in_background(wr, RIM_INPUTSINK), "background input taken");
-      wr->sink     = true;
-      retro_atomic_store_release_int(&winraw_focus_flag, 0);
-      CHECK(winraw_in_background(wr, RIM_INPUTSINK),
-            "a sink took input with the main window unfocused");
+      static const uint16_t key  = RETROK_a;
+      static const uint8_t  bind = RARCH_FIRST_META_KEY;
+      uint32_t down              = 0;
+
       retro_atomic_store_release_int(&winraw_focus_flag, 1);
-      CHECK(!winraw_in_background(wr, RIM_INPUTSINK),
-            "a sink refused input with the main window focused");
-      wr->sink     = false;
+      winraw_poll(wr);
+      wr->kb_keys[rarch_keysym_lut[RETROK_a]] = 1;
+      winraw_keys_down(wr, 0, &key, &bind, 1, &down);
+      CHECK(down == 1, "a key held with the window focused is not down");
+      /* the focus goes between polls: the frame goes by its poll's */
       retro_atomic_store_release_int(&winraw_focus_flag, 0);
-      printf("   ok   background input: refused, unless a sink with the main window focused\n");
+      down = 0;
+      winraw_keys_down(wr, 0, &key, &bind, 1, &down);
+      CHECK(down == 1, "a frame read two focus values");
+      /* ... and the next poll by the new one */
+      winraw_poll(wr);
+      down = 0;
+      winraw_keys_down(wr, 0, &key, &bind, 1, &down);
+      CHECK(down == 0, "the poll after the focus went still had it");
+      memset(wr->kb_keys, 0, SC_LAST);
+      printf("   ok   focus: read once a poll, and the frame goes by it\n");
    }
+
+   /* ---- focus left unfocused by a restart ------------------------ */
+   /* A video driver restart can leave the focus flag unfocused with
+    * the main window in front, and no message comes to put it right:
+    * the window is asked when the flag says unfocused. */
+   if (vt_window && GetForegroundWindow() == vt_window)
+   {
+      static const uint16_t key  = RETROK_a;
+      static const uint8_t  bind = RARCH_FIRST_META_KEY;
+      uint32_t down              = 0;
+
+      retro_atomic_store_release_int(&winraw_focus_flag, 0);
+      stub_video_window = vt_window;
+      winraw_poll(wr);
+      wr->kb_keys[rarch_keysym_lut[RETROK_a]] = 1;
+      winraw_keys_down(wr, 0, &key, &bind, 1, &down);
+      CHECK(down == 1, "the main window in front, a stale unfocused flag kept the key");
+      CHECK(!retro_atomic_load_acquire_int(&winraw_focus_flag),
+            "the poll wrote the flag the window procedure owns");
+      /* a main window that is not in front stays unfocused */
+      stub_video_window = raw_window;
+      winraw_poll(wr);
+      down = 0;
+      winraw_keys_down(wr, 0, &key, &bind, 1, &down);
+      CHECK(down == 0, "a main window not in front was taken as focused");
+      stub_video_window = NULL;
+      memset(wr->kb_keys, 0, SC_LAST);
+      printf("   ok   focus: a stale unfocused flag with the main window in front\n");
+   }
+   else
+      printf("   note no foreground window: the stale focus lane is not checked\n");
 
    /* ---- free ----------------------------------------------------- */
    winraw_free(wr);

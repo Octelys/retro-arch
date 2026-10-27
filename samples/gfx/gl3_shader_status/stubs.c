@@ -1,10 +1,38 @@
 /* What gfx/drivers_shader/shader_gl3.c links against beyond the code
- * under test: none of it is reached by gl3_cross_compile_program, so
- * each is an empty stand-in. Declared here without the headers, as
- * only their names have to resolve. */
+ * under test: none of it but rslc's printer is reached by
+ * gl3_cross_compile_program, so each is an empty stand-in. Declared
+ * here without the headers, as only their names have to resolve. */
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* rslc: a source for each stage it prints, and for each of the
+ * driver's own stages a one-word module beside it */
+static char *stub_text(void)
+{
+   static const char text[] = "void main() {}\n";
+   char *s = (char*)malloc(sizeof(text));
+   if (s)
+      memcpy(s, text, sizeof(text));
+   return s;
+}
+char *slang_print_stage(const char *source, bool fragment, const void *t)
+{ (void)source; (void)fragment; (void)t; return stub_text(); }
+struct slang_blob *slang_blob_adopt_words(uint32_t *words, size_t nwords);
+bool slang_compile_builtin(const char *source, bool fragment,
+      const void *t, struct slang_blob **blob, char **text)
+{
+   uint32_t *word = (uint32_t*)calloc(1, sizeof(*word));
+   (void)source; (void)fragment; (void)t;
+   *blob = word ? slang_blob_adopt_words(word, 1) : NULL;
+   *text = stub_text();
+   return *blob && *text;
+}
+bool slang_compile_remapped(void) { return false; }
+void rslc_result_free(void *r) { (void)r; }
 
 void RARCH_LOG(const char *fmt, ...)  { (void)fmt; }
 void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
@@ -24,14 +52,17 @@ void image_texture_free(void *t) { (void)t; }
 
 int  glslang_compile_shader(void) { return 0; }
 int  glslang_compile_shader_cached(void) { return 0; }
+int  glslang_compile_shader_text(void) { return 0; }
 const char *glslang_format_to_string(int f) { (void)f; return ""; }
 void *glslang_include_cache_new(void) { return NULL; }
 void glslang_include_cache_free(void *c) { (void)c; }
-int  glslang_last_pass_needs_target(const void *s, void *c)
-{ (void)s; (void)c; return 0; }
+void glslang_last_pass_init(const void *s, void *c, void *state)
+{ (void)s; (void)c; (void)state; }
+int slang_last_pass_feedback(void *s, const void *o)
+{ (void)s; (void)o; return 0; }
 unsigned glslang_num_miplevels(unsigned w, unsigned h) { (void)w; (void)h; return 1; }
 void glslang_output_free(void *o) { (void)o; }
-int  slang_reflect_spirv(void) { return 0; }
+int  slang_reflect_pass(void) { return 0; }
 void slang_reflection_free(void *r) { (void)r; }
 void slang_reflection_init(void *r) { (void)r; }
 void slang_semantic_name_map_free(void *m) { (void)m; }

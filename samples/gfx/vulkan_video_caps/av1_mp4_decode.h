@@ -3,6 +3,47 @@
 #include <formats/rmp4_video.h>
 #include "av1_core_decode.h"
 
+static int av1_mp4_seek_frame(rmp4_video_stream_t *stream,
+      oracle_readback_t *reader, const hevc_fixture_t *fixture,
+      const char *path, unsigned expected)
+{
+   video_hw_frame_t frame;
+   unsigned tries;
+   int ret = 0;
+   int64_t target = (int64_t)expected * 1000000000 / 24;
+   oracle_release(reader);
+   if (!rmp4_video_stream_seek_begin_ns(stream, target)) return 0;
+   for (tries = 0; tries < 8192; tries++)
+   {
+      ret = rmp4_video_stream_seek_step(stream, NULL);
+      if (ret) break;
+      vkDeviceWaitIdle(vvd.device);
+   }
+   if (ret != 1 || tries == 8192) return 0;
+   for (tries = 0; tries < 8192; tries++)
+   {
+      if (rmp4_video_stream_next(stream, NULL)) break;
+      if (!rmp4_video_stream_waiting(stream)) return 0;
+      vkDeviceWaitIdle(vvd.device);
+   }
+   if (tries == 8192 || !rmp4_video_stream_hw_frame(stream, &frame)) return 0;
+   if (!av1_hdr_frame_matches(path, &frame))
+   {
+      video_hw_frame_abandon(&frame);
+      return 0;
+   }
+   if (getenv("AV1_TEST_HDR_TIMELINE") &&
+         (frame.color.max_cll != (expected >= 5 ? 2000u : 1000u) ||
+          frame.color.max_fall != (expected >= 5 ? 600u : 400u)))
+   {
+      fprintf(stderr, "FAIL AV1 seek HDR timeline at picture %u: %u/%u\n",
+            expected, frame.color.max_cll, frame.color.max_fall);
+      video_hw_frame_abandon(&frame);
+      return 0;
+   }
+   return oracle_read_frame(reader, frame, fixture, &expected);
+}
+
 static int av1_mp4_decode_fixture(void)
 {
    const char *path = getenv("AV1_TEST_MP4"),
@@ -19,6 +60,7 @@ static int av1_mp4_decode_fixture(void)
    video_hw_frame_t frame;
    const rmp4_track *track = NULL;
    unsigned count = 0, i, plane, x, y, bps, tries, probe;
+   unsigned retire_index = 0;
    int ok = 0, ret;
    memset(&fixture, 0, sizeof(fixture));
    fixture.name = "av1_mp4";
@@ -86,6 +128,14 @@ static int av1_mp4_decode_fixture(void)
    stream = rmp4_video_stream_open_hw_avail(data, size, size, NULL, NULL, NULL);
    if (!stream || !rmp4_video_stream_set_hw(stream, 1))
       goto done;
+   if (getenv("AV1_TEST_SEEK"))
+   {
+      if (fixture.frames < 10 ||
+          !av1_mp4_seek_frame(stream, reader, &fixture, path, 9)) goto done;
+      puts("AV1 MP4 early seek before first display: pixels and metadata PASS");
+      oracle_release(reader);
+      rmp4_video_stream_rewind(stream);
+   }
    for (tries = 0; tries < 4096; tries++)
    {
       if (!rmp4_video_stream_next(stream, NULL))
@@ -97,11 +147,13 @@ static int av1_mp4_decode_fixture(void)
          continue;
       }
       if (!rmp4_video_stream_hw_frame(stream, &frame) ||
+          !av1_hdr_frame_matches(path, &frame) ||
           !oracle_read_frame(reader, frame, &fixture, &count))
          goto done;
    }
    if (count != fixture.frames)
       goto done;
+   retire_index = count - 1;
    if (count > 2)
    {
       oracle_release(reader);
@@ -132,6 +184,18 @@ static int av1_mp4_decode_fixture(void)
       if (!rmp4_video_stream_hw_frame(stream, &frame) ||
           !oracle_read_frame(reader, frame, &fixture, &probe) || probe != 3)
          goto done;
+      retire_index = probe - 1;
+   }
+   if (getenv("AV1_TEST_STATIC_HDR") || getenv("AV1_TEST_SEEK"))
+   {
+      unsigned attempt;
+      for (attempt = 0; attempt < 3; attempt++)
+      {
+         unsigned expected = attempt == 1 ? 0 : 9;
+         if (!av1_mp4_seek_frame(stream, reader, &fixture, path, expected)) goto done;
+         retire_index = expected;
+      }
+      puts("AV1 static HDR metadata survives seek/reset PASS");
    }
    ok = 1;
 done:
@@ -139,7 +203,7 @@ done:
    rmp4_video_stream_close(stream);
    if (ok && !getenv("AV1_TEST_CORE") && reader && reader->held_count && count)
    {
-      unsigned replay = count > 2 ? 2 : count - 1;
+      unsigned replay = retire_index;
       frame = reader->held[--reader->held_count];
       ok = oracle_read_frame(reader, frame, &fixture, &replay);
    }

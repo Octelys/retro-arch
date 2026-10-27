@@ -399,6 +399,47 @@ int main(int argc, char **argv)
                resized++;
          }
 
+         {
+            unsigned old_scale = settings->uints.video_scale;
+            bool old_save = settings->bools.video_window_save_positions;
+            int core;
+            settings->uints.video_scale = 3;
+            settings->bools.video_window_save_positions = false;
+            for (core = 0; core < 2; core++)
+            {
+               RECT requested, before, after;
+               bool same;
+               stub_set_geometry(320, 240);
+               requested.left = requested.top = 0;
+               requested.right = 900;
+               requested.bottom = 660;
+               AdjustWindowRectEx(&requested,
+                     GetWindowLongPtr(hwnd, GWL_STYLE), GetMenu(hwnd) != NULL,
+                     GetWindowLongPtr(hwnd, GWL_EXSTYLE));
+               SetWindowPos(hwnd, NULL, 0, 0,
+                     requested.right - requested.left,
+                     requested.bottom - requested.top,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+               pump();
+               GetWindowRect(hwnd, &before);
+               if (core)
+                  stub_set_geometry(960, 720);
+               win32_has_focus(NULL);
+               pump();
+               GetWindowRect(hwnd, &after);
+               same = EqualRect(&before, &after) != 0;
+               if (same != (core == 0))
+               {
+                  fprintf(stderr, "FAIL focus geometry: changed=%u unchanged=%u\n",
+                        core != 0, same);
+                  return 1;
+               }
+            }
+            stub_set_geometry(320, 240);
+            settings->uints.video_scale = old_scale;
+            settings->bools.video_window_save_positions = old_save;
+         }
+
          /* A core whose picture is bigger than the window asked for,
           * with the menu bar on. The window code does not let a window
           * be smaller than the core's picture, so the window that
@@ -562,6 +603,70 @@ int main(int argc, char **argv)
             (kept && !IsWindow(kept)) ? "yes" : "no");
       trace(" focus messages from the window going down reached the input driver: %s\n",
             during ? "yes" : "no");
+   }
+
+   /* A window left up while minimised, taken by the next driver of its
+    * family - a device lost or a driver restarted with the window down
+    * on the taskbar. A minimised window has no client area, and the
+    * driver makes its surface for the client area it finds when it is
+    * handed the window: the window is put back up first, as a new
+    * window would be, and the surface is made for a window that has a
+    * size. */
+   {
+      WNDCLASSEX wndclass;
+      HWND kept = NULL, taken = NULL;
+      bool was_kept = false, mode_set = false, iconic = false;
+      unsigned dims = 0;
+
+      strlcpy(settings->arrays.input_driver, "raw",
+            sizeof(settings->arrays.input_driver));
+      settings->bools.video_fullscreen = false;
+      trace_on = false;
+
+      win32_window_reset();
+      win32_monitor_init();
+      memset(&wndclass, 0, sizeof(wndclass));
+      wndclass.lpfnWndProc = proc_for(FAM_VK, IN_WINRAW);
+      if (     win32_window_init(&wndclass, true, NULL)
+            && win32_set_video_mode(NULL, VIDEO_SCALE_PACK(640, 480), false))
+      {
+         kept = win32_get_window();
+         pump();
+         ShowWindow(kept, SW_MINIMIZE);
+         pump();
+         was_kept = win32_window_keep() && IsIconic(kept);
+         pump();
+
+         win32_window_reset();
+         win32_monitor_init();
+         stub_vk_surface_dims = 0;
+         memset(&wndclass, 0, sizeof(wndclass));
+         wndclass.lpfnWndProc = proc_for(FAM_VK, IN_WINRAW);
+         if (win32_window_init(&wndclass, true, NULL))
+            mode_set = win32_set_video_mode(NULL,
+                  VIDEO_SCALE_PACK(640, 480), false);
+         taken  = win32_get_window();
+         dims   = stub_vk_surface_dims;
+         iconic = taken && IsIconic(taken);
+         pump();
+
+         win32_window_release_kept();
+         if (taken)
+         {
+            win32_monitor_from_window();
+            win32_destroy_window();
+         }
+         pump();
+      }
+
+      trace_on = true;
+      trace("== a minimised window left up and taken\n");
+      trace(" kept minimised %s, taken %s, mode set %s, still minimised %s,"
+            " surface has a size %s\n",
+            was_kept ? "yes" : "no",
+            (kept && taken == kept) ? "yes" : "no",
+            mode_set ? "yes" : "no", iconic ? "yes" : "no",
+            (VIDEO_SCALE_W(dims) && VIDEO_SCALE_H(dims)) ? "yes" : "no");
    }
 
    /* A window carries the way it was presented on. A Vulkan or OpenGL

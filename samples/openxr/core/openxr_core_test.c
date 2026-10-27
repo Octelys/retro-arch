@@ -392,6 +392,7 @@ static uint32_t t_sc_images = 3;
 static uint32_t t_sc_images_second;
 static unsigned t_sc_count_queries;
 static unsigned t_sc_made, t_sc_destroyed, t_sc_created_total;
+static unsigned t_sc_destroyed_at_create;
 static XrResult t_sc_wait = XR_SUCCESS;
 static XrResult t_sc_release = XR_SUCCESS;
 static XrDuration t_sc_wait_timeout;
@@ -418,6 +419,7 @@ static uint32_t t_sc_refuse_width;   /* a width the runtime refuses */
 static XRAPI_ATTR XrResult XRAPI_CALL t_create_sc(XrSession s,
       const XrSwapchainCreateInfo *ci, XrSwapchain *out)
 {
+   t_sc_destroyed_at_create = t_sc_destroyed;
    if (t_sc_refuse_width && ci->width == t_sc_refuse_width)
       return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
    *out = (XrSwapchain)(uintptr_t)(0x100 + (++t_sc_created_total));
@@ -516,6 +518,7 @@ static unsigned t_waits, t_begins, t_ends, t_frame_unlocked;
 static unsigned t_discarded;
 static bool t_frame_open;
 static uint32_t t_last_layer_count;
+static unsigned t_sc_destroyed_at_end;
 static unsigned t_extra_cap;
 static XrResult t_wait_frame_res = XR_SUCCESS;
 static XrResult t_end_frame_res  = XR_SUCCESS;
@@ -556,6 +559,7 @@ static XRAPI_ATTR XrResult XRAPI_CALL t_end_frame(XrSession s,
    t_ends++;
    t_frame_open       = false;
    t_last_layer_count = ei->layerCount;
+   t_sc_destroyed_at_end = t_sc_destroyed;
    memset(t_layer_types, 0, sizeof(t_layer_types));
    for (i = 0; i < ei->layerCount && i < 4; i++)
       t_layer_types[i] = ei->layers[i]->type;
@@ -1189,6 +1193,106 @@ static bool t_pose_is(const video_xr_pose_t *p, float qy, float qw,
        && t_near(p->orientation.z, 0.0f) && t_near(p->orientation.w, qw)
        && t_near(p->position.x, x) && t_near(p->position.y, y)
        && t_near(p->position.z, z);
+}
+
+/* The latched seqlock the frame's shared state goes through: a writer
+ * stopped part way through a publication holds no reader up - they
+ * read the last whole one - and readers on two threads, with a writer
+ * going as fast as it can, never read two publications mixed. */
+#define T_LATCH_N 24
+static retro_atomic_int_t t_latch_seq;
+static retro_atomic_int_t t_latch_words[2 * T_LATCH_N];
+static retro_atomic_int_t t_latch_done;
+static unsigned t_latch_mixed[2], t_latch_back[2];
+
+static void t_latch_writer(void *data)
+{
+   int v[T_LATCH_N];
+   int n, i;
+   (void)data;
+   for (n = 1; n <= 100000; n++)
+   {
+      for (i = 0; i < T_LATCH_N; i++)
+         v[i] = n;
+      openxr_seq_publish(&t_latch_seq, t_latch_words, v, sizeof(v));
+   }
+   retro_atomic_store_release_int(&t_latch_done, 1);
+}
+
+static void t_latch_reader(void *data)
+{
+   unsigned who = *(unsigned*)data;
+   int last     = 0;
+   while (!retro_atomic_load_acquire_int(&t_latch_done))
+   {
+      int v[T_LATCH_N];
+      int i;
+      openxr_seq_read(&t_latch_seq, t_latch_words, v, sizeof(v));
+      for (i = 1; i < T_LATCH_N; i++)
+         if (v[i] != v[0])
+            t_latch_mixed[who]++;
+      if (v[0] < last)
+         t_latch_back[who]++;
+      last = v[0];
+   }
+}
+
+static void test_seq_latch(void)
+{
+   int a[T_LATCH_N], b[T_LATCH_N], got[T_LATCH_N];
+   unsigned i, who[2] = { 0, 1 };
+   sthread_t *w, *r0, *r1;
+
+   for (i = 0; i < T_LATCH_N; i++)
+   {
+      a[i] = (int)i + 1;
+      b[i] = (int)i + 100;
+   }
+   openxr_seq_publish(&t_latch_seq, t_latch_words, a, sizeof(a));
+   openxr_seq_read(&t_latch_seq, t_latch_words, got, sizeof(got));
+   CHECK(!memcmp(a, got, sizeof(a)), "latch: a publication not read back");
+
+   /* a writer stopped half way through copy 0: the reader goes on with
+    * the last whole publication, at once */
+   {
+      int s = retro_atomic_load_relaxed_int(&t_latch_seq);
+      retro_atomic_store_release_int(&t_latch_seq, s + 1);
+      for (i = 0; i < T_LATCH_N / 2; i++)
+         retro_atomic_store_relaxed_int(&t_latch_words[i], -1);
+      openxr_seq_read(&t_latch_seq, t_latch_words, got, sizeof(got));
+      CHECK(!memcmp(a, got, sizeof(a)),
+            "latch: a writer stopped part way through was read");
+      retro_atomic_store_release_int(&t_latch_seq, s);
+   }
+   openxr_seq_publish(&t_latch_seq, t_latch_words, b, sizeof(b));
+   openxr_seq_read(&t_latch_seq, t_latch_words, got, sizeof(got));
+   CHECK(!memcmp(b, got, sizeof(b)), "latch: the next publication not read back");
+
+   /* one writer, two readers */
+   for (i = 0; i < T_LATCH_N; i++)
+      a[i] = 0;
+   openxr_seq_publish(&t_latch_seq, t_latch_words, a, sizeof(a));
+   retro_atomic_store_release_int(&t_latch_done, 0);
+   r0 = sthread_create(t_latch_reader, &who[0]);
+   r1 = sthread_create(t_latch_reader, &who[1]);
+   w  = sthread_create(t_latch_writer, NULL);
+   CHECK(r0 && r1 && w, "latch: no threads");
+   if (w)
+      sthread_join(w);
+   else
+      retro_atomic_store_release_int(&t_latch_done, 1);
+   if (r0)
+      sthread_join(r0);
+   if (r1)
+      sthread_join(r1);
+   CHECK(!t_latch_mixed[0] && !t_latch_mixed[1],
+         "latch: a read mixed two publications (%u, %u)",
+         t_latch_mixed[0], t_latch_mixed[1]);
+   CHECK(!t_latch_back[0] && !t_latch_back[1],
+         "latch: a read went back to an older publication");
+   openxr_seq_read(&t_latch_seq, t_latch_words, got, sizeof(got));
+   CHECK(got[0] == 100000 && got[T_LATCH_N - 1] == 100000,
+         "latch: the newest was not read once the writer stopped");
 }
 
 static void test_frame(void)
@@ -3319,6 +3423,277 @@ static void test_frame_inline(void)
    openxr_frame_stop_inline(&f);
    openxr_slot_destroy(&sc, 1);
    openxr_slot_destroy(&sc, OPENXR_PROJECTION_SLOT);
+   t_frame_free(&rt, &s, &f);
+}
+
+/* One in-line headset frame, drawn. */
+static void t_drawn_frame(openxr_frame_t *f)
+{
+   openxr_frame_begun_t b;
+   if (openxr_frame_begin(f, &b))
+   {
+      b.render = true;
+      openxr_frame_end(f, &b);
+   }
+}
+
+/* A slot made again at another size shows its old swapchains until the
+ * new ones have an image, and frees them after the xrEndFrame that
+ * shows the new ones; a forgotten slot shows neither. */
+static void test_slot_resize(void)
+{
+   openxr_runtime_t rt;
+   openxr_session_t s;
+   openxr_swapchains_t sc;
+   openxr_frame_t f;
+   openxr_frame_begun_t b;
+   video_xr_quad_set_t set;
+   XrSwapchain old0;
+   uint32_t max_layers;
+   unsigned n = 0, i, destroyed, idx[2];
+   const unsigned menu = VIDEO_XR_MENU_SLOT;
+   int cb_user         = 0;
+
+   t_sc_wait          = XR_SUCCESS;
+   t_sc_refuse_width  = 0;
+   t_sc_images        = 3;
+   t_sc_images_second = 0;
+   t_listed_got       = -1;
+   t_frame_fresh(&rt, &s, &sc, &f);
+   CHECK(openxr_frame_start_inline(&f), "resize: in-line start");
+   t_push_state(T_SESSION, XR_SESSION_STATE_READY);
+   CHECK(openxr_frame_begin(&f, &b), "resize: first frame");
+   openxr_frame_end(&f, &b);
+   retro_atomic_store_release_int(&s.state, XR_SESSION_STATE_FOCUSED);
+
+   memset(&set, 0, sizeof(set));
+   set.num_quads     = 1;
+   set.quads[0].slot = 1;
+   openxr_frame_publish(&f, &set);
+   CHECK(     openxr_slot_create(&sc, 1, 44, false, VIDEO_SCALE_PACK(64, 64),
+               1, t_images_cb, &cb_user, &n)
+         && openxr_slot_acquire(&sc, 1, idx), "resize: 64");
+   openxr_slot_release(&sc, 1);
+   old0 = sc.slots[1].swapchains[0];
+   t_drawn_frame(&f);
+   CHECK(t_last_layer_count == 1 && t_quad.subImage.swapchain == old0,
+         "resize: 64 not shown");
+
+   /* Until the new swapchain has an image, the old one shows at its own
+    * size. */
+   destroyed     = t_sc_destroyed;
+   t_sc_unlocked = 0;
+   CHECK(openxr_slot_create(&sc, 1, 44, false, VIDEO_SCALE_PACK(96, 64), 1,
+            t_images_cb, &cb_user, &n), "resize: 96");
+   CHECK(     t_sc_destroyed == destroyed && sc.slots[1].old[0] == old0
+         && sc.slots[1].swapchains[0] != old0,
+         "resize: the shown swapchain destroyed at the resize");
+   t_drawn_frame(&f);
+   CHECK(     t_last_layer_count == 1 && t_quad.subImage.swapchain == old0
+         && t_quad.subImage.imageRect.extent.width == 64,
+         "resize: %u layers between the resize and the release, width %d",
+         t_last_layer_count, (int)t_quad.subImage.imageRect.extent.width);
+
+   /* Released: the next frame shows the new one, and the old one goes
+    * after that frame's xrEndFrame, under the lock, once. */
+   CHECK(openxr_slot_acquire(&sc, 1, idx), "resize: acquire 96");
+   openxr_slot_release(&sc, 1);
+   t_drawn_frame(&f);
+   CHECK(     t_last_layer_count == 1
+         && t_quad.subImage.swapchain == sc.slots[1].swapchains[0]
+         && t_quad.subImage.imageRect.extent.width == 96,
+         "resize: 96 not shown after its release");
+   CHECK(     t_sc_destroyed_at_end == destroyed
+         && t_sc_destroyed == destroyed + 1 && !sc.slots[1].old[0]
+         && !t_sc_unlocked,
+         "resize: old swapchain: %u destroyed by xrEndFrame, %u after, "
+         "%u unlocked", t_sc_destroyed_at_end - destroyed,
+         t_sc_destroyed - destroyed, t_sc_unlocked);
+   t_drawn_frame(&f);
+   CHECK(t_sc_destroyed == destroyed + 1,
+         "resize: an old swapchain destroyed twice");
+
+   /* A second resize before the first's image: the shown swapchain
+    * stays, the one never shown goes at once. */
+   old0      = sc.slots[1].swapchains[0];
+   destroyed = t_sc_destroyed;
+   CHECK(     openxr_slot_create(&sc, 1, 44, false,
+               VIDEO_SCALE_PACK(128, 64), 1, t_images_cb, &cb_user, &n)
+         && openxr_slot_create(&sc, 1, 44, false,
+               VIDEO_SCALE_PACK(160, 64), 1, t_images_cb, &cb_user, &n),
+         "resize: twice");
+   CHECK(t_sc_destroyed_at_create == destroyed + 1,
+         "resize: the 128 swapchain destroyed after the 160 one was made: "
+         "%u before", t_sc_destroyed_at_create - destroyed);
+   t_drawn_frame(&f);
+   CHECK(     t_sc_destroyed == destroyed + 1 && sc.slots[1].old[0] == old0
+         && t_last_layer_count == 1 && t_quad.subImage.swapchain == old0
+         && t_quad.subImage.imageRect.extent.width == 96,
+         "resize: a second resize lost the shown image: %u destroyed, "
+         "%u layers", t_sc_destroyed - destroyed, t_last_layer_count);
+   CHECK(openxr_slot_acquire(&sc, 1, idx), "resize: acquire 160");
+   openxr_slot_release(&sc, 1);
+   t_drawn_frame(&f);
+   CHECK(     t_sc_destroyed == destroyed + 2
+         && t_quad.subImage.imageRect.extent.width == 160,
+         "resize: 160 after its release");
+
+   /* A size the runtime refuses: nothing kept, old or new. */
+   destroyed         = t_sc_destroyed;
+   CHECK(     openxr_slot_create(&sc, 1, 44, false,
+               VIDEO_SCALE_PACK(192, 64), 1, t_images_cb, &cb_user, &n)
+         && sc.slots[1].old[0], "refused: no old set before the refusal");
+   t_sc_refuse_width = 4096;
+   CHECK(!openxr_slot_create(&sc, 1, 44, false, VIDEO_SCALE_PACK(4096, 64),
+            1, t_images_cb, &cb_user, &n), "refused: made");
+   t_sc_refuse_width = 0;
+   CHECK(     t_sc_destroyed == destroyed + 2 && !sc.slots[1].swapchains[0]
+         && !sc.slots[1].old[0]
+         && !retro_atomic_load_acquire_int(&sc.slots[1].content)
+         && !retro_atomic_load_acquire_int(&sc.slots[1].old_layers),
+         "refused: %u destroyed", t_sc_destroyed - destroyed);
+
+   /* Refused while a set with an image shows: it and the superseded old
+    * set both go. */
+   CHECK(     openxr_slot_create(&sc, 1, 44, false, VIDEO_SCALE_PACK(64, 64),
+               1, t_images_cb, &cb_user, &n)
+         && openxr_slot_acquire(&sc, 1, idx), "refused shown: 64");
+   openxr_slot_release(&sc, 1);
+   CHECK(     openxr_slot_create(&sc, 1, 44, false, VIDEO_SCALE_PACK(96, 64),
+               1, t_images_cb, &cb_user, &n)
+         && openxr_slot_acquire(&sc, 1, idx), "refused shown: 96");
+   openxr_slot_release(&sc, 1);
+   CHECK(     sc.slots[1].old[0]
+         && retro_atomic_load_acquire_int(&sc.slots[1].content),
+         "refused shown: no old set beside a shown one");
+   destroyed         = t_sc_destroyed;
+   t_sc_refuse_width = 4096;
+   CHECK(!openxr_slot_create(&sc, 1, 44, false, VIDEO_SCALE_PACK(4096, 64),
+            1, t_images_cb, &cb_user, &n), "refused shown: made");
+   t_sc_refuse_width = 0;
+   CHECK(     t_sc_destroyed == destroyed + 2 && !sc.slots[1].swapchains[0]
+         && !sc.slots[1].old[0]
+         && !retro_atomic_load_acquire_int(&sc.slots[1].content)
+         && !retro_atomic_load_acquire_int(&sc.slots[1].old_layers),
+         "refused shown: %u destroyed", t_sc_destroyed - destroyed);
+
+   /* Mono to stereo while the mono swapchain shows: the right eye's
+    * layer 1 is left out, never read from a set that lacks it. */
+   memset(&set, 0, sizeof(set));
+   set.num_quads     = 1;
+   set.quads[0].slot = 2;
+   openxr_frame_publish(&f, &set);
+   CHECK(     openxr_slot_create(&sc, 2, 44, false, VIDEO_SCALE_PACK(64, 64),
+               1, t_images_cb, &cb_user, &n)
+         && openxr_slot_acquire(&sc, 2, idx), "stereo: mono");
+   openxr_slot_release(&sc, 2);
+   old0 = sc.slots[2].swapchains[0];
+   CHECK(openxr_slot_create(&sc, 2, 44, false, VIDEO_SCALE_PACK(64, 64), 2,
+            t_images_cb, &cb_user, &n), "stereo: two layers");
+   set.num_quads      = 2;
+   set.quads[0].eye   = VIDEO_XR_EYE_LEFT;
+   set.quads[1].slot  = 2;
+   set.quads[1].eye   = VIDEO_XR_EYE_RIGHT;
+   set.quads[1].layer = 1;
+   openxr_frame_publish(&f, &set);
+   {
+      XrCompositionLayerQuad layers[VIDEO_XR_MAX_QUADS];
+      const XrCompositionLayerBaseHeader *ptrs[VIDEO_XR_MAX_QUADS];
+      unsigned got = openxr_frame_layers(&f, layers, ptrs);
+      CHECK(     got == 1 && layers[0].subImage.swapchain == old0
+            && layers[0].eyeVisibility == XR_EYE_VISIBILITY_LEFT,
+            "stereo: %u layers from the old mono set", got);
+      CHECK(openxr_slot_acquire(&sc, 2, idx), "stereo: acquire");
+      openxr_slot_release(&sc, 2);
+      got = openxr_frame_layers(&f, layers, ptrs);
+      CHECK(     got == 2
+            && layers[0].subImage.swapchain == sc.slots[2].swapchains[0]
+            && layers[1].subImage.swapchain == sc.slots[2].swapchains[1],
+            "stereo: %u new layers", got);
+   }
+
+   /* Made again before the release's frame: the superseded mono set
+    * goes first. */
+   destroyed = t_sc_destroyed;
+   CHECK(     openxr_slot_create(&sc, 2, 44, false, VIDEO_SCALE_PACK(96, 64),
+               1, t_images_cb, &cb_user, &n)
+         && t_sc_destroyed_at_create == destroyed + 1,
+         "remade: the mono set destroyed after the next one was made: "
+         "%u before", t_sc_destroyed_at_create - destroyed);
+
+   /* Destroyed before the old set's frame: both sets go, under the
+    * lock. */
+   destroyed     = t_sc_destroyed;
+   t_sc_unlocked = 0;
+   openxr_slot_destroy(&sc, 2);
+   CHECK(     t_sc_destroyed == destroyed + 3 && !t_sc_unlocked
+         && !sc.slots[2].swapchains[0] && !sc.slots[2].old[0]
+         && !retro_atomic_load_acquire_int(&sc.slots[2].old_layers),
+         "destroy: %u of 3 swapchains, %u unlocked",
+         t_sc_destroyed - destroyed, t_sc_unlocked);
+
+   /* The menu resized: its old swapchain is still the menu's at the
+    * runtime's layer count. */
+   CHECK(     openxr_slot_create(&sc, menu, 44, false,
+               VIDEO_SCALE_PACK(64, 64), 1, t_images_cb, &cb_user, &n)
+         && openxr_slot_acquire(&sc, menu, idx), "menu");
+   openxr_slot_release(&sc, menu);
+   old0 = sc.slots[menu].swapchains[0];
+   CHECK(openxr_slot_create(&sc, menu, 44, false, VIDEO_SCALE_PACK(96, 64),
+            1, t_images_cb, &cb_user, &n), "menu: resize");
+   max_layers    = rt.max_layers;
+   rt.max_layers = 3;
+   {
+      XrCompositionLayerQuad q[4];
+      const XrCompositionLayerBaseHeader *kept[4];
+      memset(q, 0, sizeof(q));
+      for (i = 0; i < 4; i++)
+         kept[i] = (const XrCompositionLayerBaseHeader*)&q[i];
+      q[0].subImage.swapchain = sc.slots[1].swapchains[0];
+      q[1].subImage.swapchain = sc.slots[1].swapchains[0];
+      q[2].subImage.swapchain = old0;
+      CHECK(     openxr_frame_fit(&f, kept, 4, 0, 3) == 3
+            && kept[0] == (const XrCompositionLayerBaseHeader*)&q[0]
+            && kept[1] == (const XrCompositionLayerBaseHeader*)&q[2]
+            && kept[2] == (const XrCompositionLayerBaseHeader*)&q[3],
+            "fit: the menu's old swapchain dropped as a screen");
+   }
+   rt.max_layers = max_layers;
+
+   /* Closed before its new image: neither set shows, the old one goes at
+    * the next xrEndFrame, and a menu back at another size shows nothing
+    * until its release. */
+   memset(&set, 0, sizeof(set));
+   set.num_quads     = 1;
+   set.quads[0].kind = VIDEO_XR_QUAD_MENU;
+   set.quads[0].slot = menu;
+   openxr_frame_publish(&f, &set);
+   t_drawn_frame(&f);
+   CHECK(t_last_layer_count == 1 && t_quad.subImage.swapchain == old0,
+         "menu: %u layers while resized", t_last_layer_count);
+   destroyed = t_sc_destroyed;
+   openxr_slot_forget(&sc, menu);
+   t_drawn_frame(&f);
+   CHECK(     !t_last_layer_count && t_sc_destroyed == destroyed + 1
+         && !sc.slots[menu].old[0],
+         "forget: %u layers, %u destroyed", t_last_layer_count,
+         t_sc_destroyed - destroyed);
+   CHECK(openxr_slot_create(&sc, menu, 44, false, VIDEO_SCALE_PACK(128, 64),
+            1, t_images_cb, &cb_user, &n), "forget: back at 128");
+   t_drawn_frame(&f);
+   CHECK(     !t_last_layer_count && t_sc_destroyed == destroyed + 2
+         && !sc.slots[menu].old[0],
+         "forget: the menu came back with its last image");
+   CHECK(openxr_slot_acquire(&sc, menu, idx), "forget: acquire");
+   openxr_slot_release(&sc, menu);
+   t_drawn_frame(&f);
+   CHECK(     t_last_layer_count == 1
+         && t_quad.subImage.swapchain == sc.slots[menu].swapchains[0],
+         "forget: the new image not shown");
+
+   openxr_frame_stop_inline(&f);
+   openxr_slot_destroy(&sc, 1);
+   openxr_slot_destroy(&sc, menu);
    t_frame_free(&rt, &s, &f);
 }
 
@@ -5997,6 +6372,7 @@ static void test_gl_host_records(void)
 static void test_gl_host_resize(void)
 {
    unsigned made;
+   XrSwapchain before, shown;
    gl_openxr_t *xr = t_gl_host_new();
    CHECK(xr, "host");
    if (!xr)
@@ -6008,18 +6384,21 @@ static void test_gl_host_resize(void)
          && t_gl_shown(NULL) == 1, "64: width %u, image %u",
          (unsigned)t_ci_width, t_gl_image_content(xr, 1, 1));
 
-   /* A new size waits for its image: the slot shows nothing while the
-    * runtime is busy, never the new size's quad over the old pixels. */
+   /* A new size waits for its image: the old one shows meanwhile, with
+    * its own quad. */
+   before    = xr->sc.slots[1].swapchains[0];
    t_sc_wait = XR_TIMEOUT_EXPIRED;
    CHECK(t_gl_draw(xr, 1, VIDEO_SCALE_PACK(128, 64), 2, 2, NULL)
          && t_gate_step(1), "second size");
-   CHECK(t_ci_width == 128 && !t_gl_shown(NULL)
-         && t_gl_image_content(xr, 1, 0) != 20,
+   CHECK(     t_ci_width == 128 && t_gl_shown(&shown) == 1
+         && shown == before && t_gl_image_content(xr, 1, 0) != 20,
          "128 busy: width %u, shown %u", (unsigned)t_ci_width,
          t_gl_shown(NULL));
    t_sc_wait = XR_SUCCESS;
    CHECK(t_gate_step(1), "frame");
-   CHECK(t_gl_image_content(xr, 1, 0) == 20 && t_gl_shown(NULL) == 1,
+   CHECK(     t_gl_image_content(xr, 1, 0) == 20
+         && t_gl_shown(&shown) == 1
+         && shown == xr->sc.slots[1].swapchains[0] && shown != before,
          "128: image %u, shown %u", t_gl_image_content(xr, 1, 0),
          t_gl_shown(NULL));
 
@@ -6164,6 +6543,7 @@ static void test_gl_host_projection(void)
    const unsigned dims = VIDEO_SCALE_PACK(96, 80);
    enum retro_vr_reference_space space = RETRO_VR_REFERENCE_SPACE_LOCAL;
    XrPosef origin;
+   XrSwapchain before;
    openxr_projection_t p, got;
    int seq;
    gl_openxr_t *xr = t_gl_host_new();
@@ -6236,18 +6616,22 @@ static void test_gl_host_projection(void)
          "carried: seq %d of %d, x %f", got.track_seq, seq + 2,
          t_proj_views[0].pose.position.x);
 
-   /* Another eye size, its image not copied yet: no projection, rather
-    * than the new size's extent over the old pixels, or the old one's
-    * over images the runtime has none of. */
+   /* Another eye size, its image not copied yet: the old images show,
+    * with the projection they were drawn for. */
+   before    = xr->sc.slots[slot].swapchains[0];
    t_sc_wait = XR_TIMEOUT_EXPIRED;
    p.width   = 100;
    p.height  = 90;
    CHECK(t_gl_draw(xr, slot, VIDEO_SCALE_PACK(128, 96), 2, 5, &p)
          && t_gate_step(1), "resized, busy");
-   CHECK(t_ci_width == 128
-         && t_layer_types[0] != XR_TYPE_COMPOSITION_LAYER_PROJECTION,
-         "resized, busy: width %u, type %d", (unsigned)t_ci_width,
-         (int)t_layer_types[0]);
+   CHECK(     t_ci_width == 128
+         && t_layer_types[0] == XR_TYPE_COMPOSITION_LAYER_PROJECTION
+         && t_proj_views[0].subImage.swapchain == before
+         && t_proj_views[0].subImage.imageRect.extent.width == 64
+         && t_proj_views[1].subImage.imageRect.extent.height == 48,
+         "resized, busy: width %u, type %d, extent %d",
+         (unsigned)t_ci_width, (int)t_layer_types[0],
+         (int)t_proj_views[0].subImage.imageRect.extent.width);
    t_sc_wait = XR_SUCCESS;
    CHECK(     t_gate_step(1)
          && t_layer_types[0] == XR_TYPE_COMPOSITION_LAYER_PROJECTION
@@ -6293,6 +6677,7 @@ int main(void)
    test_ring_threads();
    test_session();
    test_swapchain();
+   test_seq_latch();
    test_frame();
    test_frame_thread_hooks();
    test_frame_carried_seq();
@@ -6311,6 +6696,7 @@ int main(void)
    test_runtime_platform();
    test_runtime_gaps();
    test_frame_inline();
+   test_slot_resize();
    test_frame_perf();
    test_frame_rate_retry();
    test_binding_gles();

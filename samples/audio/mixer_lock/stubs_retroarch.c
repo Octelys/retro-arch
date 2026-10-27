@@ -75,6 +75,8 @@ struct audio_mixer_voice { int tag; };
 /* Called by every load stub, which is where a sound is built: the test
  * looks at whether the state lock is held while it is. */
 void (*stub_load_hook)(void) = NULL;
+unsigned stub_sound_destroys = 0;
+bool stub_play_fail = false;
 
 static audio_mixer_sound_t *new_sound_owning(void *data)
 {
@@ -133,6 +135,7 @@ void audio_mixer_destroy(audio_mixer_sound_t *sound)
 {
    if (!sound)
       return;
+   stub_sound_destroys++;
    if (sound->owned_data)
       free(sound->owned_data);
    free(sound);
@@ -144,7 +147,7 @@ audio_mixer_voice_t *audio_mixer_play(audio_mixer_sound_t *sound,
 {
    (void)sound; (void)repeat; (void)volume; (void)resampler_ident;
    (void)quality; (void)stop_cb;
-   return new_voice();
+   return stub_play_fail ? NULL : new_voice();
 }
 
 audio_mixer_voice_t *audio_mixer_play_s16(audio_mixer_sound_t *sound,
@@ -154,7 +157,7 @@ audio_mixer_voice_t *audio_mixer_play_s16(audio_mixer_sound_t *sound,
 {
    (void)sound; (void)repeat; (void)gain; (void)resampler_ident;
    (void)quality; (void)stop_cb;
-   return new_voice();
+   return stub_play_fail ? NULL : new_voice();
 }
 
 void audio_mixer_stop(audio_mixer_voice_t *voice)
@@ -310,4 +313,28 @@ void audio_thread_apply_control(void *data,
 {
    (void)data;
    if (control) control(userdata);
+}
+
+/* The driver exposes transport pause; these harnesses stub mixer I/O. */
+void audio_mixer_voice_set_paused(audio_mixer_voice_t *voice, bool paused)
+{
+   (void)voice;
+   (void)paused;
+}
+
+void audio_mixer_voice_set_repeat(audio_mixer_voice_t *voice, bool repeat)
+{
+   (void)voice;
+   (void)repeat;
+}
+
+/* No real PCM is mixed by this stand-in, so no mix clock is available. */
+bool audio_mixer_voice_clock(audio_mixer_voice_t *voice,
+      size_t *frames, unsigned *rate, size_t *serial)
+{
+   (void)voice;
+   if (frames) *frames = 0;
+   if (rate) *rate = 0;
+   if (serial) *serial = 0;
+   return false;
 }

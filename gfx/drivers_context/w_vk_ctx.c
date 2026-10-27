@@ -104,9 +104,13 @@ static void gfx_ctx_w_vk_check_window(void *data, bool *quit,
          && (g_win32_resize_width  == VIDEO_SCALE_W(*dims))
          && (g_win32_resize_height == VIDEO_SCALE_H(*dims)))
    {
+      /* Asked for, not done: with threaded video this runs on the
+       * video thread, and the restart takes the input driver down
+       * while the main thread polls it. Unthreaded, it runs inside the
+       * driver's own call. */
       int reinit_flags = DRIVER_VIDEO_AND_INPUT_MASK;
       g_win32_refresh_rate = settings->floats.video_refresh_rate;
-      command_event(CMD_EVENT_REINIT, &reinit_flags);
+      command_event_later(CMD_EVENT_REINIT, &reinit_flags);
    }
 }
 
@@ -338,7 +342,7 @@ static uint32_t gfx_ctx_w_vk_get_flags(void *data)
          BIT32_SET(flags, GFX_CTX_FLAGS_FULLSCREEN_EXCLUSIVE_IN_PLACE);
    }
 
-#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
    BIT32_SET(flags, GFX_CTX_FLAGS_SHADERS_SLANG);
 #endif
 

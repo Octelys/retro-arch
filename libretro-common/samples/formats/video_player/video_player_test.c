@@ -36,14 +36,47 @@
 
 #include <time.h>
 #include <retro_timers.h>
+#include <retro_atomic.h>
 #include <formats/image.h>
 #include <formats/video_player.h>
+#ifdef HAVE_THREADS
+#include <rthreads/rthreads.h>
+#endif
 
 #define W 4
 #define H 2
 #define N (W * H)
 
 static int failures = 0;
+
+#ifdef VP_TEST_CALLOC_FAULTS
+static retro_atomic_int_t alloc_count;
+static retro_atomic_int_t alloc_fail;
+static retro_atomic_int_t alloc_enabled;
+#ifdef HAVE_THREADS
+static retro_atomic_int_t fail_worker;
+
+sthread_t *__real_sthread_create(void (*func)(void*), void *user);
+sthread_t *__wrap_sthread_create(void (*func)(void*), void *user)
+{
+   if (retro_atomic_cas_int(&fail_worker, 1, 0))
+      return NULL;
+   return __real_sthread_create(func, user);
+}
+#endif
+
+void *__real_calloc(size_t count, size_t size);
+void *__wrap_calloc(size_t count, size_t size)
+{
+   if (retro_atomic_load_acquire_int(&alloc_enabled))
+   {
+      int ordinal = retro_atomic_fetch_add_int(&alloc_count, 1) + 1;
+      if (ordinal == retro_atomic_load_acquire_int(&alloc_fail))
+         return NULL;
+   }
+   return __real_calloc(count, size);
+}
+#endif
 
 static void CHECK(int cond, const char *fmt, ...)
 {
@@ -72,6 +105,9 @@ typedef struct
    int wait_at;
    bool waiting;
    int duration_ms;
+   int64_t movie_ns, lead_ns, frame_step_ns, stamp_jitter_ns;
+   int64_t hw_failure_ns;
+   bool stamp_quantized, failed_stream;
    int catchup;        /* last value set */
    int catchup_sets;
    int argb;
@@ -86,7 +122,36 @@ typedef struct
    int hw_abandoned;
    int hw_fail_from;   /* 0 never */
    bool hw_pending;
+   retro_atomic_int_t startup_hold, startup_entered;
+   int startup_calls;
+#ifdef HAVE_THREADS
+   uintptr_t startup_poll, startup_thread;
+#endif
 } fake_t;
+
+int64_t image_transfer_anim_stream_duration_ns(void *stream,
+      enum image_type_enum type)
+{
+   (void)type;
+   return ((fake_t*)stream)->movie_ns;
+}
+
+int64_t image_transfer_anim_stream_frame_time_ns(void *stream,
+      enum image_type_enum type)
+{
+   fake_t *f = (fake_t*)stream;
+   int64_t time_ns;
+   (void)type;
+   if (f->hw_on && f->hw_failure_ns && f->hw_fail_from
+         && f->pos >= f->hw_fail_from)
+      return f->hw_failure_ns;
+   time_ns = f->pos ? f->lead_ns + (int64_t)(f->pos - 1)
+      * (f->frame_step_ns ? f->frame_step_ns
+            : (int64_t)f->duration_ms * 1000000)
+      + ((f->pos & 1) ? 0 : f->stamp_jitter_ns) : -1;
+   return time_ns >= 0 && f->stamp_quantized
+      ? time_ns / 1000000 * 1000000 : time_ns;
+}
 
 static uint32_t frame_px(int k, bool argb)
 {
@@ -108,6 +173,14 @@ void image_transfer_anim_stream_get_info(void *stream,
    *loop_count = 0;
 }
 
+bool image_transfer_anim_stream_completed(const void *stream,
+      enum image_type_enum type)
+{
+   const fake_t *f = (const fake_t*)stream;
+   (void)type;
+   return f->pos >= f->frames && !f->waiting;
+}
+
 const uint32_t *image_transfer_anim_stream_next(void *stream,
       enum image_type_enum type, int *duration_ms)
 {
@@ -121,7 +194,7 @@ const uint32_t *image_transfer_anim_stream_next(void *stream,
       f->wait_left--;
       return NULL;
    }
-   if (f->pos >= f->frames)
+   if (f->failed_stream || f->pos >= f->frames)
       return NULL;
    if (f->hw_on)
    {
@@ -159,6 +232,18 @@ bool image_transfer_anim_stream_set_hw(void *stream,
 {
    fake_t *f = (fake_t*)stream;
    (void)type;
+   if(!enable)return f->hw_on;
+   f->startup_calls++;
+#ifdef HAVE_THREADS
+   f->startup_thread = sthread_get_current_thread_id();
+   if (f->startup_poll && f->startup_thread == f->startup_poll)
+   {
+      CHECK(0,"startup: native constructor ran on polling thread");
+      return false;
+   }
+#endif
+   retro_atomic_store_release_int(&f->startup_entered,1);
+   while (retro_atomic_load_acquire_int(&f->startup_hold)) retro_sleep(1);
    if (enable && f->hw_can)
       f->hw_on = true;
    return f->hw_on;
@@ -250,6 +335,7 @@ typedef struct
 {
    uint32_t slots[2][(W + 3) * H];
    unsigned stride[2];
+   int64_t times[4];
    int seen[MAX_SEEN];
    int nseen;
    int bad_px;
@@ -262,7 +348,17 @@ typedef struct
    int hw_taken;
    int hw_busy_every;
    int hw_offers;
-   int hw_started;
+   int hw_started, started, ended;
+   int hw_start_waits;
+   fake_t *fallback_stream;
+   int fallback_calls, fallback_waits;
+   retro_atomic_int_t fallback_entered;
+   bool fallback_error;
+   bool hw_start_refused, fallback_threaded, fallback_async;
+   video_hw_frame_t fallback_held;
+#ifdef HAVE_THREADS
+   uintptr_t fallback_caller;
+#endif
    bool hw_twice;        /* the same frame offered after it was taken */
 } sink_t;
 
@@ -270,6 +366,7 @@ static int sink_start(void *user, unsigned width, unsigned height,
       unsigned num_slots)
 {
    sink_t *k = (sink_t*)user;
+   k->started++;
    CHECK(width == W && height == H, "start: %ux%u", width, height);
    CHECK(num_slots == (k->slots_on ? num_slots : 0u),
          "start: %u slots for a sink without", num_slots);
@@ -288,6 +385,7 @@ static uint32_t *sink_slot_begin(void *user, unsigned slot)
 
 static void sink_slot_end(void *user, unsigned slot)
 {
+   ((sink_t*)user)->ended++;
    ((sink_t*)user)->begun[slot] = 0;
 }
 
@@ -301,6 +399,7 @@ static enum video_player_present sink_present(void *user,
    unsigned i;
 
    CHECK(fr->width == W && fr->height == H, "present: dims");
+   CHECK(!k->begun[fr->slot], "present: slot still being written");
    idx = (int)(px[0] & 0xFF) - 1;
    if (!fr->native)
       idx = (int)((px[0] >> 16) & 0xFF) - 1;
@@ -315,6 +414,8 @@ static enum video_player_present sink_present(void *user,
       if (p != want_argb)
          k->bad_px++;
    }
+   if (k->nseen < 4)
+      k->times[k->nseen] = fr->time_us;
    if (k->nseen < MAX_SEEN)
       k->seen[k->nseen] = idx;
    k->nseen++;
@@ -333,7 +434,12 @@ static int sink_start_hw(void *user, unsigned width, unsigned height,
    CHECK(jobs == 1 || jobs == 2, "start_hw: %u jobs", jobs);
    CHECK(width == W && height == H, "start_hw: %ux%u", width, height);
    k->hw_started++;
-   return 0;
+   if (k->hw_start_waits)
+   {
+      k->hw_start_waits--;
+      return -1;
+   }
+   return k->hw_start_refused ? VIDEO_PLAYER_HW_REFUSED : 0;
 }
 
 static enum video_player_present sink_present_hw(void *user,
@@ -355,6 +461,8 @@ static enum video_player_present sink_present_hw(void *user,
    if (k->nseen && k->nseen <= MAX_SEEN && k->seen[k->nseen - 1] == idx
          && k->held < 0)
       k->hw_twice = true;
+   if (k->nseen < 4)
+      k->times[k->nseen] = fr->time_us;
    if (k->nseen < MAX_SEEN)
       k->seen[k->nseen] = idx;
    k->nseen++;
@@ -371,6 +479,7 @@ static void sink_init(sink_t *k, video_player_sink_t *s, bool slots)
 {
    memset(k, 0, sizeof(*k));
    k->held       = -1;
+   retro_atomic_int_init(&k->fallback_entered,0);
    k->slots_on   = slots;
    s->user       = k;
    s->start      = sink_start;
@@ -394,9 +503,27 @@ static void sink_init_hw(sink_t *k, video_player_sink_t *s)
 static void fake_init(fake_t *f, int frames, int duration_ms)
 {
    memset(f, 0, sizeof(*f));
+   retro_atomic_int_init(&f->startup_hold,0);
+   retro_atomic_int_init(&f->startup_entered,0);
    f->frames        = frames;
    f->duration_ms   = duration_ms;
    f->honours_order = true;
+}
+
+/* Pacing lanes keep one clock origin while cold admission is scheduled. */
+static void settle_hw_start(video_player_t *p, int64_t now)
+{
+   unsigned i;
+   enum video_player_state state = VIDEO_PLAYER_PLAYING;
+   for (i = 0;
+        i < 1000 && !video_player_started(p) && state == VIDEO_PLAYER_PLAYING;
+        i++)
+   {
+      state = video_player_poll(p, now);
+      if (!video_player_started(p))
+         retro_sleep(1);
+   }
+   CHECK(video_player_started(p), "startup: sink did not settle");
 }
 
 static bool seen_in_order(const sink_t *k, int frames)
@@ -493,6 +620,8 @@ static void lane_order_and_default(void)
    video_player_poll(p, 100000);
    CHECK(k.nseen == 2 && k.bad_px == 0,
          "swizzle: %d frames, %d pixels wrong", k.nseen, k.bad_px);
+   CHECK(k.times[0] == -1 && k.times[1] == -1,
+         "animation: no fabricated movie timestamp");
    video_player_free(p);
 
    /* the same without slots: handed over as is, marked non-native */
@@ -519,6 +648,7 @@ static void lane_fp16(void)
    p = video_player_new(&f, IMAGE_TYPE_MP4, 0, &s, VIDEO_PLAYER_INLINE);
    CHECK(video_player_poll(p, 0) == VIDEO_PLAYER_ENDED && k.nseen == 0,
          "fp16: a canvas frame was shown");
+   CHECK(!k.begun[0], "fp16: refused frame holds its slot");
    video_player_free(p);
 
    fake_init(&f, 3, 10);
@@ -552,6 +682,7 @@ static void lane_hw_inline(void)
    sink_init_hw(&k, &s);
    k.hw_busy_every = 4;
    p = video_player_new(&f, IMAGE_TYPE_MP4, 2, &s, VIDEO_PLAYER_INLINE);
+   settle_hw_start(p,now);
    do
    {
       st  = video_player_poll(p, now);
@@ -583,6 +714,7 @@ static void lane_hw_inline(void)
    f.hw_fail_from = 3;
    sink_init_hw(&k, &s);
    p     = video_player_new(&f, IMAGE_TYPE_MP4, 0, &s, VIDEO_PLAYER_INLINE);
+   settle_hw_start(p,0);
    now   = 0;
    polls = 0;
    do
@@ -592,6 +724,7 @@ static void lane_hw_inline(void)
    } while (st == VIDEO_PLAYER_PLAYING && ++polls < 50);
    CHECK(st == VIDEO_PLAYER_ENDED && k.nseen == 2,
          "hw inline: %d frames before the failing one", k.nseen);
+   CHECK(!video_player_completed(p), "hw failure is not successful EOF");
    video_player_free(p);
 }
 
@@ -736,6 +869,43 @@ static unsigned sink_slot_stride(void *user, unsigned slot)
    return ((sink_t*)user)->stride[slot];
 }
 
+static bool sink_feed_stop(void *user)
+{
+   (void)user;
+   return false;
+}
+
+static void lane_inline_release(void)
+{
+   unsigned mode;
+   for (mode = 0; mode < 3; mode++)
+   {
+      fake_t f;
+      sink_t k;
+      video_player_sink_t s;
+      video_player_t *p;
+      fake_init(&f, 1, 10);
+      f.direct = true;
+      sink_init(&k, &s, true);
+      if (mode == 0)
+         s.feed = sink_feed_stop;
+      else if (mode == 1)
+         f.pos = f.frames;
+      else
+         s.slot_stride = sink_slot_stride;
+      p = video_player_new(&f, IMAGE_TYPE_MP4, 1, &s,
+            VIDEO_PLAYER_INLINE);
+      CHECK(p != NULL, "inline release: allocation");
+      if (!p)
+         continue;
+      CHECK(video_player_poll(p, 0) == VIDEO_PLAYER_ENDED,
+            "inline release: mode %u did not end", mode);
+      CHECK(!k.begun[0] && !k.nseen,
+            "inline release: mode %u holds or presents its slot", mode);
+      video_player_free(p);
+   }
+}
+
 static void lane_padded(void)
 {
    unsigned threaded, direct, order;
@@ -772,6 +942,7 @@ static void lane_padded(void)
       CHECK(state == VIDEO_PLAYER_ENDED && k.nseen == 6 && !k.bad_px,
             "padded: mode %u/%u/%u showed %d frames, %d wrong pixels",
             threaded, direct, order, k.nseen, k.bad_px);
+      CHECK(!k.begun[0] && !k.begun[1], "padded: unreleased slot");
       for (slot = 0; slot < 2; slot++)
          for (y = 0; y < H; y++)
             for (x = W; x < k.stride[slot]; x++)
@@ -780,8 +951,1407 @@ static void lane_padded(void)
    }
 }
 
+/* A long pause must retain the remainder of the displayed picture,
+ * without catch-up, skipped ordinals or presenting a ready worker job. */
+static void lane_pause(bool threaded)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t s;
+   video_player_t *p;
+   int i;
+   int64_t now = 1000000;
+   fake_init(&f, 5, 40);
+   sink_init(&k, &s, true);
+   f.direct = true;
+   p = video_player_new(&f, IMAGE_TYPE_WEBM, 1, &s,
+         threaded ? 0 : VIDEO_PLAYER_INLINE);
+   CHECK(p != NULL, "pause: allocation");
+   if (!p) return;
+   video_player_set_paused(p, true, now);
+   video_player_set_paused(p, true, now + 10000);
+   CHECK(video_player_paused(p), "pause: before first poll");
+   CHECK(!video_player_has_presented(p), "pause: no accepted picture yet");
+   for (i = 0; i < 10; i++)
+      CHECK(video_player_poll(p, now + i * 1000) == VIDEO_PLAYER_PLAYING,
+            "pause: stays live");
+   CHECK(k.nseen == 0, "pause: no initial presentation");
+   CHECK(video_player_due(p) == INT64_MAX, "pause: no deadline");
+   video_player_set_paused(p, false, now);
+   for (i = 0; i < 1000 && k.nseen == 0; i++)
+   {
+      video_player_poll(p, now);
+      if (threaded) retro_sleep(1);
+   }
+   CHECK(k.nseen == 1, "pause: first picture");
+   CHECK(video_player_has_presented(p), "pause: first picture accepted");
+   CHECK(video_player_due(p) == now + 40000, "pause: initial duration");
+   video_player_set_paused(p, true, now + 10000);
+   for (i = 0; i < 10; i++)
+   {
+      video_player_poll(p, now + 10000000 + i * 1000);
+      if (threaded) retro_sleep(1);
+   }
+   CHECK(k.nseen == 1, "pause: pending picture not presented");
+   video_player_set_paused(p, false, now + 10000000);
+   CHECK(video_player_due(p) == now + 10030000,
+         "pause: remaining 30ms preserved");
+   video_player_set_paused(p, false, now + 10010000);
+   CHECK(video_player_due(p) == now + 10030000,
+         "pause: repeated resume does not shift clock");
+   video_player_poll(p, now + 10029999);
+   CHECK(k.nseen == 1, "pause: not before deadline");
+   for (i = 0; i < 1000 && k.nseen == 1; i++)
+   {
+      video_player_poll(p, now + 10030000);
+      if (threaded) retro_sleep(1);
+   }
+   CHECK(k.nseen == 2 && seen_in_order(&k, 5), "pause: resumes next ordinal");
+   CHECK(f.catchup_sets == 0, "pause: elapsed wall time is not catch-up");
+   video_player_set_paused(p, true, now + 10040000);
+   while (!video_player_stop(p)) retro_sleep(1);
+   video_player_set_paused(p, false, now + 20000000);
+   CHECK(video_player_poll(p, now + 20000000) == VIDEO_PLAYER_ENDED,
+         "pause: stop cannot resume");
+   CHECK(!video_player_completed(p), "stop is not successful EOF");
+   video_player_free(p);
+}
+
+static void lane_input_wait(bool threaded, bool slots)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t s;
+   video_player_t *p;
+   int tick, state = VIDEO_PLAYER_PLAYING;
+   bool finite = false;
+   fake_init(&f, 5, 10);
+   f.direct = true;
+   f.wait_at = 2;
+   f.wait_left = 3;
+   sink_init(&k, &s, slots);
+   p = video_player_new(&f, IMAGE_TYPE_MP4, 0, &s,
+         threaded ? 0 : VIDEO_PLAYER_INLINE);
+   CHECK(p != NULL, "input wait: allocation");
+   if (!p) return;
+   for (tick = 0; tick < 1000 && state != VIDEO_PLAYER_ENDED; tick++)
+   {
+      if (k.nseen >= 2 && !finite)
+      {
+         CHECK(video_player_set_repeat(p, false), "set one-pass movie policy");
+         finite = true;
+      }
+      state = video_player_poll(p, (int64_t)tick * 1000);
+      if (threaded) retro_sleep(1);
+   }
+   CHECK(video_player_completed(p), "input wait: clean movie EOF");
+   video_player_free(p);
+   CHECK(state == VIDEO_PLAYER_ENDED && k.nseen == 5
+         && seen_in_order(&k, 5) && !k.bad_px,
+         "input wait: mode %d/%d ended after %d frames", threaded, slots, k.nseen);
+   CHECK(!k.begun[0] && !k.begun[1], "input wait: slots released");
+}
+
+typedef struct
+{
+   fake_t *stream;
+   retro_atomic_int_t gate, steps;
+   int restarts;
+   int fail;
+   bool progress;
+   int64_t target;
+} seek_test_t;
+
+static int seek_step(void *user, int64_t target, bool restart,
+      int64_t *position)
+{
+   seek_test_t *seek = (seek_test_t*)user;
+   if (restart)
+   {
+      seek->restarts++;
+      seek->target = target;
+   }
+   retro_atomic_fetch_add_int(&seek->steps, 1);
+   if (!retro_atomic_load_acquire_int(&seek->gate))
+      return seek->progress ? VIDEO_PLAYER_SEEK_PROGRESS : 0;
+   if (seek->fail)
+      return -1;
+   seek->stream->pos = (int)(target / 10000);
+   *position = target;
+   return 1;
+}
+
+static void lane_seek(bool threaded, bool hw)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t s;
+   video_player_t *p;
+   seek_test_t seek;
+   int i, state = VIDEO_PLAYER_PLAYING;
+   int64_t position = -1, now = 1000000;
+   fake_init(&f, 12, 10);
+   sink_init(&k, &s, true);
+   memset(&seek, 0, sizeof(seek));
+   seek.stream = &f;
+   f.direct = true;
+   f.wait_at = 5;
+   f.wait_left = 3;
+   f.hw_can = hw;
+   if (hw) sink_init_hw(&k, &s);
+   k.queue_every = threaded ? 1 : 0;
+   p = video_player_new(&f, IMAGE_TYPE_WEBM, 1, &s,
+         threaded ? 0 : VIDEO_PLAYER_INLINE);
+   CHECK(p != NULL, "seek: allocation");
+   if (!p) return;
+   CHECK(!video_player_seek(p, 0), "seek: handler required");
+   CHECK(video_player_set_seek_handler(p, seek_step, &seek),
+         "seek: handler installation");
+   if(hw)settle_hw_start(p,now);
+   for (i = 0; i < 1000 && !k.nseen; i++)
+   {
+      video_player_poll(p, now);
+      if (threaded) retro_sleep(1);
+   }
+   CHECK(k.nseen == 1, "seek: initial picture");
+   CHECK(!video_player_set_seek_handler(p, NULL, NULL),
+         "seek: running handler immutable");
+   video_player_set_paused(p, true, now);
+   CHECK(video_player_seek(p, 20000), "seek: first request");
+   if (threaded)
+   {
+      for (i = 0; i < 10; i++)
+      {
+         video_player_poll(p, now);
+         retro_sleep(1);
+      }
+      CHECK(!retro_atomic_load_acquire_int(&seek.steps),
+            "seek: accepted old slot remains sink-owned");
+      CHECK(k.held >= 0, "seek: initial slot held");
+      video_player_slot_released(p, (unsigned)k.held);
+      k.held = -1;
+      k.queue_every = 0;
+   }
+   for (i = 0; i < 1000
+         && !retro_atomic_load_acquire_int(&seek.steps); i++)
+   {
+      video_player_poll(p, now);
+      if (threaded) retro_sleep(1);
+   }
+   CHECK(retro_atomic_load_acquire_int(&seek.steps) > 0,
+         "seek: bounded step ran");
+   CHECK(k.nseen == 1 && !video_player_seek_position(p, &position),
+         "seek: old picture retained, result pending");
+   CHECK(video_player_seek(p, 30000) && video_player_seek(p, 50000),
+         "seek: newest target accepted");
+   retro_atomic_store_release_int(&seek.gate, 1);
+   for (i = 0; i < 1000 && (video_player_seeking(p) || k.nseen < 2); i++)
+   {
+      video_player_poll(p, now);
+      if (threaded) retro_sleep(1);
+   }
+   CHECK(k.nseen == 2 && k.seen[1] == 5 && !k.bad_px,
+         "seek: newest target picture, no stale frame (%d/%d)",
+         k.nseen, k.seen[1]);
+   CHECK(video_player_seek_position(p, &position) && position == 50000,
+         "seek: latest completion position");
+   CHECK(seek.restarts == 2 && seek.target == 50000,
+         "seek: intermediate request coalesced");
+   CHECK(video_player_paused(p), "seek: paused state preserved");
+   for (i = 0; i < 10; i++) video_player_poll(p, now + 1000000);
+   CHECK(k.nseen == 2, "seek: paused seek shows only one picture");
+   video_player_set_paused(p, false, now + 1000000);
+   CHECK(video_player_due(p) == now + 1010000,
+         "seek: resumed picture retains its full duration");
+   for (i = 0; i < 1000 && k.nseen < 3; i++)
+   {
+      video_player_poll(p, now + 1010000);
+      if (threaded) retro_sleep(1);
+   }
+   CHECK(k.nseen == 3 && k.seen[2] == 6, "seek: next frame follows target");
+   video_player_set_paused(p, true, now + 1010000);
+   CHECK(video_player_seek(p, -1), "seek: negative target accepted");
+   for (i = 0; i < 1000 && (video_player_seeking(p) || k.nseen < 4); i++)
+   {
+      video_player_poll(p, now + 1010000);
+      if (threaded) retro_sleep(1);
+   }
+   CHECK(k.nseen == 4 && k.seen[3] == 0
+         && video_player_seek_position(p, &position) && !position,
+         "seek: target clamped to zero");
+   seek.fail = 1;
+   CHECK(video_player_seek(p, 40000), "seek: failing request accepted");
+   for (i = 0; i < 1000 && state != VIDEO_PLAYER_SEEK_FAILED; i++)
+   {
+      state = video_player_poll(p, now + 1010000);
+      if (threaded) retro_sleep(1);
+   }
+   CHECK(state == VIDEO_PLAYER_SEEK_FAILED && k.nseen == 4,
+         "seek: failure retains the last picture");
+   CHECK(video_player_poll(p, now + 1010000) == VIDEO_PLAYER_SEEK_FAILED
+         && !video_player_seeking(p), "seek: failure is stable without decoding");
+   seek.fail = 0;
+   CHECK(video_player_seek(p, 0), "seek: failed player accepts recovery");
+   for (i = 0; i < 1000 && (video_player_seeking(p) || k.nseen < 5); i++)
+   {
+      video_player_poll(p, now + 1010000);
+      if (threaded) retro_sleep(1);
+   }
+   CHECK(k.nseen == 5 && k.seen[4] == 0
+         && video_player_seek_position(p, &position) && !position,
+         "seek: recovery presents a replacement picture");
+   video_player_free(p);
+   if (hw)
+      CHECK(f.hw_made == k.hw_taken + f.hw_abandoned,
+            "seek: each GPU lease taken or abandoned exactly once");
+}
+
+static void lane_seek_progress(bool threaded)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t sink;
+   video_player_t *p;
+   seek_test_t seek;
+   int tick;
+   int64_t position = -1;
+   fake_init(&f, 12, 10);
+   sink_init(&k, &sink, true);
+   memset(&seek, 0, sizeof(seek));
+   seek.stream = &f;
+   seek.progress = true;
+   p = video_player_new(&f, IMAGE_TYPE_WEBM, 1, &sink,
+         threaded ? 0 : VIDEO_PLAYER_INLINE);
+   CHECK(p != NULL, "seek progress: allocation");
+   if (!p)
+      return;
+   video_player_set_seek_handler(p, seek_step, &seek);
+   video_player_set_paused(p, true, 1000000);
+   CHECK(video_player_seek(p, 40000), "seek progress: initial request");
+   video_player_poll(p, 1000000);
+   video_player_poll(p, 1000000);
+   for (tick = 0; tick < 1000
+         && retro_atomic_load_acquire_int(&seek.steps) < 64; tick++)
+   {
+      if (threaded)
+         retro_sleep(1);
+      else
+         video_player_poll(p, 1000000);
+   }
+   CHECK(retro_atomic_load_acquire_int(&seek.steps) >= 64,
+         "seek progress: worker continues without polling the player");
+   CHECK(video_player_seeking(p) && !k.nseen,
+         "seek progress: progress is not completion");
+   CHECK(video_player_seek(p, 20000), "seek progress: replace running target");
+   retro_atomic_store_release_int(&seek.gate, 1);
+   for (tick = 0; tick < 1000
+         && !video_player_seek_position(p, &position); tick++)
+   {
+      video_player_poll(p, 1000000);
+      if (threaded)
+         retro_sleep(1);
+   }
+   CHECK(video_player_seek_position(p, &position) && position == 20000,
+         "seek progress: the latest request completes");
+   video_player_free(p);
+   video_player_worker_deinit();
+}
+
+typedef struct
+{
+   fake_t stream[2];
+   sink_t output[2];
+   video_player_sink_t sink[2];
+   seek_test_t seek;
+} seek_peer_t;
+
+static void lane_seek_peer(bool threaded, bool progress)
+{
+   seek_peer_t *test = (seek_peer_t*)calloc(1, sizeof(*test));
+   video_player_t *pending, *peer;
+   int tick;
+   int64_t position = -1;
+   int64_t now = 1000000;
+   CHECK(test != NULL, "seek peer: allocation");
+   if (!test)
+      return;
+   fake_init(&test->stream[0], 12, 10);
+   fake_init(&test->stream[1], 5, 10);
+   sink_init(&test->output[0], &test->sink[0], true);
+   sink_init(&test->output[1], &test->sink[1], true);
+   test->seek.stream = &test->stream[0];
+   test->seek.progress = progress;
+   pending = video_player_new(&test->stream[0], IMAGE_TYPE_WEBM, 1,
+         &test->sink[0], threaded ? 0 : VIDEO_PLAYER_INLINE);
+   peer = video_player_new(&test->stream[1], IMAGE_TYPE_WEBM, 1,
+         &test->sink[1], threaded ? 0 : VIDEO_PLAYER_INLINE);
+   CHECK(pending && peer, "seek peer: players");
+   if (!pending || !peer)
+      goto cleanup;
+   CHECK(video_player_set_seek_handler(pending, seek_step, &test->seek),
+         "seek peer: handler");
+   video_player_set_paused(pending, true, now);
+   CHECK(video_player_seek(pending, 40000), "seek peer: request");
+   for (tick = 0; tick < 1000
+         && !retro_atomic_load_acquire_int(&test->seek.steps); tick++)
+   {
+      video_player_poll(pending, now);
+      if (threaded)
+         retro_sleep(1);
+   }
+   CHECK(retro_atomic_load_acquire_int(&test->seek.steps) > 0,
+         "seek peer: pending work started");
+   for (tick = 0; tick < 1000 && !video_player_completed(peer); tick++)
+   {
+      video_player_poll(pending, now);
+      video_player_poll(peer, now);
+      now += 10000;
+      if (threaded)
+         retro_sleep(1);
+   }
+   CHECK(video_player_completed(peer) && test->output[1].nseen == 5
+         && seen_in_order(&test->output[1], 5) && !test->output[1].bad_px,
+         "seek peer: other player reaches EOF (%d/%d)", threaded, progress);
+   CHECK(video_player_seeking(pending) && !test->output[0].nseen
+         && !video_player_seek_position(pending, &position),
+         "seek peer: pending seek publishes nothing");
+   CHECK(video_player_seek(pending, 20000), "seek peer: replace target");
+   retro_atomic_store_release_int(&test->seek.gate, 1);
+   for (tick = 0; tick < 1000 && (video_player_seeking(pending)
+            || !test->output[0].nseen); tick++)
+   {
+      video_player_poll(pending, now);
+      if (threaded)
+         retro_sleep(1);
+   }
+   CHECK(video_player_seek_position(pending, &position) && position == 20000
+         && test->output[0].nseen == 1 && test->output[0].seen[0] == 2,
+         "seek peer: only replacement picture published");
+cleanup:
+   video_player_free(pending);
+   video_player_free(peer);
+   video_player_worker_deinit();
+   CHECK(!test->output[0].begun[0] && !test->output[0].begun[1]
+         && !test->output[1].begun[0] && !test->output[1].begun[1],
+         "seek peer: presentation slots retired");
+   free(test);
+}
+
+static void lane_seek_stop(bool threaded)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t s;
+   video_player_t *p;
+   seek_test_t seek;
+   int i, steps;
+   fake_init(&f, 12, 10);
+   sink_init(&k, &s, true);
+   memset(&seek, 0, sizeof(seek));
+   seek.stream = &f;
+   p = video_player_new(&f, IMAGE_TYPE_WEBM, 1, &s,
+         threaded ? 0 : VIDEO_PLAYER_INLINE);
+   CHECK(p != NULL, "seek stop: allocation");
+   if (!p) return;
+   video_player_set_seek_handler(p, seek_step, &seek);
+   video_player_set_paused(p, true, 1000000);
+   CHECK(video_player_seek(p, 40000), "seek stop: before first poll");
+   for (i = 0; i < 1000
+         && !retro_atomic_load_acquire_int(&seek.steps); i++)
+   {
+      video_player_poll(p, 1000000);
+      if (threaded) retro_sleep(1);
+   }
+   CHECK(!k.nseen && video_player_seeking(p),
+         "seek stop: no picture from incomplete initial seek");
+   while (!video_player_stop(p)) retro_sleep(1);
+   CHECK(!video_player_seek(p, 0) && !video_player_seeking(p),
+         "seek stop: cannot resume stopped request");
+   steps = retro_atomic_load_acquire_int(&seek.steps);
+   video_player_free(p);
+   video_player_worker_deinit();
+   CHECK(retro_atomic_load_acquire_int(&seek.steps) == steps,
+         "seek stop: callback not run after stream released");
+}
+
+/* A short video track inside a longer movie must preserve both its
+ * leading interval and the audio tail on every loop. Test the clock
+ * independently of decode speed by polling each timestamp repeatedly. */
+static void lane_movie(bool threaded, bool hardware, bool pause_lead)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t s;
+   video_player_t *p;
+   enum video_player_state state = VIDEO_PLAYER_PLAYING;
+   int tick, retry;
+   const int64_t origin = 1000000;
+   int64_t now;
+   fake_init(&f, 2, 100);
+   f.direct = true;
+   f.movie_ns = (int64_t)4000000 * 1000;
+   f.lead_ns = 1000000000;
+   if (hardware)
+   {
+      f.hw_can = true;
+      sink_init_hw(&k, &s);
+      k.hw_busy_every = 2;
+   }
+   else sink_init(&k, &s, true);
+   p = video_player_new(&f, IMAGE_TYPE_MP4, 2, &s,
+         threaded ? 0 : VIDEO_PLAYER_INLINE);
+   CHECK(p != NULL, "movie: allocation");
+   if (!p) return;
+   CHECK(!video_player_started(p), "movie: sink not ready before poll");
+   if(hardware)settle_hw_start(p,origin);
+   for (tick = 0; tick <= 800; tick++)
+   {
+      int expected = tick < 100 ? 0 : tick < 110 ? 1
+         : tick < 500 ? 2 : tick < 510 ? 3 : 4;
+      now = origin + (int64_t)tick * 10000;
+      if (pause_lead && tick == 50)
+      {
+         video_player_set_paused(p, true, now);
+         for (retry = 0; retry < 8; retry++)
+            video_player_poll(p, now + 1000000);
+         CHECK(!k.nseen, "movie: pause preserves leading gap");
+         video_player_set_paused(p, false, now + 2000000);
+      }
+      if (pause_lead && tick >= 50) now += 2000000;
+      for (retry = 0; retry < 12; retry++)
+      {
+         state = video_player_poll(p, now);
+         if (threaded) retro_sleep(1);
+      }
+      CHECK(k.nseen == expected, "movie: tick %d pictures %d expected %d",
+            tick, k.nseen, expected);
+      CHECK(video_player_has_presented(p) == (expected != 0),
+            "movie: due time is not a presentation");
+      CHECK(video_player_started(p), "movie: ready during leading interval");
+      CHECK(state == (tick < 800 ? VIDEO_PLAYER_PLAYING : VIDEO_PLAYER_ENDED),
+            "movie: complete period at tick %d", tick);
+      CHECK(video_player_completed(p) == (tick >= 800),
+            "movie: clean EOF waits for final presentation duration");
+   }
+   CHECK(k.seen[0] == 0 && k.seen[1] == 1
+         && k.seen[2] == 0 && k.seen[3] == 1 && !k.bad_px,
+         "movie: repeated picture sequence");
+   CHECK(k.times[0] == 1000000 && k.times[1] == 1100000
+         && k.times[2] == 5000000 && k.times[3] == 5100000,
+         "movie: published timestamps preserve lead and loop epoch");
+   video_player_free(p);
+   video_player_worker_deinit();
+   CHECK(!hardware || f.hw_made == f.hw_abandoned + k.hw_taken,
+         "movie: every hardware lease accounted for");
+}
+
+static void lane_timestamp_precision(bool threaded)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t s;
+   video_player_t *p;
+   int tick;
+   fake_init(&f, 3, 42);
+   f.movie_ns = 200000000;
+   f.lead_ns = 1234567;
+   f.frame_step_ns = 41708333;
+   sink_init(&k, &s, true);
+   p = video_player_new(&f, IMAGE_TYPE_MP4, 1, &s,
+         threaded ? 0 : VIDEO_PLAYER_INLINE);
+   CHECK(p != NULL, "timestamp: allocation");
+   if (!p)
+      return;
+   for (tick = 0; tick < 250 && k.nseen < 3; tick++)
+   {
+      video_player_poll(p, (int64_t)tick * 1000);
+      if (threaded)
+         retro_sleep(1);
+   }
+   CHECK(k.nseen == 3 && k.times[0] == 1234 && k.times[1] == 42942
+         && k.times[2] == 84651,
+         "timestamp: fractional cadence survives millisecond frame duration");
+   video_player_free(p);
+   video_player_worker_deinit();
+}
+
+static void lane_cadence(bool threaded, unsigned mode, bool hardware)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t s;
+   video_player_t *p;
+   seek_test_t seek;
+   unsigned num = 0, den = 0;
+   int tick;
+   fake_init(&f, 60, 42);
+   f.movie_ns = (int64_t)3000000 * 1000;
+   f.frame_step_ns = 41708333;
+   f.stamp_jitter_ns = mode == 1 ? 7000000 : 0;
+   f.stamp_quantized = mode == 2;
+   memset(&seek, 0, sizeof(seek));
+   seek.stream = &f;
+   retro_atomic_int_init(&seek.gate, 1);
+   retro_atomic_int_init(&seek.steps, 0);
+   if (hardware)
+   {
+      f.hw_can = true;
+      sink_init_hw(&k, &s);
+      k.hw_busy_every = 2;
+   }
+   else
+      sink_init(&k, &s, true);
+   p = video_player_new(&f, IMAGE_TYPE_MP4, 1, &s,
+         threaded ? 0 : VIDEO_PLAYER_INLINE);
+   CHECK(p != NULL, "cadence: allocation");
+   if (!p) return;
+   CHECK(video_player_set_seek_handler(p, seek_step, &seek), "cadence: seek setup");
+   if (hardware)
+      settle_hw_start(p, 0);
+   for (tick = 0; tick < 3000 && k.nseen < (mode == 1 ? 60 : 33); tick++)
+   {
+      video_player_poll(p, (int64_t)tick * 1000);
+      if (k.nseen < 33 || mode == 1)
+         CHECK(!video_player_cadence(p, &num, &den),
+               "cadence: insufficient or variable timing");
+      if (threaded) retro_sleep(1);
+   }
+   if (mode != 1)
+   {
+      CHECK(k.nseen == 33 && video_player_cadence(p, &num, &den)
+            && num == 32000000 && (mode == 2 ? den == 1334000
+               : den >= 1334666 && den <= 1334667),
+            "cadence: measured rate thread=%d hardware=%d mode=%u seen=%d rate=%u/%u",
+            threaded, hardware, mode, k.nseen, num, den);
+      CHECK(!video_player_cadence_unstable(p), "cadence: stable evidence");
+      CHECK(video_player_seek(p, 0), "cadence: seek accepted");
+      CHECK(!video_player_cadence(p, &num, &den), "cadence: seek clears evidence");
+      CHECK(!video_player_cadence_unstable(p), "cadence: seek is not variable timing");
+   }
+   else
+   {
+      CHECK(k.nseen == 60, "cadence: variable stream completes");
+      CHECK(video_player_cadence_unstable(p), "cadence: variable evidence");
+   }
+   video_player_stop(p);
+   CHECK(!video_player_cadence(p, &num, &den), "cadence: stopped player has no rate");
+   video_player_free(p);
+   video_player_worker_deinit();
+}
+
+static void lane_cadence_loops(bool threaded)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t s;
+   video_player_t *p;
+   unsigned num = 0, den = 0;
+   int tick, previous = 0;
+   fake_init(&f, 40, 42);
+   f.movie_ns = 2000000000;
+   f.frame_step_ns = 41708333;
+   sink_init(&k, &s, true);
+   p = video_player_new(&f, IMAGE_TYPE_MP4, 2, &s,
+         threaded ? 0 : VIDEO_PLAYER_INLINE);
+   CHECK(p != NULL, "cadence loops: allocation");
+   if (!p)
+      return;
+   for (tick = 0; tick < 4500 && k.nseen < 80; tick++)
+   {
+      video_player_poll(p, (int64_t)tick * 1000);
+      if (k.nseen != previous && k.nseen >= 33)
+         CHECK(video_player_cadence(p, &num, &den)
+               && !video_player_cadence_unstable(p)
+               && num == 32000000 && den >= 1334666 && den <= 1334667,
+               "cadence loops: audio tail is not variable picture timing");
+      previous = k.nseen;
+      if (threaded)
+         retro_sleep(1);
+   }
+   CHECK(k.nseen == 80, "cadence loops: both complete picture sequences");
+   video_player_free(p);
+   video_player_worker_deinit();
+}
+
+static void lane_movie_stop(bool threaded)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t s;
+   video_player_t *p;
+   unsigned i;
+   fake_init(&f, 2, 100);
+   f.movie_ns = (int64_t)4000000 * 1000;
+   f.lead_ns = 1000000000;
+   f.hw_can = true;
+   sink_init_hw(&k, &s);
+   p = video_player_new(&f, IMAGE_TYPE_MP4, 0, &s,
+         threaded ? 0 : VIDEO_PLAYER_INLINE);
+   CHECK(p != NULL, "movie stop: allocation");
+   if (!p) return;
+   settle_hw_start(p,1000000);
+   for (i = 0; i < 30; i++)
+   {
+      video_player_poll(p, 1000000);
+      if (threaded) retro_sleep(1);
+   }
+   while (!video_player_stop(p)) retro_sleep(1);
+   video_player_free(p);
+   video_player_worker_deinit();
+   CHECK(!k.nseen && f.hw_made && f.hw_abandoned == f.hw_made,
+         "movie stop: future hardware leases returned once");
+}
+
+static int fallback_restart(void *user)
+{
+   sink_t *k = (sink_t *)user;
+   fake_t *f = k->fallback_stream;
+#ifdef HAVE_THREADS
+   bool worker = sthread_get_current_thread_id() != k->fallback_caller;
+   CHECK(worker == (k->fallback_threaded || k->hw_start_refused),
+         "fallback: restart ran on the wrong stream owner");
+#endif
+   k->fallback_calls++;
+   retro_atomic_store_release_int(&k->fallback_entered, 1);
+   if (k->fallback_error)
+      return -1;
+   if (k->fallback_waits)
+   {
+      k->fallback_waits--;
+      return 0;
+   }
+   f->hw_on = f->hw_pending = false;
+   f->pos = 0;
+   return 1;
+}
+static enum video_player_present
+fallback_present(void *user, const video_player_frame_t *frame)
+{
+   sink_t *k = (sink_t *)user;
+   if (frame->hw)
+   {
+      if (!k->fallback_async)
+         return VIDEO_PLAYER_PRESENT_FAILED;
+      k->fallback_held = *frame->hw;
+      k->held = (int)frame->slot;
+      return VIDEO_PLAYER_PRESENT_QUEUED;
+   }
+   return sink_present(user, frame);
+}
+static void lane_hw_fallback(bool threaded, bool refused, bool decode_failed,
+                             bool async)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t sink;
+   video_player_t *p;
+   enum video_player_state state = VIDEO_PLAYER_PLAYING;
+   int polls;
+   int64_t now = 1000000;
+   fake_init(&f, 6, 5);
+   f.hw_can = true;
+   f.movie_ns = 1000000000;
+   if (decode_failed)
+      f.hw_fail_from = 1;
+   sink_init_hw(&k, &sink);
+   k.fallback_stream = &f;
+   k.hw_start_refused = refused;
+   k.fallback_waits = 2;
+   k.fallback_threaded = threaded;
+   k.fallback_async = async;
+#ifdef HAVE_THREADS
+   k.fallback_caller = sthread_get_current_thread_id();
+#endif
+   sink.present = fallback_present;
+   p = video_player_new(&f, IMAGE_TYPE_MP4, 1, &sink,
+                        threaded ? 0 : VIDEO_PLAYER_INLINE);
+   CHECK(p && video_player_set_hw_fallback(p, fallback_restart, &k),
+         "fallback: setup failed");
+   settle_hw_start(p, now);
+   for (polls = 0; polls < 3000 && state == VIDEO_PLAYER_PLAYING; polls++)
+   {
+      state = video_player_poll(p, now);
+      if (k.held >= 0)
+      {
+         CHECK(video_player_request_software(p) &&
+                     video_player_request_software(p),
+               "fallback async: refusal request was not idempotent");
+         video_player_poll(p, now);
+         CHECK(!k.fallback_calls,
+               "fallback async: restarted before releasing the held slot");
+         video_hw_frame_abandon(&k.fallback_held);
+         video_player_slot_released(p, (unsigned)k.held);
+         k.held = -1;
+      }
+      now += 6000;
+      if (threaded)
+         retro_sleep(1);
+   }
+   CHECK(state == VIDEO_PLAYER_ENDED && k.nseen == 6 && seen_in_order(&k, 6),
+         "fallback: %d frames, state %d (thread %d refused %d decode %d)",
+         k.nseen, state, threaded, refused, decode_failed);
+   CHECK(f.startup_calls == 1, "fallback: hardware admission repeated");
+   CHECK(k.hw_started == 1 && k.fallback_calls == 3 && !f.hw_on,
+         "fallback: selected hardware again or failed to finish bounded "
+         "restart");
+   if (!refused)
+      CHECK(video_player_due(p) == 2000000,
+            "fallback: movie clock origin reset during recovery");
+   video_player_free(p);
+   CHECK(f.hw_made == f.hw_abandoned,
+         "fallback: unused GPU lease lost or returned twice");
+}
+
+#ifdef VP_TEST_CALLOC_FAULTS
+static int lane_hw_alloc_failure(int fail_at)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t sink;
+   video_player_t *p;
+   unsigned i;
+   int count;
+
+   video_player_worker_deinit();
+   fake_init(&f, 3, 10);
+   f.hw_can = true;
+   sink_init_hw(&k, &sink);
+   retro_atomic_store_relaxed_int(&alloc_count, 0);
+   retro_atomic_store_relaxed_int(&alloc_fail, fail_at);
+   retro_atomic_store_release_int(&alloc_enabled, 1);
+   p = video_player_new(&f, IMAGE_TYPE_MP4, 1, &sink, VIDEO_PLAYER_INLINE);
+   if (p)
+   {
+      for (i = 0; i < 1000; i++)
+      {
+         enum video_player_state state = video_player_poll(p, 1000000);
+         if (video_player_started(p) || state == VIDEO_PLAYER_ENDED)
+            break;
+         retro_sleep(1);
+      }
+      CHECK(i < 1000, "allocation %d: admission never settled", fail_at);
+      for (i = 0; i < 1000 && !video_player_stop(p); i++)
+         retro_sleep(1);
+      CHECK(i < 1000, "allocation %d: cancellation never settled", fail_at);
+      video_player_free(p);
+   }
+   video_player_worker_deinit();
+   retro_atomic_store_release_int(&alloc_enabled, 0);
+   count = retro_atomic_load_acquire_int(&alloc_count);
+   CHECK(!fail_at || count >= fail_at,
+         "allocation %d: fault was not reached", fail_at);
+   CHECK(p || fail_at == 1, "allocation %d: unexpected player failure", fail_at);
+   CHECK(!k.begun[0] && !k.begun[1],
+         "allocation %d: sink slot lost", fail_at);
+   CHECK(f.hw_made == f.hw_abandoned + k.hw_taken,
+         "allocation %d: native lease lost", fail_at);
+   return count;
+}
+
+static void lane_hw_alloc_failures(void)
+{
+   int ordinal;
+   int count = lane_hw_alloc_failure(0);
+   CHECK(count > 0, "allocation faults: no setup allocations observed");
+   for (ordinal = 1; ordinal <= count; ordinal++)
+      lane_hw_alloc_failure(ordinal);
+   printf("hardware admission allocation failures: %d sites\n", count);
+}
+
+#ifdef HAVE_THREADS
+static void lane_hw_worker_failure(void)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t sink;
+   video_player_t *p;
+
+   video_player_worker_deinit();
+   fake_init(&f, 3, 10);
+   f.hw_can = true;
+   f.startup_poll = sthread_get_current_thread_id();
+   sink_init_hw(&k, &sink);
+   sink.present = sink_present;
+   p = video_player_new(&f, IMAGE_TYPE_MP4, 1, &sink, VIDEO_PLAYER_INLINE);
+   CHECK(p != NULL, "worker failure: player allocation");
+   if (!p)
+      return;
+   retro_atomic_store_release_int(&fail_worker, 1);
+   video_player_poll(p, 1000000);
+   CHECK(!retro_atomic_load_acquire_int(&fail_worker),
+         "worker failure: thread creation fault was not reached");
+   CHECK(video_player_started(p) && k.started == 1 && !k.hw_started,
+         "worker failure: software playback did not start");
+   CHECK(!f.startup_calls,
+         "worker failure: native constructor ran without its worker");
+   CHECK(video_player_stop(p), "worker failure: stop did not settle");
+   video_player_free(p);
+   CHECK(!k.begun[0] && !k.begun[1], "worker failure: sink slot lost");
+   puts("hardware admission worker creation failure: passed");
+}
+#endif
+#endif
+
+#ifdef HAVE_THREADS
+static void lane_hw_failure_deadline(bool recover)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t sink;
+   video_player_t *p;
+   unsigned i;
+   enum video_player_state state = VIDEO_PLAYER_PLAYING;
+   fake_init(&f, 6, 5);
+   f.hw_can = true;
+   f.hw_fail_from = 1;
+   f.movie_ns = f.hw_failure_ns = (int64_t)30000 * 1000000;
+   sink_init_hw(&k, &sink);
+   sink.present = fallback_present;
+   k.fallback_stream = &f;
+   k.fallback_threaded = true;
+   k.fallback_caller = sthread_get_current_thread_id();
+   p = video_player_new(&f, IMAGE_TYPE_MP4, 1, &sink, 0);
+   CHECK(p && (!recover || video_player_set_hw_fallback(p, fallback_restart, &k)),
+         "failure deadline: setup");
+   if (!p)
+      return;
+   settle_hw_start(p, 1000000);
+   for (i = 0; i < 1000 && !k.nseen; i++)
+   {
+      state = video_player_poll(p, 1000000);
+      if (state == VIDEO_PLAYER_ENDED)
+         break;
+      retro_sleep(1);
+   }
+   CHECK(recover ? state == VIDEO_PLAYER_PLAYING && k.nseen == 1
+         && k.seen[0] == 0 && k.fallback_calls == 1
+         : state == VIDEO_PLAYER_ENDED && !k.nseen && !k.fallback_calls,
+         "failure deadline: waited for movie end (recovery %d)", recover);
+   for (i = 0; i < 1000 && !video_player_stop(p); i++)
+      retro_sleep(1);
+   CHECK(i < 1000, "failure deadline: stop did not settle");
+   video_player_free(p);
+   CHECK(f.hw_made == f.hw_abandoned, "failure deadline: native lease lost");
+}
+#endif
+
+static void lane_empty_movie_deadline(bool threaded, bool completed)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t sink;
+   video_player_t *p;
+   unsigned i;
+   enum video_player_state state = VIDEO_PLAYER_PLAYING;
+
+   fake_init(&f, completed ? 0 : 6, 5);
+   f.failed_stream = !completed;
+   f.movie_ns = (int64_t)30000 * 1000000;
+   sink_init(&k, &sink, true);
+   p = video_player_new(&f, IMAGE_TYPE_MP4, 1, &sink,
+         threaded ? 0 : VIDEO_PLAYER_INLINE);
+   CHECK(p != NULL, "empty movie: setup");
+   if (!p)
+      return;
+   for (i = 0; i < 1000 && state == VIDEO_PLAYER_PLAYING; i++)
+   {
+      state = video_player_poll(p, 1000000);
+      if (threaded)
+         retro_sleep(1);
+   }
+   CHECK(state == VIDEO_PLAYER_ENDED && !k.nseen
+         && !video_player_completed(p),
+         "empty movie: waited for movie end (thread %d, completed %d)",
+         threaded, completed);
+   for (i = 0; i < 1000 && !video_player_stop(p); i++)
+      retro_sleep(1);
+   CHECK(i < 1000, "empty movie: stop did not settle");
+   video_player_free(p);
+}
+
+static void lane_hw_start_result(bool refused)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t sink;
+   video_player_t *p;
+   enum video_player_state state = VIDEO_PLAYER_PLAYING;
+   unsigned i;
+
+   fake_init(&f, 3, 10);
+   f.hw_can = true;
+   sink_init_hw(&k, &sink);
+   k.hw_start_refused = refused;
+   k.hw_start_waits = refused ? 0 : 2;
+   p = video_player_new(&f, IMAGE_TYPE_MP4, 1, &sink, VIDEO_PLAYER_INLINE);
+   CHECK(p != NULL, "admission result: allocation");
+   if (!p)
+      return;
+   for (i = 0; i < 1000; i++)
+   {
+      state = video_player_poll(p, 1000000);
+      if (state == VIDEO_PLAYER_ENDED || video_player_started(p))
+         break;
+      retro_sleep(1);
+   }
+   if (refused)
+      CHECK(state == VIDEO_PLAYER_ENDED && k.hw_started == 1 && !k.started,
+            "permanent admission refusal without recovery did not end");
+   else
+      CHECK(state == VIDEO_PLAYER_PLAYING && video_player_started(p) &&
+                  k.hw_started == 3 && !k.started,
+            "temporary admission retry did not start hardware");
+#ifdef HAVE_THREADS
+   CHECK(f.startup_calls == 1, "admission result: constructor repeated");
+#endif
+   for (i = 0; i < 1000 && !video_player_stop(p); i++)
+      retro_sleep(1);
+   CHECK(i < 1000, "admission result: stop did not settle");
+   video_player_free(p);
+   CHECK(f.hw_made == f.hw_abandoned + k.hw_taken,
+         "admission result: native lease lost");
+}
+
+static void lane_hw_recovery_state(bool threaded, bool paused, bool seek_first)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t sink;
+   video_player_t *p;
+   seek_test_t seek;
+   enum video_player_state state = VIDEO_PLAYER_PLAYING;
+   int64_t now = 1000000;
+   int64_t position = -1;
+   unsigned i;
+
+   fake_init(&f, 12, 10);
+   f.hw_can = true;
+   f.movie_ns = 1000000000;
+   sink_init_hw(&k, &sink);
+   k.fallback_stream = &f;
+   k.fallback_threaded = threaded;
+   k.fallback_async = true;
+#ifdef HAVE_THREADS
+   k.fallback_caller = sthread_get_current_thread_id();
+#endif
+   sink.present = fallback_present;
+   memset(&seek, 0, sizeof(seek));
+   seek.stream = &f;
+   retro_atomic_int_init(&seek.steps, 0);
+   retro_atomic_int_init(&seek.gate, 1);
+   p = video_player_new(&f, IMAGE_TYPE_MP4, 1, &sink,
+                        threaded ? 0 : VIDEO_PLAYER_INLINE);
+   CHECK(p && video_player_set_hw_fallback(p, fallback_restart, &k),
+         "recovery state: setup");
+   if (!p)
+      return;
+   if (seek_first)
+      CHECK(video_player_set_seek_handler(p, seek_step, &seek) &&
+                  video_player_seek(p, 40000),
+            "recovery state: initial seek");
+   settle_hw_start(p, now);
+   for (i = 0; i < 1000 && k.held < 0; i++)
+   {
+      video_player_poll(p, now);
+      retro_sleep(1);
+   }
+   CHECK(k.held >= 0 && !k.nseen, "recovery state: initial GPU lease");
+   if (seek_first)
+      CHECK(video_player_seek_position(p, &position) && position == 40000,
+            "recovery state: initial seek did not complete");
+   video_player_set_paused(p, paused, now);
+   CHECK(video_player_request_software(p), "recovery state: refusal request");
+   video_hw_frame_abandon(&k.fallback_held);
+   video_player_slot_released(p, (unsigned)k.held);
+   k.held = -1;
+   for (i = 0; i < 1000 && !k.nseen; i++)
+   {
+      state = video_player_poll(p, now);
+      retro_sleep(1);
+   }
+   CHECK(state == VIDEO_PLAYER_PLAYING && k.nseen == 1 &&
+               k.seen[0] == (seek_first ? 4 : 0),
+         "recovery state: first software frame %d, count %d (thread %d pause "
+         "%d seek %d)",
+         k.seen[0], k.nseen, threaded, paused, seek_first);
+   CHECK(video_player_paused(p) == paused, "recovery state: pause changed");
+   if (seek_first)
+      CHECK(seek.restarts == 2 && video_player_seek_position(p, &position) &&
+                  position == 40000,
+            "recovery state: target not restored");
+   for (i = 0; i < 1000 && !video_player_stop(p); i++)
+      retro_sleep(1);
+   CHECK(i < 1000, "recovery state: stop did not settle");
+   video_player_free(p);
+   CHECK(f.hw_made == f.hw_abandoned, "recovery state: native lease lost");
+}
+
+static void lane_hw_fallback_stop(bool threaded, bool cancel)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t sink;
+   video_player_t *p;
+   enum video_player_state state = VIDEO_PLAYER_PLAYING;
+   int polls;
+   int64_t now = 0;
+   fake_init(&f, 6, 5);
+   f.hw_can = true;
+   sink_init_hw(&k, &sink);
+   k.fallback_stream = &f;
+   k.fallback_threaded = threaded;
+   k.fallback_error = !cancel;
+   k.fallback_waits = cancel ? 10000 : 0;
+#ifdef HAVE_THREADS
+   k.fallback_caller = sthread_get_current_thread_id();
+#endif
+   sink.present = fallback_present;
+   p = video_player_new(&f, IMAGE_TYPE_MP4, 1, &sink,
+                        threaded ? 0 : VIDEO_PLAYER_INLINE);
+   CHECK(p && video_player_set_hw_fallback(p, fallback_restart, &k),
+         "fallback stop: setup");
+   for (polls = 0; polls < 1000 && state == VIDEO_PLAYER_PLAYING; polls++)
+   {
+      state = video_player_poll(p, now);
+      now += 6000;
+      if (cancel && retro_atomic_load_acquire_int(&k.fallback_entered))
+         break;
+      if (threaded || !video_player_started(p))
+         retro_sleep(1);
+   }
+   if (cancel)
+   {
+      CHECK(retro_atomic_load_acquire_int(&k.fallback_entered),
+            "fallback stop: callback never ran");
+      for (polls = 0; polls < 1000 && !video_player_stop(p); polls++)
+         retro_sleep(1);
+      CHECK(polls < 1000, "fallback stop: decoder owner never settled");
+   }
+   else
+      CHECK(state == VIDEO_PLAYER_ENDED && k.fallback_calls == 1,
+            "fallback stop: failed restart retried forever");
+   CHECK(video_player_poll(p, now) == VIDEO_PLAYER_ENDED && !k.nseen,
+         "fallback stop: stopped player resumed");
+   video_player_free(p);
+   CHECK(f.hw_made == f.hw_abandoned,
+         "fallback stop: GPU lease lost or returned twice");
+}
+
+static void lane_nonmovie_hw_sink(void)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t sink;
+   video_player_t *p;
+   fake_init(&f, 2, 10);
+   f.hw_can = true;
+   sink_init_hw(&k, &sink);
+   sink.present = fallback_present;
+   p = video_player_new(&f, IMAGE_TYPE_WEBP, 1, &sink, VIDEO_PLAYER_INLINE);
+   CHECK(p != NULL, "nonmovie startup: allocation");
+   if (!p)
+      return;
+   video_player_poll(p, 1000000);
+   CHECK(!f.startup_calls && !k.hw_started && k.started == 1 && k.nseen == 1,
+         "nonmovie startup: deferred an unsupported hardware probe");
+   video_player_free(p);
+}
+
+#ifdef HAVE_THREADS
+static enum video_player_present
+startup_present(void *user, const video_player_frame_t *frame)
+{
+   return frame->hw ? sink_present_hw(user, frame) : sink_present(user, frame);
+}
+static void lane_hw_startup(bool inline_frames, bool cancel, bool available)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t sink;
+   video_player_t *p;
+   unsigned i;
+   fake_init(&f, 3, 5);
+   f.hw_can = available;
+   sink_init_hw(&k, &sink);
+   sink.present = startup_present;
+   sink.slot_end = sink_slot_end;
+   f.startup_poll = sthread_get_current_thread_id();
+   retro_atomic_store_release_int(&f.startup_hold, 1);
+   p = video_player_new(&f, IMAGE_TYPE_MP4, 1, &sink,
+                        inline_frames ? VIDEO_PLAYER_INLINE : 0);
+   CHECK(p != NULL, "startup gate: allocation");
+   if (!p)
+      return;
+   CHECK(video_player_poll(p, 1000000) == VIDEO_PLAYER_PLAYING,
+         "startup gate: first poll");
+   for (i = 0; i < 1000 && !retro_atomic_load_acquire_int(&f.startup_entered);
+        i++)
+      retro_sleep(1);
+   CHECK(retro_atomic_load_acquire_int(&f.startup_entered),
+         "startup gate: constructor never entered");
+   CHECK(f.startup_thread != f.startup_poll,
+         "startup gate: polling constructor");
+   CHECK(!video_player_started(p) && !k.started && !k.hw_started && !k.nseen,
+         "startup gate: sink or decode ran before native setup settled");
+   CHECK(video_player_poll(p, 1000000) == VIDEO_PLAYER_PLAYING,
+         "startup gate: pending poll");
+   if (cancel)
+      CHECK(!video_player_stop(p),
+            "startup gate: running constructor not retained");
+   retro_atomic_store_release_int(&f.startup_hold, 0);
+   if (cancel)
+   {
+      for (i = 0; i < 1000 && !video_player_stop(p); i++)
+         retro_sleep(1);
+      CHECK(i < 1000 && video_player_poll(p, 1000000) == VIDEO_PLAYER_ENDED,
+            "startup gate: cancelled constructor did not settle");
+      CHECK(!k.started && !k.hw_started && !k.nseen,
+            "startup gate: stopped sink resumed");
+   }
+   else
+   {
+      settle_hw_start(p, 1000000);
+      CHECK((k.hw_started != 0) == available,
+            "startup gate: incorrect hardware admission");
+   }
+   CHECK(f.startup_calls == 1, "startup gate: constructor repeated");
+   video_player_free(p);
+   if (cancel || available)
+      CHECK(!k.ended, "startup gate: ended an unlent sink slot");
+   CHECK(f.hw_made == f.hw_abandoned + k.hw_taken, "startup gate: lease lost");
+}
+static void lane_hw_startup_seek(bool inline_frames)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t sink;
+   video_player_t *p;
+   seek_test_t seek;
+   unsigned i;
+   int64_t position = -1;
+   fake_init(&f, 12, 10);
+   f.hw_can = true;
+   f.startup_poll = sthread_get_current_thread_id();
+   sink_init_hw(&k, &sink);
+   memset(&seek, 0, sizeof(seek));
+   seek.stream = &f;
+   retro_atomic_int_init(&seek.steps, 0);
+   retro_atomic_int_init(&seek.gate, 1);
+   retro_atomic_store_release_int(&f.startup_hold, 1);
+   p = video_player_new(&f, IMAGE_TYPE_MP4, 1, &sink,
+                        inline_frames ? VIDEO_PLAYER_INLINE : 0);
+   CHECK(p && video_player_set_seek_handler(p, seek_step, &seek),
+         "startup seek: setup");
+   if (!p)
+      return;
+   video_player_poll(p, 1000000);
+   for (i = 0; i < 1000 && !retro_atomic_load_acquire_int(&f.startup_entered);
+        i++)
+      retro_sleep(1);
+   CHECK(retro_atomic_load_acquire_int(&f.startup_entered),
+         "startup seek: admission never entered");
+   CHECK(video_player_seek(p, 20000) && video_player_seek(p, 40000),
+         "startup seek: requests rejected");
+   video_player_poll(p, 1000000);
+   CHECK(!retro_atomic_load_acquire_int(&seek.steps) && !k.nseen,
+         "startup seek: transport raced native admission");
+   retro_atomic_store_release_int(&f.startup_hold, 0);
+   for (i = 0; i < 1000 && !k.nseen; i++)
+   {
+      video_player_poll(p, 1000000);
+      retro_sleep(1);
+   }
+   CHECK(k.nseen && k.seen[0] == 4 && seek.restarts == 1,
+         "startup seek: latest target was not the first picture");
+   CHECK(video_player_seek_position(p, &position) && position == 40000,
+         "startup seek: target did not complete");
+   while (!video_player_stop(p))
+      retro_sleep(1);
+   video_player_free(p);
+   CHECK(f.startup_calls == 1 && f.hw_made == f.hw_abandoned + k.hw_taken,
+         "startup seek: repeated admission or lost frame");
+}
+static void lane_hw_startup_queued_cancel(void)
+{
+   static fake_t f[2];
+   static sink_t k[2];
+   video_player_sink_t sink[2];
+   video_player_t *p[2];
+   unsigned i;
+   for (i = 0; i < 2; i++)
+   {
+      fake_init(&f[i], 3, 5);
+      f[i].hw_can = true;
+      f[i].startup_poll = sthread_get_current_thread_id();
+      sink_init_hw(&k[i], &sink[i]);
+      sink[i].slot_end = sink_slot_end;
+      p[i] = video_player_new(&f[i], IMAGE_TYPE_MP4, 1, &sink[i], 0);
+      CHECK(p[i] != NULL, "startup queue: allocation");
+   }
+   retro_atomic_store_release_int(&f[0].startup_hold, 1);
+   video_player_poll(p[0], 1000000);
+   for (i = 0;
+        i < 1000 && !retro_atomic_load_acquire_int(&f[0].startup_entered); i++)
+      retro_sleep(1);
+   CHECK(retro_atomic_load_acquire_int(&f[0].startup_entered),
+         "startup queue: owner never entered");
+   video_player_poll(p[1], 1000000);
+   CHECK(video_player_stop(p[1]), "startup queue: queued cancellation waited");
+   video_player_free(p[1]);
+   retro_atomic_store_release_int(&f[0].startup_hold, 0);
+   for (i = 0; i < 1000 && !video_player_stop(p[0]); i++)
+      retro_sleep(1);
+   CHECK(i < 1000, "startup queue: owner never settled");
+   video_player_free(p[0]);
+   video_player_worker_deinit();
+   CHECK(!f[1].startup_calls && !k[1].hw_started && !k[1].nseen,
+         "startup queue: cancelled constructor ran");
+   CHECK(!k[0].ended && !k[1].ended,
+         "startup queue: ended an unlent sink slot");
+}
+#endif
+
+#ifdef HAVE_THREADS
+static void lane_delayed_slot_releases(void)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t sink;
+   video_player_t *player;
+   unsigned tick, released = 4, i;
+   enum video_player_state state = VIDEO_PLAYER_PLAYING;
+   fake_init(&f, 8, 10);
+   sink_init(&k, &sink, true);
+   k.queue_every = 1;
+   player = video_player_new(&f, IMAGE_TYPE_WEBM, 2, &sink, 0);
+   CHECK(player != NULL, "delayed release: allocation");
+   if (!player) return;
+   for (tick = 0; tick < 1000 && k.nseen < 2; tick++)
+   {
+      video_player_poll(player, (int64_t)tick * 10000);
+      retro_sleep(1);
+   }
+   CHECK(k.nseen == 2, "delayed release: both slots retained");
+   k.held = -1;
+   video_player_slot_released(player, 0);
+   video_player_slot_released(player, 1);
+   for (; tick < 2000 && k.nseen < 4; tick++)
+   {
+      video_player_poll(player, (int64_t)tick * 10000);
+      retro_sleep(1);
+   }
+   CHECK(k.nseen == 4 && !k.bad_px,
+         "delayed release: decoding resumes after both releases");
+   k.held = -1;
+   video_player_slot_released(player, 0);
+   video_player_slot_released(player, 1);
+   for (; tick < 4000 && state != VIDEO_PLAYER_ENDED; tick++)
+   {
+      state = video_player_poll(player, (int64_t)tick * 10000);
+      if (k.nseen >= (int)released + 2)
+      {
+         released = (unsigned)k.nseen;
+         k.held = -1;
+         video_player_slot_released(player, 0);
+         video_player_slot_released(player, 1);
+      }
+      retro_sleep(1);
+   }
+   CHECK(state == VIDEO_PLAYER_ENDED && k.nseen == 16,
+         "delayed release: exactly two complete loops");
+   for (i = 0; i < 16 && i < (unsigned)k.nseen; i++)
+      CHECK(k.seen[i] == (int)(i % 8), "delayed release: frame order");
+   k.held = -1;
+   video_player_slot_released(player, 0);
+   video_player_slot_released(player, 1);
+   while (!video_player_stop(player)) retro_sleep(1);
+   video_player_free(player);
+   video_player_worker_deinit();
+}
+#endif
+
 int main(void)
 {
+#ifdef VP_TEST_CALLOC_FAULTS
+   retro_atomic_int_init(&alloc_count, 0);
+   retro_atomic_int_init(&alloc_fail, 0);
+   retro_atomic_int_init(&alloc_enabled, 0);
+#ifdef HAVE_THREADS
+   retro_atomic_int_init(&fail_worker, 0);
+   lane_hw_worker_failure();
+#endif
+   lane_hw_alloc_failures();
+#endif
+   if (getenv("VP_TEST_RECOVERY_ONLY"))
+      goto recovery_only;
+   lane_nonmovie_hw_sink();
+#ifdef HAVE_THREADS
+   lane_hw_startup_seek(false);
+   lane_hw_startup_seek(true);
+   lane_hw_startup_queued_cancel();
+   lane_hw_startup(false,false,true);
+   lane_hw_startup(true,false,true);
+   lane_hw_startup(false,false,false);
+   lane_hw_startup(true,false,false);
+   lane_hw_startup(false,true,true);
+   lane_hw_startup(true,true,true);
+#endif
+   lane_hw_fallback_stop(false,false);
+   lane_hw_fallback_stop(false,true);
+   lane_hw_fallback(false,false,false,false);
+   lane_hw_fallback(false,true,false,false);
+   lane_hw_fallback(false,false,true,false);
+   lane_hw_fallback(false,false,false,true);
+#ifdef HAVE_THREADS
+   lane_hw_fallback_stop(true,false);
+   lane_hw_fallback_stop(true,true);
+   lane_hw_fallback(true,false,false,false);
+   lane_hw_fallback(true,true,false,false);
+   lane_hw_fallback(true,false,true,false);
+   lane_hw_fallback(true,false,false,true);
+#endif
+   lane_movie_stop(false);
+   lane_movie(false, false, false);
+   lane_movie(false, true, true);
+#ifdef HAVE_THREADS
+   lane_movie_stop(true);
+   lane_movie(true, false, true);
+   lane_movie(true, true, false);
+#endif
+   lane_input_wait(false, false);
+   lane_input_wait(false, true);
+   lane_seek(false, false);
+   lane_seek(false, true);
+   lane_seek_stop(false);
+   lane_seek_progress(false);
+   lane_seek_peer(false, false);
+   lane_seek_peer(false, true);
+   lane_pause(false);
+#ifdef HAVE_THREADS
+   lane_input_wait(true, true);
+   lane_seek(true, false);
+   lane_seek(true, true);
+   lane_seek_stop(true);
+   lane_seek_progress(true);
+   lane_seek_peer(true, false);
+   lane_seek_peer(true, true);
+   lane_pause(true);
+#endif
+   lane_cadence_loops(false);
+   lane_timestamp_precision(false);
+   lane_cadence(false, 0, false);
+   lane_cadence(false, 1, false);
+   lane_cadence(false, 2, false);
+   lane_cadence(false, 0, true);
+#ifdef HAVE_THREADS
+   lane_cadence_loops(true);
+   lane_timestamp_precision(true);
+   lane_cadence(true, 0, false);
+   lane_cadence(true, 1, false);
+   lane_cadence(true, 2, false);
+   lane_cadence(true, 0, true);
+#endif
+   lane_inline_release();
    lane_padded();
    lane_inline_pacing(false);
    lane_inline_pacing(true);
@@ -790,11 +2360,32 @@ int main(void)
    lane_fp16();
    lane_hw_inline();
 #ifdef HAVE_THREADS
+   lane_delayed_slot_releases();
    lane_hw_threaded();
    lane_threaded(true);
    lane_threaded(false);
    lane_churn();
 #endif
+recovery_only:
+   lane_empty_movie_deadline(false, false);
+   lane_empty_movie_deadline(false, true);
+#ifdef HAVE_THREADS
+   lane_empty_movie_deadline(true, false);
+   lane_empty_movie_deadline(true, true);
+   lane_hw_failure_deadline(true);
+   lane_hw_failure_deadline(false);
+#endif
+   lane_hw_start_result(true);
+   lane_hw_start_result(false);
+   lane_hw_recovery_state(false, true, false);
+   lane_hw_recovery_state(false, false, true);
+   lane_hw_recovery_state(false, true, true);
+#ifdef HAVE_THREADS
+   lane_hw_recovery_state(true, true, false);
+   lane_hw_recovery_state(true, false, true);
+   lane_hw_recovery_state(true, true, true);
+#endif
+   video_player_worker_deinit();
    if (failures)
    {
       printf("%d failure(s)\n", failures);

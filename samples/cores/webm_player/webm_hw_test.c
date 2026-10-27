@@ -70,6 +70,7 @@ static bool start_core(int hardware)
 int main(void)
 {
    unsigned i, before, decoded;
+   int64_t restart_clock, restart_pts, restart_ordinal;
    uint8_t state[40];
    hevc_stream_checks_main();
    rh265_set_hw_backend(&backend);
@@ -158,17 +159,42 @@ int main(void)
    memset(&held, 0, sizeof(held));
    rh265_set_hw_backend(NULL);
    rh265_set_hw_backend(&backend);
+   restart_clock = media_player.play_ns;
+   restart_pts = media_player.vpts_ns;
+   restart_ordinal = media_player.vshown;
+   decode_busy = output_busy = 1;
+   media_video_hw_ready();
+   CHECK(media_player.hw_restart == 2);
+   decoded = opened;
+   media_video_hw_ready();
+   CHECK(!media_player.hw_restart && opened == decoded);
+   CHECK(media_player.play_ns == restart_clock
+         && media_player.vpts_ns == restart_pts
+         && media_player.vshown == restart_ordinal);
    retro_run();
    CHECK(media_player.hw_video && !media_player.hw_restart && opened == closed + 1);
-   media_suspend_video_hw();
-   CHECK(opened == closed && exported == abandoned);
-   memset(&held, 0, sizeof(held));
    sink_ready = 0;
    expect_software = 1;
+   before = sink_calls;
    retro_run();
    CHECK(!media_player.hw_video && media_player.hw_started);
+   CHECK(opened == closed && exported == abandoned && sink_calls == before);
+   CHECK(!media_player.hw_frame.image && !media_player.hw_restart);
+   CHECK(media_player.fb && media_player.fb[0] != 0);
+   memset(&held, 0, sizeof(held));
    media_suspend_video_hw();
    sink_ready = 1;
+   restart_clock = media_player.play_ns;
+   restart_pts = media_player.vpts_ns;
+   restart_ordinal = media_player.vshown;
+   before = cpu_ticks;
+   decode_busy = output_busy = 100;
+   retro_run();
+   CHECK(media_player.hw_restart == 2 && cpu_ticks == before + 1);
+   CHECK(media_player.play_ns == restart_clock + media_player.frame_ns
+         && media_player.vpts_ns == restart_pts
+         && media_player.vshown == restart_ordinal);
+   decode_busy = output_busy = 0;
    media_video_hw_ready();
    CHECK(media_player.hw_video && media_player.hw_started);
    retro_unload_game();

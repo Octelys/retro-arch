@@ -8,6 +8,7 @@
 #include <stdio.h>
 
 struct defaults g_defaults;
+void RARCH_ERR(const char *fmt, ...) { (void)fmt; }
 
 bool *audio_get_bool_ptr(enum audio_action action)
 {
@@ -57,6 +58,7 @@ bool retroarch_ctl(enum rarch_ctl_state state, void *data)
 { (void)state; (void)data; return false; }
 bool retroarch_override_setting_is_set(enum rarch_override_setting enum_idx, void *data)
 { (void)enum_idx; (void)data; return false; }
+uint32_t retroarch_get_flags(void) { return 0; }
 
 int main(void)
 {

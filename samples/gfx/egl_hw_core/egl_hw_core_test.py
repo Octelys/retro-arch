@@ -17,6 +17,16 @@ one of those is the path taken:
   threaded                  EGL_KHR_surfaceless_context
   threaded, pbuffer         a pbuffer on the context's own config
   threaded, pbuffer config  a pbuffer on a config searched for
+  threaded, one context     no share context can be made: the driver's
+                            one context is handed between the threads
+  threaded, one context,    the same with a swap slower than the push's
+  slow swap                 wait for the video thread's turn: the core
+                            runs ahead and the ring fills, and the run
+                            must still finish
+  threaded, one context,    every other frame a dupe, pushed while the
+  menu up, dupes            core holds the one context, with the menu
+                            open over the running core: the run must
+                            finish
   unthreaded                the driver's own context, as ever
 
 Needs Xvfb (xvfb-run) and a software GL (Mesa llvmpipe).
@@ -84,7 +94,8 @@ def read_png(path):
     return width, height, rows
 
 
-def run(retroarch, name, threaded, hide, cache_fbo=False, frames=20):
+def run(retroarch, name, threaded, hide, cache_fbo=False, frames=20,
+        menu=False):
     d = tempfile.mkdtemp(prefix="egl_hw_core_")
     try:
         shot = os.path.join(d, "shot.png")
@@ -104,6 +115,8 @@ def run(retroarch, name, threaded, hide, cache_fbo=False, frames=20):
                 'audio_driver = "null"',
                 'input_driver = "null"',
                 'menu_driver = "rgui"',
+                'menu_pause_libretro = "false"',
+                'stdin_cmd_enable = "%s"' % ("true" if menu else "false"),
                 'config_save_on_exit = "false"',
                 'screenshot_directory = "%s"' % d,
                 ""]))
@@ -114,11 +127,19 @@ def run(retroarch, name, threaded, hide, cache_fbo=False, frames=20):
             env["EGL_HW_CORE_SHIM"]  = hide
         if cache_fbo:
             env["EGL_HW_CORE_CACHE_FBO"] = "1"
+        if menu:
+            env["EGL_HW_CORE_DUPE"] = "1"
         cmd = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24", retroarch,
                "--config=" + cfg, "-L", CORE, "--max-frames=%d" % frames,
                "--max-frames-ss", "--max-frames-ss-path=" + shot, "-v"]
-        proc = subprocess.run(cmd, env=env, stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT, timeout=120)
+        try:
+            proc = subprocess.run(cmd, env=env, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, timeout=120,
+                                  input=b"MENU_TOGGLE\n" if menu else b"")
+        except subprocess.TimeoutExpired as e:
+            sys.stdout.write((e.output or b"").decode("utf-8", "replace")[-4000:])
+            print("FAIL %s: retroarch did not finish (hung)" % name)
+            return False
         log  = proc.stdout.decode("utf-8", "replace")
 
         def fail(why):
@@ -135,7 +156,16 @@ def run(retroarch, name, threaded, hide, cache_fbo=False, frames=20):
             return fail("the core was given no context")
         if "[egl_hw_core] context_reset: GL_VERSION" not in log:
             return fail("the core's context_reset did not run")
-        if bool(hide) != ("[egl_shim] pbuffer created" in log):
+        if "noshare" in hide:
+            if "[egl_shim] share context refused" not in log:
+                return fail("the shim did not refuse the share context")
+            if "[EGL] Created shared context" in log:
+                return fail("a shared context was made anyway")
+            if "one GL context, handed between" not in log:
+                return fail("the ring did not hand the one context off")
+            if "could not be made current" in log:
+                return fail("a bind failed on the way to the handoff")
+        elif bool(hide) != ("[egl_shim] pbuffer created" in log):
             return fail("the core's context is %s a pbuffer"
                         % ("not on" if hide else "on"))
         # A core that keeps the framebuffer from context_reset renders
@@ -146,6 +176,10 @@ def run(retroarch, name, threaded, hide, cache_fbo=False, frames=20):
                         % ("did not cache" if cache_fbo else "cached"))
         if proc.returncode != 0:
             return fail("retroarch exited with %d" % proc.returncode)
+        if menu:
+            # The screenshot is the menu's; finishing is the check.
+            print("ok   %s" % name)
+            return True
         if not os.path.exists(shot):
             return fail("no screenshot")
         w, h, rows = read_png(shot)
@@ -168,10 +202,14 @@ def main():
         ("threaded",                 True,  "",                   False),
         ("threaded, pbuffer",        True,  "surfaceless",        False),
         ("threaded, pbuffer config", True,  "surfaceless,pbuffer", False),
+        ("threaded, one context",    True,  "noshare",            False),
+        ("threaded, one context, cached FBO", True, "noshare",    True),
+        ("threaded, one context, slow swap", True, "noshare,slowswap", False),
         ("threaded, cached FBO",     True,  "",                   True),
         ("unthreaded",               False, "",                   False),
     ]
-    ok = True
+    ok = run(retroarch, "threaded, one context, menu up, dupes", True,
+             "noshare", menu=True)
     for name, threaded, hide, cache_fbo in cases:
         if cache_fbo:
             # Which slot the core cached depends on when context_reset

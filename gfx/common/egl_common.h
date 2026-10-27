@@ -96,6 +96,8 @@ void egl_bind_hw_render(egl_ctx_data_t *egl, bool enable);
  * gfx_ctx_driver_t::release_current. */
 void egl_release_current(egl_ctx_data_t *egl);
 
+bool egl_no_shared_context(const egl_ctx_data_t *egl);
+
 /* gfx_ctx_driver_t's shared context: in egl->ctx's share group, made
  * with egl_create_context's attributes for client API 'api', and
  * surfaceless where the display allows it, else with a pbuffer of its
@@ -140,6 +142,20 @@ bool egl_create_context(egl_ctx_data_t *egl, const EGLint *egl_attribs);
 bool egl_create_surface(egl_ctx_data_t *egl, void *native_window);
 
 bool egl_destroy_surface(egl_ctx_data_t *egl);
+
+#ifdef HAVE_VIDEO_WINDOWS
+/* A secondary window's surface on egl's config, with the main window's
+ * attributes. Bind makes egl->ctx current on it, giving it swap interval
+ * 0 when 'interval' is set (once is enough, the interval is the
+ * surface's), or on egl->surf for EGL_NO_SURFACE. Free puts the context
+ * back on egl->surf first where the surface is current. None of them
+ * log. */
+EGLSurface egl_window_surface_new(egl_ctx_data_t *egl, void *native_window);
+bool egl_window_surface_bind(egl_ctx_data_t *egl, EGLSurface surf,
+      bool interval);
+bool egl_window_surface_swap(egl_ctx_data_t *egl, EGLSurface surf);
+void egl_window_surface_free(egl_ctx_data_t *egl, EGLSurface surf);
+#endif
 
 bool egl_get_native_visual_id(egl_ctx_data_t *egl, EGLint *value);
 

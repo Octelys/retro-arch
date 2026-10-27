@@ -63,6 +63,9 @@
 #include "../../record/record_driver.h"
 #include "../../verbosity.h"
 #include "../common/gl2_common.h"
+#ifdef GL2_KMS_FRAMES
+#include "../common/drm_common.h"
+#endif
 
 #ifdef HAVE_THREADS
 #include "../video_thread_wrapper.h"
@@ -1691,8 +1694,15 @@ static void gl2_load_texture_image(GLenum target,
    }
 }
 
+static void gl2_create_fbo_texture(gl2_t *gl,
+      gl2_renderchain_data_t *chain,
+      unsigned i, GLuint texture,
+      bool video_smooth, bool force_srgb_disable);
+
 static bool gl2_recreate_fbo(
-      struct video_fbo_rect *fbo_rect,
+      gl2_t *gl,
+      gl2_renderchain_data_t *chain,
+      unsigned i,
       GLuint fbo,
       GLuint* texture
       )
@@ -1700,13 +1710,9 @@ static bool gl2_recreate_fbo(
    gl2_bind_fb(fbo);
    glDeleteTextures(1, texture);
    glGenTextures(1, texture);
-   glBindTexture(GL_TEXTURE_2D, *texture);
-   gl2_load_texture_image(GL_TEXTURE_2D,
-         0, RARCH_GL_INTERNAL_FORMAT32,
-         VIDEO_SCALE_W(fbo_rect->dims),
-         VIDEO_SCALE_H(fbo_rect->dims),
-         0, RARCH_GL_TEXTURE_TYPE32,
-         RARCH_GL_FORMAT32, NULL);
+   gl2_create_fbo_texture(gl, chain, i, *texture,
+         (gl->flags & GL2_FLAG_FBO_SMOOTH) != 0,
+         (gl->flags & GL2_FLAG_FBO_SRGB_DISABLE) != 0);
 
    gl2_fb_texture_2d(RARCH_GL_FRAMEBUFFER,
          RARCH_GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
@@ -1980,7 +1986,7 @@ static void gl2_renderchain_deinit_fbo(gl2_t *gl,
 static void gl2_bind_core_context(gl2_t *gl, bool enable)
 {
    if (     (gl->flags & GL2_FLAG_SHARED_CONTEXT_USE)
-         && !(gl->flags & GL2_FLAG_HW_RING))
+         && !retro_atomic_load_acquire_int(&gl->hw_ring))
       gl->ctx_driver->bind_hw_render(gl->ctx_data, enable);
 }
 
@@ -2333,6 +2339,60 @@ static void gl2_renderchain_recompute_pass_sizes(
 
       last_dims              = fbo_rect->img_dims;
       last_max_dims          = fbo_rect->max_img_dims;
+   }
+}
+
+/* Each pass's target remade larger where its pass, as
+ * gl2_renderchain_recompute_pass_sizes() last sized them, draws past
+ * it. Never smaller, so outputs of different sizes take turns without
+ * remaking anything. */
+static void gl2_renderchain_grow_fbos(gl2_t *gl,
+      gl2_renderchain_data_t *chain)
+{
+   size_t i;
+   for (i = 0; i < (size_t)chain->fbo_pass; i++)
+   {
+      struct video_fbo_rect *fbo_rect = &gl->fbo_rect[i];
+      if (fbo_rect)
+      {
+         unsigned img_width   = VIDEO_SCALE_W(fbo_rect->max_img_dims);
+         unsigned img_height  = VIDEO_SCALE_H(fbo_rect->max_img_dims);
+
+         if (     (img_width  > VIDEO_SCALE_W(fbo_rect->dims))
+               || (img_height > VIDEO_SCALE_H(fbo_rect->dims)))
+         {
+            /* Check proactively since we might suddenly
+             * get sizes of tex_w width or tex_h height. */
+            unsigned max                    = img_width > img_height ? img_width : img_height;
+            unsigned pow2_size              = next_pow2(max);
+            bool update_feedback            = (gl->flags & GL2_FLAG_FBO_FEEDBACK_ENABLE)
+               && (unsigned)i == gl->fbo_feedback_pass;
+
+            fbo_rect->dims                  = VIDEO_SCALE_PACK(
+                  pow2_size, pow2_size);
+
+            gl2_recreate_fbo(gl, chain, (unsigned)i,
+                  chain->fbo[i], &chain->fbo_texture[i]);
+
+            /* Update feedback texture in-place so we avoid having to
+             * juggle two different fbo_rect structs since they get updated here. */
+            if (update_feedback)
+            {
+               if (gl2_recreate_fbo(gl, chain, (unsigned)i,
+                        gl->fbo_feedback, &gl->fbo_feedback_texture))
+               {
+                  /* Make sure the feedback textures are cleared
+                   * so we don't feedback noise. */
+                  glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                  glClear(GL_COLOR_BUFFER_BIT);
+               }
+            }
+
+            RARCH_LOG("[GL] Recreating FBO texture #%d: %ux%u.\n",
+                  i, VIDEO_SCALE_W(fbo_rect->dims),
+                  VIDEO_SCALE_H(fbo_rect->dims));
+         }
+      }
    }
 }
 
@@ -2824,6 +2884,18 @@ error:
    glDisable(GL_DITHER)
 #endif
 
+#ifdef GL2_KMS_FRAMES
+/* The frame textures go: their buffers with them */
+static void gl2_kms_frames_drop(gl2_t *gl)
+{
+   if (!gl->kms_frames)
+      return;
+   /* The cached frame may name one of them */
+   video_driver_cached_frame_retire();
+   egl_gbm_frames_free(&gl->kms_frames);
+}
+#endif
+
 static void gl2_renderchain_copy_frame(
       gl2_t *gl,
       gl2_renderchain_data_t *chain,
@@ -2831,6 +2903,19 @@ static void gl2_renderchain_copy_frame(
       const void *frame,
       unsigned width, unsigned height, unsigned pitch)
 {
+#ifdef GL2_KMS_FRAMES
+   if (gl->kms_frames)
+   {
+      /* Lent and written: the texture takes the buffer, nothing moves */
+      if (egl_gbm_frames_attach(gl->kms_frames, frame, gl->tex_index))
+         return;
+      /* Any other frame goes up into storage of the texture's own */
+      if (egl_gbm_frames_detach(gl->kms_frames, gl->tex_index))
+         gl2_load_texture_image(GL_TEXTURE_2D, 0, gl->internal_fmt,
+               VIDEO_SCALE_W(gl->tex_dims), VIDEO_SCALE_H(gl->tex_dims), 0,
+               gl->texture_type, gl->texture_fmt, gl->empty_buf);
+   }
+#endif
 #if defined(HAVE_PSGL)
    {
       int h;
@@ -3635,7 +3720,8 @@ static bool gl2_core_context_is_mains(gl2_t *gl)
     * path. The live-settings consultation this replaces read
     * settings->arrays.video_driver every frame from the video
     * thread with the main thread running free. */
-   return (gl->flags & (GL2_FLAG_HW_RING | GL2_FLAG_HW_RING_EXPECTED)) != 0;
+   return retro_atomic_load_acquire_int(&gl->hw_ring)
+      || (gl->flags & GL2_FLAG_HW_RING_EXPECTED);
 }
 
 
@@ -3645,14 +3731,41 @@ static bool gl2_core_context_is_mains(gl2_t *gl)
  * context driver created it shared with this thread's at init, with
  * the HW-render FBOs already made inside it. From here on the frame
  * never takes it back. */
+/* True on a context that cannot share: the ring then hands this
+ * driver's one context between the threads (video_thread_hw.c), and
+ * this driver neither makes a shared context nor binds one. Read from
+ * the context driver, whose answer is fixed once it is up. */
+static bool gl2_ctx_no_shared_context(gl2_t *gl)
+{
+   return gl->ctx_driver && gl->ctx_driver->get_flags
+      && BIT32_GET(gl->ctx_driver->get_flags(gl->ctx_data),
+            GFX_CTX_FLAGS_NO_SHARED_CONTEXT);
+}
+
 static bool gl2_hw_ring_context_new(void *data, void **ctx)
 {
    gl2_t *gl = (gl2_t*)data;
-   if (!gl || !ctx || !(gl->flags & GL2_FLAG_SHARED_CONTEXT_USE)
-         || !gl->ctx_driver || !gl->ctx_driver->bind_hw_render)
+   if (!gl || !ctx || !gl->ctx_driver || !gl->ctx_driver->bind_hw_render)
       return false;
-   gl->ctx_driver->bind_hw_render(gl->ctx_data, true);
-   gl->flags |= GL2_FLAG_HW_RING;
+   /* Asked now, with the context up: a driver that could not make the
+    * shared context says so only once it has tried. One context for
+    * both threads: the ring binds it on whichever thread holds its
+    * token, so nothing is bound here. */
+   if (     (gl->flags & GL2_FLAG_SHARED_CONTEXT_USE)
+         && gl2_ctx_no_shared_context(gl))
+   {
+      gl->flags &= ~GL2_FLAG_SHARED_CONTEXT_USE;
+      RARCH_LOG("[GL] No shared context on \"%s\": the core shares this driver's.\n",
+            gl->ctx_driver->ident);
+   }
+   if (!(gl->flags & GL2_FLAG_SHARED_CONTEXT_USE))
+   {
+      if (!gl2_ctx_no_shared_context(gl))
+         return false;
+   }
+   else
+      gl->ctx_driver->bind_hw_render(gl->ctx_data, true);
+   retro_atomic_store_release_int(&gl->hw_ring, 1);
    *ctx = gl;
    return true;
 }
@@ -3669,7 +3782,7 @@ static void gl2_hw_ring_context_free(void *data, void *ctx)
    (void)ctx;
    if (!gl)
       return;
-   gl->flags &= ~GL2_FLAG_HW_RING;
+   retro_atomic_store_release_int(&gl->hw_ring, 0);
    if (gl->ctx_driver && gl->ctx_driver->release_current)
       gl->ctx_driver->release_current(gl->ctx_data);
 }
@@ -3695,7 +3808,8 @@ static bool gl2_hw_ring_capture(void *data, unsigned slot,
    if (!gl || slot >= 3)
       return false;
 #ifdef GL2_HW_RING_SYNC
-   if (gl->flags & GL2_FLAG_HAVE_SYNC)
+   /* The core's thread: flags is the video thread's word. */
+   if (gl->hw_ring_have_sync)
    {
       /* A sync the video thread never took belongs to a frame it
        * dropped; deleting it does not disturb a wait already placed. */
@@ -5405,6 +5519,9 @@ static void gl2_frame_textures_remake(gl2_t *gl)
    if (gl->flags & GL2_FLAG_FBO_INITED)
       gl2_renderchain_deinit_fbo(gl,
             (gl2_renderchain_data_t*)gl->renderchain_data);
+#ifdef GL2_KMS_FRAMES
+   gl2_kms_frames_drop(gl);
+#endif
    glDeleteTextures(gl->textures, gl->texture);
    gl->tex_index = 0;
    gl2_init_textures(gl);
@@ -5913,6 +6030,8 @@ static bool gl2_views_write_wanted(const gl2_t *gl,
 {
    return video_info->views.num_views
       && gl->views.preset && video_info->shader_active
+      /* A screen's own window copies its views from the frame too */
+      && !(video_info->windows && video_info->windows->plan.separate_mask)
       && !(gl->flags & GL2_FLAG_TEXTURE_MIPMAP)
       && !(chain->flags & GL2_CHAIN_FLAG_EGL_IMAGES)
 #ifdef HAVE_OPENGLES
@@ -6329,20 +6448,21 @@ static bool gl2_views_setup(gl2_t *gl, const video_frame_info_t *video_info,
    return views;
 }
 
-/* Draws the frame's views into the back buffer, sized dims, or with
- * blend into the canvas, whose halves one pass then blends into the
- * back buffer: with direct straight from the frame, else each through
- * the preset, one view after another, from its view of software frame
- * @sw written straight in or else a copy of it. */
+/* Draws the frame's views as @layout places them into the back
+ * buffer, sized @dims, or with blend into @canvas, whose halves one
+ * pass then blends into the back buffer: with direct straight from the
+ * frame, else each through the preset, one view after another, from
+ * its view of software frame @sw written straight in or else a copy of
+ * it. */
 static void gl2_views_render(gl2_t *gl,
-      const video_frame_info_t *video_info, void *const *chains,
+      const video_frame_info_t *video_info,
+      const video_views_layout_t *layout, unsigned dims,
+      const struct gl2_views_fbo *canvas, void *const *chains,
       const video_views_rect_t *rects, bool blend, bool direct,
       bool fresh, const void *sw, unsigned pitch, bool use_rgba,
       unsigned frame_count)
 {
    struct gl2_views_draw d;
-   const video_views_layout_t *layout = &video_info->views_layout;
-   unsigned dims                      = video_info->dims;
    unsigned target_dims               = blend ? layout->canvas_dims : dims;
 
    /* The window's viewport and projection, which the preset's first
@@ -6352,12 +6472,12 @@ static void gl2_views_render(gl2_t *gl,
       gl2_set_viewport(gl, gl->video_dims, false, true);
 
    d.video_info    = video_info;
-   d.target        = blend ? gl->views.canvas.fbo : 0;
+   d.target        = blend ? canvas->fbo : 0;
    d.target_height = VIDEO_SCALE_H(target_dims);
    d.frame_count   = frame_count;
 
    if (blend)
-      gl2_bind_fb(gl->views.canvas.fbo);
+      gl2_bind_fb(canvas->fbo);
    else
       gl2_renderchain_bind_backbuffer();
    glDisable(GL_BLEND);
@@ -6419,7 +6539,7 @@ static void gl2_views_render(gl2_t *gl,
          ? &gl->views.interlaced : &gl->views.anaglyph;
       gl2_renderchain_bind_backbuffer();
       glViewport(0, 0, VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims));
-      glBindTexture(GL_TEXTURE_2D, gl->views.canvas.tex);
+      glBindTexture(GL_TEXTURE_2D, canvas->tex);
       glUseProgram(p->prog);
       if (p->loc_height >= 0)
          glUniform1f(p->loc_height,
@@ -6494,6 +6614,202 @@ static void gl2_views_ui_end(gl2_t *gl, video_frame_info_t *video_info)
    /* gl->vp is the window again, for the readbacks after. */
    gl2_set_viewport(gl, video_info->dims, false, true);
 }
+
+#ifdef HAVE_VIDEO_WINDOWS
+/* Events a frame takes from the context's windows */
+#define GL2_WINDOW_EVENTS 8
+
+/* Window @w let go: its GPU objects, then the context's window, and
+ * input stops mapping into it */
+static void gl2_window_retire(gl2_t *gl, unsigned w)
+{
+   struct gl2_window *win = &gl->windows.win[w];
+   gl2_vv_target_drop(gl, &win->canvas_target, &win->canvas);
+   gl->ctx_driver->windows->destroy(gl->ctx_data, &win->native);
+   video_driver_publish_window_layout(w, 0, NULL, NULL, 0, 0);
+   memset(win, 0, sizeof(*win));
+   gl->windows.held.live &= ~(1u << w);
+}
+
+static void gl2_windows_retire_all(gl2_t *gl)
+{
+   unsigned w;
+   for (w = 1; w < RETRO_VIDEO_VIEWS_MAX; w++)
+      if (gl->windows.held.live & (1u << w))
+         gl2_window_retire(gl, w);
+}
+
+/* Window @w's screens back in the main window, until the next restore
+ * (video_driver_restore_windows()) */
+static void gl2_window_attach(gl2_t *gl, const video_windows_frame_t *f,
+      unsigned w)
+{
+   if (f)
+      video_driver_attach_windows(f->window_screens[w], f->restore);
+   gl->windows.held.failed |= 1u << w;
+   if (gl->windows.held.live & (1u << w))
+      gl2_window_retire(gl, w);
+}
+
+/* Window @w for @f's screens there, on @f's display */
+static bool gl2_window_make(gl2_t *gl, const video_windows_frame_t *f,
+      unsigned w)
+{
+   video_window_request_t request;
+   struct gl2_window *win = &gl->windows.win[w];
+
+   memset(&request, 0, sizeof(request));
+   memset(win, 0, sizeof(*win));
+   request.screen     = w;
+   request.generation = video_driver_window_generation();
+   request.settings   = f->settings[w];
+   request.display    = f->display;
+   if (     !request.generation
+         || !gl->ctx_driver->windows->create(gl->ctx_data, &request,
+            &win->native))
+      return false;
+   gl->windows.held.live       |= 1u << w;
+   gl->windows.held.display[w]  = f->display;
+   return true;
+}
+
+/* The preset's targets made to hold its passes for each of @chains'
+ * views at its rectangle in @rects, which a window larger than the main
+ * one draws past */
+static void gl2_windows_fit_chain(gl2_t *gl,
+      const video_frame_info_t *video_info, void *const *chains,
+      const video_views_rect_t *rects)
+{
+   unsigned i;
+   gl2_renderchain_data_t *chain = (gl2_renderchain_data_t*)
+      gl->renderchain_data;
+   if (!(gl->flags & GL2_FLAG_FBO_INITED))
+      return;
+   for (i = 0; i < video_info->views.num_views; i++)
+   {
+      const struct retro_video_view *v = &video_info->views.views[i];
+      if (!chains[i])
+         continue;
+      gl2_renderchain_recompute_pass_sizes(gl, chain,
+            VIDEO_SCALE_PACK(v->width, v->height), rects[i].dims);
+      gl2_renderchain_grow_fbos(gl, chain);
+   }
+}
+
+/* Window @w's screens drawn as the main window's views were this
+ * frame, and shown. Without a surface it can show, it keeps its last
+ * image. */
+static bool gl2_window_draw(gl2_t *gl,
+      const video_frame_info_t *video_info, unsigned w, bool new_frame)
+{
+   void *chains[RETRO_VIDEO_VIEWS_MAX];
+   video_views_rect_t rects[RETRO_VIDEO_VIEWS_MAX];
+   bool blend;
+   const video_windows_frame_t *f     = video_info->windows;
+   const gfx_ctx_window_driver_t *ctx = gl->ctx_driver->windows;
+   struct gl2_window *win             = &gl->windows.win[w];
+   video_views_layout_t *layout       = &win->layout;
+   unsigned dims                      = win->native.dims;
+   bool stock                         = !video_info->shader_active
+      || !gl->views.preset;
+
+   if (     !win->native.configured || !win->native.presentable
+         || !VIDEO_SCALE_W(dims) || !VIDEO_SCALE_H(dims))
+      return false;
+   video_driver_window_layout_screens(f, f->window_screens[w], dims,
+         layout);
+   blend = layout->offscreen
+      && gl2_vv_target_ensure(gl, &win->canvas_target, &win->canvas,
+            layout->canvas_dims);
+   if (!layout->offscreen)
+      gl2_vv_target_drop(gl, &win->canvas_target, &win->canvas);
+   if (!gl2_vv_pick_chains(gl, &gl->views.chains, &video_info->views,
+            layout, stock, blend || !layout->offscreen,
+            blend ? layout->canvas_dims : dims, chains, rects))
+      return false;
+   if (!ctx->bind_gl(gl->ctx_data, &win->native))
+   {
+      ctx->bind_gl(gl->ctx_data, NULL);
+      RARCH_WARN("[GL] A screen window can't be drawn. "
+            "Its screens go back to the main window.\n");
+      gl2_window_attach(gl, f, w);
+      return false;
+   }
+   if (!stock)
+      gl2_windows_fit_chain(gl, video_info, chains, rects);
+   gl2_views_render(gl, video_info, layout, dims, &win->canvas, chains,
+         rects, blend, stock, new_frame, NULL, 0, false,
+         gl->windows.frame_count);
+   /* False: not shown this time, its last image stays */
+   ctx->present_gl(gl->ctx_data, &win->native);
+   ctx->bind_gl(gl->ctx_data, NULL);
+   video_driver_publish_window_layout(w, win->native.generation, layout,
+         &f->core, f->core_dims, dims);
+   return true;
+}
+
+/* The screens' own windows for this frame: made, let go of, and drawn
+ * after the main window's frame and before its swap, which stays the
+ * only one that waits; a window swaps at interval 0. Views only: the
+ * menu, OSD, widgets and overlay stay in the main window. True when a
+ * window was drawn. */
+static bool gl2_windows_draw(gl2_t *gl,
+      const video_frame_info_t *video_info, bool new_frame)
+{
+   unsigned w, retire, create;
+   unsigned closed                    = 0;
+   const video_windows_frame_t *f     = video_info->windows;
+   const gfx_ctx_window_driver_t *ctx = gl->ctx_driver->windows;
+   bool drawn                         = false;
+
+   if (!ctx)
+      return false;
+   if (gl->windows.held.live)
+   {
+      unsigned i, count;
+      video_window_event_t events[GL2_WINDOW_EVENTS];
+      count = ctx->poll(gl->ctx_data, events, GL2_WINDOW_EVENTS);
+      for (i = 0; i < count; i++)
+      {
+         unsigned id = events[i].screen;
+         if (     events[i].kind == VIDEO_WINDOW_EVENT_CLOSE
+               && id && id < RETRO_VIDEO_VIEWS_MAX
+               && (gl->windows.held.live & (1u << id))
+               && gl->windows.win[id].native.generation
+                  == events[i].generation)
+            closed |= 1u << id;
+      }
+   }
+   video_windows_steps(&gl->windows.held, f, &retire, &create);
+   for (w = 1; w < RETRO_VIDEO_VIEWS_MAX; w++)
+      if (retire & (1u << w))
+         gl2_window_retire(gl, w);
+   if (!f)
+      return false;
+   /* Marked after steps(), which clears the marks when this frame's
+    * restore count moved, so a closed window waits for the next one */
+   for (w = 1; w < RETRO_VIDEO_VIEWS_MAX; w++)
+      if ((closed & (1u << w)) && f->window_screens[w])
+         gl2_window_attach(gl, f, w);
+   create &= ~closed;
+   for (w = 1; w < RETRO_VIDEO_VIEWS_MAX; w++)
+   {
+      if (!(create & (1u << w)) || gl2_window_make(gl, f, w))
+         continue;
+      RARCH_WARN("[GL] A screen window can't be made. "
+            "Its screens stay in the main window.\n");
+      gl2_window_attach(gl, f, w);
+   }
+   /* Views the main window drew whole are not drawn here either */
+   if (!gl->views.active)
+      return false;
+   for (w = 1; w < RETRO_VIDEO_VIEWS_MAX; w++)
+      if (     (gl->windows.held.live & (1u << w))
+            && gl2_window_draw(gl, video_info, w, new_frame))
+         drawn = true;
+   return drawn;
+}
+#endif
 #endif
 
 static bool gl2_frame(void *data, const void *frame,
@@ -6637,51 +6953,7 @@ static bool gl2_frame(void *data, const void *frame,
       {
          /* On resize, we might have to recreate our FBOs
           * due to "Viewport" scale, and set a new viewport. */
-         size_t i;
-         /* Check if we have to recreate our FBO textures. */
-         for (i = 0; i < (size_t)chain->fbo_pass; i++)
-         {
-            struct video_fbo_rect *fbo_rect = &gl->fbo_rect[i];
-            if (fbo_rect)
-            {
-               unsigned img_width   = VIDEO_SCALE_W(fbo_rect->max_img_dims);
-               unsigned img_height  = VIDEO_SCALE_H(fbo_rect->max_img_dims);
-
-               if (     (img_width  > VIDEO_SCALE_W(fbo_rect->dims))
-                     || (img_height > VIDEO_SCALE_H(fbo_rect->dims)))
-               {
-                  /* Check proactively since we might suddenly
-                   * get sizes of tex_w width or tex_h height. */
-                  unsigned max                    = img_width > img_height ? img_width : img_height;
-                  unsigned pow2_size              = next_pow2(max);
-                  bool update_feedback            = (gl->flags & GL2_FLAG_FBO_FEEDBACK_ENABLE)
-                     && (unsigned)i == gl->fbo_feedback_pass;
-
-                  fbo_rect->dims                  = VIDEO_SCALE_PACK(
-                        pow2_size, pow2_size);
-
-                  gl2_recreate_fbo(fbo_rect, chain->fbo[i], &chain->fbo_texture[i]);
-
-                  /* Update feedback texture in-place so we avoid having to
-                   * juggle two different fbo_rect structs since they get updated here. */
-                  if (update_feedback)
-                  {
-                     if (gl2_recreate_fbo(fbo_rect, gl->fbo_feedback,
-                              &gl->fbo_feedback_texture))
-                     {
-                        /* Make sure the feedback textures are cleared
-                         * so we don't feedback noise. */
-                        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-                        glClear(GL_COLOR_BUFFER_BIT);
-                     }
-                  }
-
-                  RARCH_LOG("[GL] Recreating FBO texture #%d: %ux%u.\n",
-                        i, VIDEO_SCALE_W(fbo_rect->dims),
-                        VIDEO_SCALE_H(fbo_rect->dims));
-               }
-            }
-         }
+         gl2_renderchain_grow_fbos(gl, chain);
 
          /* Go back to what we're supposed to do,
           * render to FBO #0. */
@@ -6812,7 +7084,8 @@ static bool gl2_frame(void *data, const void *frame,
          (video_info->views.num_views && !views) ? 1 : 0);
    gl2_views_publish(gl);
    if (views)
-      gl2_views_render(gl, video_info, view_chains, view_rects,
+      gl2_views_render(gl, video_info, &video_info->views_layout,
+            video_info->dims, &gl->views.canvas, view_chains, view_rects,
             views_blend, views_direct, frame != NULL, views_sw, pitch,
             use_rgba, (unsigned)frame_count);
    else
@@ -7120,6 +7393,24 @@ static bool gl2_frame(void *data, const void *frame,
       gl2_desktop_xr_frame(gl, video_info, frame != NULL, dims, &xr_vp);
 #endif
 
+#if defined(GL2_VIEWS) && defined(HAVE_VIDEO_WINDOWS)
+   /* Before the ring's fence: the windows read the frame too. Not from
+    * the BFI light dupes. */
+   if (     (video_info->windows || gl->windows.held.live
+            || gl->windows.held.failed)
+         && !(gl->flags & GL2_FLAG_FRAME_DUPE_LOCK))
+   {
+      gl->windows.frame_count = (unsigned)frame_count;
+      if (     gl2_windows_draw(gl, video_info, frame != NULL)
+            && (gl->flags & GL2_FLAG_HW_RENDER_FBO_INIT))
+      {
+         /* As the frame leaves it for the core */
+         gl->shader->use(gl, gl->shader_data, 0, true);
+         glBindTexture(GL_TEXTURE_2D, 0);
+      }
+   }
+#endif
+
     gl2_hw_ring_drawn(gl);
     gl2_present_wait = 0;
     if (gl->ctx_driver->swap_buffers)
@@ -7317,6 +7608,10 @@ static void gl2_free(void *data)
 
    gl2_scrgb_deinit(gl);
 #ifdef GL2_VIEWS
+#ifdef HAVE_VIDEO_WINDOWS
+   /* Before the context, which sweeps what is left */
+   gl2_windows_retire_all(gl);
+#endif
    gl2_views_release(gl);
 #endif
 #ifdef HAVE_GL_PLANAR
@@ -7331,6 +7626,9 @@ static void gl2_free(void *data)
 #ifdef HAVE_GL_FRAME_MEM
    gl_sw_fb_free(gl->frame_mem, &gl->sw_fb);
    gl_frame_mem_destroy(&gl->frame_mem);
+#endif
+#ifdef GL2_KMS_FRAMES
+   gl2_kms_frames_drop(gl);
 #endif
 
    glDeleteTextures(gl->textures, gl->texture);
@@ -7456,6 +7754,7 @@ static bool gl2_resolve_extensions(gl2_t *gl, const char *context_ident, const v
       bool video_hard_sync       = settings->bools.video_hard_sync;
 
       gl->flags                 |=  GL2_FLAG_HAVE_SYNC;
+      gl->hw_ring_have_sync      = true;
       if (video_hard_sync)
          RARCH_LOG("[GL] Using ARB_sync to reduce latency.\n");
    }
@@ -7699,6 +7998,19 @@ static const gfx_ctx_driver_t *gl2_get_context(gl2_t *gl)
    if (ctx_data)
       gl->ctx_data = ctx_data;
 
+   /* A context that cannot share (one GL context per process) made
+    * none: the ring hands this one between the threads, and this
+    * driver must not bind a shared context it does not have. */
+   if (     gfx_ctx
+         && (gl->flags & GL2_FLAG_SHARED_CONTEXT_USE)
+         && gfx_ctx->get_flags
+         && BIT32_GET(gfx_ctx->get_flags(ctx_data), GFX_CTX_FLAGS_NO_SHARED_CONTEXT))
+   {
+      gl->flags &= ~GL2_FLAG_SHARED_CONTEXT_USE;
+      RARCH_LOG("[GL] No shared context on \"%s\": the core shares this driver's.\n",
+            gfx_ctx->ident);
+   }
+
    return gfx_ctx;
 }
 
@@ -7863,7 +8175,10 @@ static void *gl2_init(const video_info_t *video)
    const gfx_ctx_driver_t *ctx_driver   = NULL;
 
    /* gl must exist before the context lookup writes its flags. */
-   if (!gl || !(ctx_driver = gl2_get_context(gl)))
+   if (!gl)
+      goto error;
+   retro_atomic_int_init(&gl->hw_ring, 0);
+   if (!(ctx_driver = gl2_get_context(gl)))
       goto error;
 
    /* Latched here, inside the wrapper's blocking CMD_INIT (the main
@@ -7881,6 +8196,15 @@ static void *gl2_init(const video_info_t *video)
    gl->video_info                       = *video;
 
    RARCH_LOG("[GL] Found GL context: \"%s\".\n", ctx_driver->ident);
+
+#if !defined(RARCH_CONSOLE) || defined(HAVE_LIBNX)
+   if (!ctx_driver->get_proc_address)
+   {
+      RARCH_ERR("[GL] The \"%s\" context has no OpenGL.\n",
+            ctx_driver->ident);
+      goto error;
+   }
+#endif
 
    if (gl->ctx_driver->get_video_size)
       gl->ctx_driver->get_video_size(gl->ctx_data,
@@ -8543,6 +8867,9 @@ static bool gl2_set_shader(void *data,
       if ((gl->flags & GL2_FLAG_HW_RENDER_USE) && (gl->flags & GL2_FLAG_FBO_INITED))
          video_thread_call_on_waiter(gl2_deinit_hw_render_cb, gl);
 
+#ifdef GL2_KMS_FRAMES
+      gl2_kms_frames_drop(gl);
+#endif
       glDeleteTextures(gl->textures, gl->texture);
 #if defined(HAVE_PSGL)
       /* gl2_init_textures generates the buffer again */
@@ -9209,16 +9536,11 @@ static void *gl2_frame_mem_alloc(void *data, size_t size, uintptr_t *id,
 
 /* The frame lent to the core, unthreaded: frame memory the GL uploads
  * the pushed frame out of (gl2_renderchain_copy_frame), where that
- * upload reads it as it is (gl2_frame_mem_uploads). Not to a core that
- * reads its frame, since the GL may keep a persistent mapping
- * write-combined. */
-static bool gl2_get_current_software_framebuffer(void *data,
-      struct retro_framebuffer *fb)
+ * upload reads it as it is (gl2_frame_mem_uploads). */
+static bool gl2_frame_mem_lend_fb(gl2_t *gl, struct retro_framebuffer *fb)
 {
-   gl2_t   *gl = (gl2_t*)data;
    void    *p;
-   if (     !gl || !fb || !gl2_frame_mem_uploads(gl)
-         || (fb->access_flags & RETRO_MEMORY_ACCESS_READ))
+   if (!gl2_frame_mem_uploads(gl))
       return false;
    /* Remade at a new size: the cached frame may name the old ones */
    if (!gl_sw_fb_fits(&gl->sw_fb, fb->width, fb->height, gl->base_size))
@@ -9249,6 +9571,75 @@ static void gl2_frame_mem_free(void *data, uintptr_t id)
       gl_frame_mem_free(gl->frame_mem, id);
 }
 #endif
+
+#ifdef GL2_KMS_FRAMES
+/* A buffer the GPU samples as the core writes it, the frame texture
+ * taking it as storage: KMS only, a plain 8-bit frame in one texture
+ * level, as large as the frame textures; one per texture, and three
+ * more for the core to write into while those and the frames before
+ * them are read */
+static void *gl2_kms_frames_lend(gl2_t *gl, unsigned width,
+      unsigned height, size_t *pitch)
+{
+   unsigned tw    = VIDEO_SCALE_W(gl->tex_dims);
+   unsigned th    = VIDEO_SCALE_H(gl->tex_dims);
+   unsigned count = gl->textures + 3;
+   gl2_renderchain_data_t *chain = (gl2_renderchain_data_t*)
+      gl->renderchain_data;
+
+   if (     gl->kms_frames_off
+         || video_driver_display_type_get() != RARCH_DISPLAY_KMS
+         || (gl->flags & (GL2_FLAG_HW_RENDER_USE | GL2_FLAG_TEXTURE_MIPMAP))
+         || (chain && (chain->flags & GL2_CHAIN_FLAG_EGL_IMAGES))
+         || gl->video_info.source_10bit || gl->video_info.source_hdr10
+         || count > EGL_GBM_FRAMES_MAX
+         || !width || !height || width > tw || height > th)
+      return NULL;
+   if (!egl_gbm_frames_fits(gl->kms_frames, tw, th, gl->base_size, count))
+   {
+      gl2_kms_frames_drop(gl);
+      if (!(gl->kms_frames = egl_gbm_frames_new(g_drm_fd, tw, th,
+                  gl->base_size, count)))
+      {
+         gl->kms_frames_off = true;
+         return NULL;
+      }
+   }
+   return egl_gbm_frames_lend(gl->kms_frames, width, height, pitch);
+}
+#endif
+
+#if defined(HAVE_GL_FRAME_MEM) || defined(GL2_KMS_FRAMES)
+/* Not to a core that reads its frame: the memory may be write-combined */
+static bool gl2_get_current_software_framebuffer(void *data,
+      struct retro_framebuffer *fb)
+{
+   gl2_t *gl = (gl2_t*)data;
+#ifdef GL2_KMS_FRAMES
+   size_t pitch = 0;
+   void *p;
+#endif
+   if (!gl || !fb || (fb->access_flags & RETRO_MEMORY_ACCESS_READ))
+      return false;
+#ifdef GL2_KMS_FRAMES
+   if ((p = gl2_kms_frames_lend(gl, fb->width, fb->height, &pitch)))
+   {
+      fb->data         = p;
+      fb->pitch        = pitch;
+      fb->format       = (gl->base_size == 4)
+         ? RETRO_PIXEL_FORMAT_XRGB8888 : RETRO_PIXEL_FORMAT_RGB565;
+      fb->memory_flags = 0;
+      return true;
+   }
+#endif
+#ifdef HAVE_GL_FRAME_MEM
+   return gl2_frame_mem_lend_fb(gl, fb);
+#else
+   return false;
+#endif
+}
+#endif
+
 
 #ifdef GL2_VIEWS
 static void gl2_set_view_count(void *data, unsigned count)
@@ -9296,7 +9687,15 @@ static uint32_t gl2_get_flags(void *data)
 #endif
 #ifdef GL2_VIEWS
    if (gl2 && retro_atomic_load_acquire_int(&gl2->views.allowed))
+   {
       BIT32_SET(flags, GFX_CTX_FLAGS_VIDEO_VIEWS);
+#if defined(HAVE_VIDEO_WINDOWS) && !(defined(HAVE_OPENXR) && defined(ANDROID))
+      /* The context can make screens windows of their own. Not in the
+       * Quest's build, whose back buffer is the headset's framebuffer. */
+      if (gl2->ctx_driver && gl2->ctx_driver->windows)
+         BIT32_SET(flags, GFX_CTX_FLAGS_VIDEO_WINDOWS);
+#endif
+   }
    if (gl2 && retro_atomic_load_acquire_int(&gl2->views.fallback))
       BIT32_SET(flags, GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK);
 #endif
@@ -9530,7 +9929,7 @@ static const video_poke_interface_t gl2_poke_interface = {
    gl2_show_mouse,
    NULL, /* grab_mouse_toggle */
    gl2_get_current_shader,
-#ifdef HAVE_GL_FRAME_MEM
+#if defined(HAVE_GL_FRAME_MEM) || defined(GL2_KMS_FRAMES)
    gl2_get_current_software_framebuffer,
 #else
    NULL, /* get_current_software_framebuffer */
@@ -9595,10 +9994,18 @@ static const video_poke_interface_t gl2_poke_interface = {
    NULL, /* import_texture */
    NULL, /* get_last_present_sync */
 #if defined(HAVE_GL_ASYNC_READBACK) && !defined(HAVE_OPENGLES) && !defined(HAVE_PSGL)
-   gl2_record_read
+   gl2_record_read,
 #else
-   NULL  /* record_read */
+   NULL, /* record_read */
 #endif
+   NULL, /* import_movie_frame */
+   NULL, /* get_menu_framebuffer */
+   NULL, /* menu_mem_alloc */
+   0,    /* menu_mem_pitch_align */
+   false, /* texture_lend_per_write */
+   NULL, /* driver_pacing_set */
+   NULL, /* driver_pacing_wait */
+   NULL  /* driver_pacing_mark */
 };
 
 static void gl2_get_poke_interface(void *data,

@@ -809,6 +809,12 @@ void menu_driver_toggle(
       retro_keyboard_event_t *frontend_key_event,
       bool on);
 
+/* Queue a fullscreen file-browser launch; NULL cancels it. */
+bool menu_driver_media_open(const char *path);
+/* Startup presentation is released only by the activated fullscreen view. */
+int menu_driver_media_startup_token(void);
+void menu_driver_media_startup_ready(int token);
+
 /* Iterate the menu driver for one frame. */
 bool menu_driver_iterate(
       struct menu_state *menu_st,
@@ -844,6 +850,11 @@ void menu_update_runahead_mode(void);
 
 size_t menu_playlist_random_selection(
       size_t selection, bool is_explore_list);
+
+/* The Playlists tab's Scan: a random playlist row other than
+ * @selection. Not menu_playlist_random_selection, which picks an item
+ * inside an open playlist or Explore list. */
+size_t menu_playlists_tab_random_selection(size_t selection);
 
 void menu_dialog_confirm_set(struct menu_state *menu_st,
       unsigned msg, unsigned cmd);

@@ -33,6 +33,7 @@
 #include "../gfx_instrument.h"
 #include "../common/gl_common.h"
 #include "../common/rgba16_pack.h"
+#include "../common/spirv_shaders.h"
 
 #include <compat/strl.h>
 #include <encodings/utf.h>
@@ -2404,7 +2405,8 @@ static void gl3_destroy_resources(gl3_t *gl)
    if (!gl)
       return;
 
-   if (gl->flags & GL3_FLAG_USE_SHARED_CONTEXT)
+   /* (none to unbind where the context never came up) */
+   if ((gl->flags & GL3_FLAG_USE_SHARED_CONTEXT) && gl->ctx_driver)
       gl->ctx_driver->bind_hw_render(gl->ctx_data, false);
 
 #ifdef HAVE_SLANG
@@ -2777,6 +2779,20 @@ static const gfx_ctx_driver_t *gl3_get_context(gl3_t *gl)
    if (ctx_data)
       gl->ctx_data = ctx_data;
 
+   /* A context that cannot share (one GL context per process) gets
+    * no shared context asked of it: a hardware core is handed this
+    * one - by the ring between the threads under the wrapper, as the
+    * driver's own unthreaded. */
+   if (     gfx_ctx
+         && (gl->flags & GL3_FLAG_USE_SHARED_CONTEXT)
+         && gfx_ctx->get_flags
+         && BIT32_GET(gfx_ctx->get_flags(ctx_data), GFX_CTX_FLAGS_NO_SHARED_CONTEXT))
+   {
+      gl->flags &= ~GL3_FLAG_USE_SHARED_CONTEXT;
+      RARCH_LOG("[GLCore] No shared context on \"%s\": the core shares this driver's.\n",
+            gfx_ctx->ident);
+   }
+
    /* Need to force here since video_context_driver_init also checks for global option. */
    if (gfx_ctx->bind_hw_render)
       gfx_ctx->bind_hw_render(ctx_data, (gl->flags & GL3_FLAG_USE_SHARED_CONTEXT) ? true : false);
@@ -2878,14 +2894,6 @@ static void gl3_set_viewport(gl3_t *gl,
 }
 
 #ifdef HAVE_SLANG
-static const uint32_t gl3_alpha_blend_vert[] =
-#include "vulkan_shaders/alpha_blend.vert.inc"
-      ;
-
-static const uint32_t gl3_alpha_blend_linear_frag[] =
-#include "vulkan_shaders/alpha_blend_linear.frag.inc"
-      ;
-
 /* The program for a half-float texture under the scRGB composite, made
  * the first time one is drawn; 0 where it cannot be. */
 static GLuint gl3_linear_program(gl3_t *gl)
@@ -2895,46 +2903,12 @@ static GLuint gl3_linear_program(gl3_t *gl)
    {
       gl->pipelines.alpha_blend_linear_tried = true;
       gl->pipelines.alpha_blend_linear       = gl3_cross_compile_program(
-            gl3_alpha_blend_vert, sizeof(gl3_alpha_blend_vert),
-            gl3_alpha_blend_linear_frag, sizeof(gl3_alpha_blend_linear_frag),
+            spirv_alpha_blend_vert, spirv_alpha_blend_vert_size,
+            spirv_alpha_blend_linear_frag, spirv_alpha_blend_linear_frag_size,
             &gl->pipelines.alpha_blend_linear_loc, true);
    }
    return gl->pipelines.alpha_blend_linear;
 }
-
-#ifdef HAVE_SHADERPIPELINE
-static const uint32_t gl3_pipeline_ribbon_vert[] =
-#include "vulkan_shaders/pipeline_ribbon.vert.inc"
-      ;
-
-static const uint32_t gl3_pipeline_ribbon_frag[] =
-#include "vulkan_shaders/pipeline_ribbon.frag.inc"
-      ;
-
-static const uint32_t gl3_pipeline_ribbon_simple_vert[] =
-#include "vulkan_shaders/pipeline_ribbon_simple.vert.inc"
-      ;
-
-static const uint32_t gl3_pipeline_ribbon_simple_frag[] =
-#include "vulkan_shaders/pipeline_ribbon_simple.frag.inc"
-      ;
-
-static const uint32_t gl3_pipeline_snow_simple_frag[] =
-#include "vulkan_shaders/pipeline_snow_simple.frag.inc"
-      ;
-
-static const uint32_t gl3_pipeline_snow_frag[] =
-#include "vulkan_shaders/pipeline_snow.frag.inc"
-      ;
-
-static const uint32_t gl3_pipeline_bokeh_frag[] =
-#include "vulkan_shaders/pipeline_bokeh.frag.inc"
-      ;
-
-static const uint32_t gl3_pipeline_snowflake_frag[] =
-#include "vulkan_shaders/pipeline_snowflake.frag.inc"
-      ;
-#endif /* HAVE_SHADERPIPELINE */
 
 #ifdef HAVE_SHADERPIPELINE
 /* A menu effect's program, compiled the first time the effect is drawn
@@ -2952,33 +2926,33 @@ static GLuint gl3_effect_program(gl3_t *gl, unsigned pipeline_id,
    {
       case VIDEO_SHADER_MENU:
          prog = &gl->pipelines.ribbon;      l    = &gl->pipelines.ribbon_loc;
-         vs   = gl3_pipeline_ribbon_vert;       vs_size = sizeof(gl3_pipeline_ribbon_vert);
-         fs   = gl3_pipeline_ribbon_frag;       fs_size = sizeof(gl3_pipeline_ribbon_frag);
+         vs   = spirv_pipeline_ribbon_vert;       vs_size = spirv_pipeline_ribbon_vert_size;
+         fs   = spirv_pipeline_ribbon_frag;       fs_size = spirv_pipeline_ribbon_frag_size;
          break;
       case VIDEO_SHADER_MENU_2:
          prog = &gl->pipelines.ribbon_simple; l    = &gl->pipelines.ribbon_simple_loc;
-         vs   = gl3_pipeline_ribbon_simple_vert;  vs_size = sizeof(gl3_pipeline_ribbon_simple_vert);
-         fs   = gl3_pipeline_ribbon_simple_frag;  fs_size = sizeof(gl3_pipeline_ribbon_simple_frag);
+         vs   = spirv_pipeline_ribbon_simple_vert;  vs_size = spirv_pipeline_ribbon_simple_vert_size;
+         fs   = spirv_pipeline_ribbon_simple_frag;  fs_size = spirv_pipeline_ribbon_simple_frag_size;
          break;
       case VIDEO_SHADER_MENU_3:
          prog = &gl->pipelines.snow_simple; l    = &gl->pipelines.snow_simple_loc;
-         vs   = gl3_alpha_blend_vert;           vs_size = sizeof(gl3_alpha_blend_vert);
-         fs   = gl3_pipeline_snow_simple_frag;  fs_size = sizeof(gl3_pipeline_snow_simple_frag);
+         vs   = spirv_alpha_blend_vert;           vs_size = spirv_alpha_blend_vert_size;
+         fs   = spirv_pipeline_snow_simple_frag;  fs_size = spirv_pipeline_snow_simple_frag_size;
          break;
       case VIDEO_SHADER_MENU_4:
          prog = &gl->pipelines.snow;        l    = &gl->pipelines.snow_loc;
-         vs   = gl3_alpha_blend_vert;           vs_size = sizeof(gl3_alpha_blend_vert);
-         fs   = gl3_pipeline_snow_frag;         fs_size = sizeof(gl3_pipeline_snow_frag);
+         vs   = spirv_alpha_blend_vert;           vs_size = spirv_alpha_blend_vert_size;
+         fs   = spirv_pipeline_snow_frag;         fs_size = spirv_pipeline_snow_frag_size;
          break;
       case VIDEO_SHADER_MENU_5:
          prog = &gl->pipelines.bokeh;       l    = &gl->pipelines.bokeh_loc;
-         vs   = gl3_alpha_blend_vert;           vs_size = sizeof(gl3_alpha_blend_vert);
-         fs   = gl3_pipeline_bokeh_frag;        fs_size = sizeof(gl3_pipeline_bokeh_frag);
+         vs   = spirv_alpha_blend_vert;           vs_size = spirv_alpha_blend_vert_size;
+         fs   = spirv_pipeline_bokeh_frag;        fs_size = spirv_pipeline_bokeh_frag_size;
          break;
       case VIDEO_SHADER_MENU_6:
          prog = &gl->pipelines.snowflake;   l    = &gl->pipelines.snowflake_loc;
-         vs   = gl3_alpha_blend_vert;           vs_size = sizeof(gl3_alpha_blend_vert);
-         fs   = gl3_pipeline_snowflake_frag;    fs_size = sizeof(gl3_pipeline_snowflake_frag);
+         vs   = spirv_alpha_blend_vert;           vs_size = spirv_alpha_blend_vert_size;
+         fs   = spirv_pipeline_snowflake_frag;    fs_size = spirv_pipeline_snowflake_frag_size;
          break;
       default:
          return 0;
@@ -2994,51 +2968,29 @@ static GLuint gl3_effect_program(gl3_t *gl, unsigned pipeline_id,
 #ifdef HAVE_SLANG
 static bool gl3_init_pipelines(gl3_t *gl)
 {
-
-   static const uint32_t alpha_blend_frag[] =
-#include "vulkan_shaders/alpha_blend.frag.inc"
-      ;
-
-   static const uint32_t mesh_vert[] =
-#include "vulkan_shaders/mesh.vert.inc"
-      ;
-
-   static const uint32_t font_frag[] =
-#include "vulkan_shaders/font.frag.inc"
-      ;
-
-   static const uint32_t hdr_scrgb_vert[] =
-#include "vulkan_shaders/hdr_scrgb.vert.inc"
-      ;
-
-   static const uint32_t hdr_scrgb_frag[] =
-#include "vulkan_shaders/hdr_scrgb.frag.inc"
-      ;
-
-
    if (!gl->pipelines.alpha_blend)
-      gl->pipelines.alpha_blend = gl3_cross_compile_program(gl3_alpha_blend_vert, sizeof(gl3_alpha_blend_vert),
-                                                             alpha_blend_frag, sizeof(alpha_blend_frag),
+      gl->pipelines.alpha_blend = gl3_cross_compile_program(spirv_alpha_blend_vert, spirv_alpha_blend_vert_size,
+                                                             spirv_alpha_blend_frag, spirv_alpha_blend_frag_size,
                                                              &gl->pipelines.alpha_blend_loc, true);
    if (!gl->pipelines.alpha_blend)
       return false;
 
    /* Without it meshes are streamed through the alpha-blend program */
    if (!gl->pipelines.mesh)
-      gl->pipelines.mesh = gl3_cross_compile_program(mesh_vert, sizeof(mesh_vert),
-                                                      alpha_blend_frag, sizeof(alpha_blend_frag),
+      gl->pipelines.mesh = gl3_cross_compile_program(spirv_mesh_vert, spirv_mesh_vert_size,
+                                                      spirv_alpha_blend_frag, spirv_alpha_blend_frag_size,
                                                       &gl->pipelines.mesh_loc, true);
 
    if (!gl->pipelines.font)
-      gl->pipelines.font = gl3_cross_compile_program(gl3_alpha_blend_vert, sizeof(gl3_alpha_blend_vert),
-                                                      font_frag, sizeof(font_frag),
+      gl->pipelines.font = gl3_cross_compile_program(spirv_alpha_blend_vert, spirv_alpha_blend_vert_size,
+                                                      spirv_font_frag, spirv_font_frag_size,
                                                       &gl->pipelines.font_loc, true);
    if (!gl->pipelines.font)
       return false;
 
    if (gl->scrgb.active && !gl->pipelines.hdr_scrgb)
-      gl->pipelines.hdr_scrgb = gl3_cross_compile_program(hdr_scrgb_vert, sizeof(hdr_scrgb_vert),
-                                                           hdr_scrgb_frag, sizeof(hdr_scrgb_frag),
+      gl->pipelines.hdr_scrgb = gl3_cross_compile_program(spirv_hdr_scrgb_vert, spirv_hdr_scrgb_vert_size,
+                                                           spirv_hdr_scrgb_frag, spirv_hdr_scrgb_frag_size,
                                                            &gl->pipelines.hdr_scrgb_loc, true);
    if (gl->scrgb.active && !gl->pipelines.hdr_scrgb)
       return false;
@@ -3975,6 +3927,16 @@ static void *gl3_init(const video_info_t *video)
 
    RARCH_LOG("[GLCore] Found GL context: \"%s\".\n", ctx_driver->ident);
 
+   /* The null context comes up with no OpenGL behind it: nothing to
+    * load the entry points from, and the first call would be through
+    * a null pointer. */
+   if (!ctx_driver->get_proc_address)
+   {
+      RARCH_ERR("[GLCore] The \"%s\" context has no OpenGL.\n",
+            ctx_driver->ident);
+      goto error;
+   }
+
    if (gl->ctx_driver->get_video_size)
       gl->ctx_driver->get_video_size(gl->ctx_data,
                &mode_dims);
@@ -4720,6 +4682,9 @@ static bool gl3_set_shader(void *data,
 {
    bool ok;
    gl3_t *gl = (gl3_t *)data;
+#ifdef HAVE_SLANG
+   gl3_filter_chain_t *old;
+#endif
    if (!gl)
       return false;
 
@@ -4731,8 +4696,11 @@ static bool gl3_set_shader(void *data,
       gl->ctx_driver->bind_hw_render(gl->ctx_data, false);
 
 #ifdef HAVE_SLANG
-   if (gl->filter_chain)
-      gl3_filter_chain_free(gl->filter_chain);
+   /* The outgoing chain lives until the new one is built, so the
+    * stages and programs both have are taken from it instead of
+    * compiled and linked again. */
+   old              = gl->filter_chain;
+   gl->filter_chain = NULL;
    gl3_views_set_preset(gl, NULL);
 #endif
 
@@ -4758,6 +4726,10 @@ static bool gl3_set_shader(void *data,
    }
 
    ok = gl3_init_filter_chain_with_path(gl, path);
+#ifdef HAVE_SLANG
+   if (old)
+      gl3_filter_chain_free(old);
+#endif
    gl3_publish_flags(gl);
    if (!ok)
       return false;
@@ -5991,26 +5963,14 @@ static bool gl3_views_target_make(gl3_t *gl, struct gl3_views_fbo *t,
  * never blend. Views fall back to the left eye without them. */
 static void gl3_views_init_blend(gl3_t *gl)
 {
-   static const uint32_t alpha_blend_vert[] =
-#include "vulkan_shaders/alpha_blend.vert.inc"
-      ;
-
-   static const uint32_t stereo_anaglyph_frag[] =
-#include "vulkan_shaders/stereo_anaglyph.frag.inc"
-      ;
-
-   static const uint32_t stereo_interlaced_frag[] =
-#include "vulkan_shaders/stereo_interlaced.frag.inc"
-      ;
-
    gl->views.blend_tried           = true;
    gl->pipelines.stereo_anaglyph   = gl3_cross_compile_program(
-         alpha_blend_vert, sizeof(alpha_blend_vert),
-         stereo_anaglyph_frag, sizeof(stereo_anaglyph_frag),
+         spirv_alpha_blend_vert, spirv_alpha_blend_vert_size,
+         spirv_stereo_anaglyph_frag, spirv_stereo_anaglyph_frag_size,
          &gl->pipelines.stereo_anaglyph_loc, true);
    gl->pipelines.stereo_interlaced = gl3_cross_compile_program(
-         alpha_blend_vert, sizeof(alpha_blend_vert),
-         stereo_interlaced_frag, sizeof(stereo_interlaced_frag),
+         spirv_alpha_blend_vert, spirv_alpha_blend_vert_size,
+         spirv_stereo_interlaced_frag, spirv_stereo_interlaced_frag_size,
          &gl->pipelines.stereo_interlaced_loc, true);
 }
 
@@ -6020,18 +5980,10 @@ static void gl3_views_init_blend(gl3_t *gl)
 static void gl3_stock_rect_init(gl3_t *gl)
 {
    unsigned i;
-   static const uint32_t alpha_blend_vert[] =
-#include "vulkan_shaders/alpha_blend.vert.inc"
-      ;
-
-   static const uint32_t stock_rect_frag[] =
-#include "vulkan_shaders/stock_rect.frag.inc"
-      ;
-
    gl->pipelines.stock_rect_tried = true;
    gl->pipelines.stock_rect       = gl3_cross_compile_program(
-         alpha_blend_vert, sizeof(alpha_blend_vert),
-         stock_rect_frag, sizeof(stock_rect_frag),
+         spirv_alpha_blend_vert, spirv_alpha_blend_vert_size,
+         spirv_stock_rect_frag, spirv_stock_rect_frag_size,
          &gl->pipelines.stock_rect_loc, true);
    if (!gl->pipelines.stock_rect)
    {
@@ -8586,10 +8538,30 @@ static bool gl3_core_context_is_mains(gl3_t *gl)
 static bool gl3_hw_ring_context_new(void *data, void **ctx)
 {
    gl3_t *gl = (gl3_t*)data;
-   if (!gl || !ctx || !(gl->flags & GL3_FLAG_USE_SHARED_CONTEXT)
-         || !gl->ctx_driver || !gl->ctx_driver->bind_hw_render)
+   if (!gl || !ctx || !gl->ctx_driver || !gl->ctx_driver->bind_hw_render)
       return false;
-   gl->ctx_driver->bind_hw_render(gl->ctx_data, true);
+   /* Asked now, with the context up: a driver that could not make the
+    * shared context says so only once it has tried. One context for
+    * both threads: the ring binds it on whichever thread holds its
+    * token, so nothing is bound here. */
+   if (     (gl->flags & GL3_FLAG_USE_SHARED_CONTEXT)
+         && gl->ctx_driver->get_flags
+         && BIT32_GET(gl->ctx_driver->get_flags(gl->ctx_data),
+               GFX_CTX_FLAGS_NO_SHARED_CONTEXT))
+   {
+      gl->flags &= ~GL3_FLAG_USE_SHARED_CONTEXT;
+      RARCH_LOG("[GLCore] No shared context on \"%s\": the core shares this driver's.\n",
+            gl->ctx_driver->ident);
+   }
+   if (!(gl->flags & GL3_FLAG_USE_SHARED_CONTEXT))
+   {
+      if (     !gl->ctx_driver->get_flags
+            || !BIT32_GET(gl->ctx_driver->get_flags(gl->ctx_data),
+                  GFX_CTX_FLAGS_NO_SHARED_CONTEXT))
+         return false;
+   }
+   else
+      gl->ctx_driver->bind_hw_render(gl->ctx_data, true);
    gl->flags |= GL3_FLAG_HW_RING;
    *ctx = gl;
    return true;

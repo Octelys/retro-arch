@@ -36,12 +36,6 @@
 #                               video driver, and works after it.
 #   video not threaded          as the first, with the window, the pump
 #                               and the poll all on one thread.
-#   RETROARCH_RAWINPUT_POLL=0   the driver as it was before any of
-#                               this: no bulk reads, restarted with
-#                               the video driver, still works - and
-#                               says, each time it is freed, how old
-#                               what the poll read was (the wait that
-#                               reading by the poll removes).
 #   DirectInput                 the other input driver a Windows window
 #                               can get, with its joypad driver:
 #                               started by the same code, restarted
@@ -85,6 +79,11 @@
 #
 # ONLY=<part of a scenario's name> runs just the scenarios that match.
 #
+# The scenarios run in lanes side by side - LANES of them, by default
+# the CPUs less one, three at most - each lane with its own X display,
+# Wine prefix and work directory, taking every LANES-th scenario in
+# turn. Each lane's report is printed whole once all are done.
+#
 # And the window. In every scenario above it is left up across both
 # restarts and taken back by the driver that comes next - with
 # threaded video, where the video thread is held for it, and without.
@@ -114,6 +113,7 @@ set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=${1:-$(cd "$here/../../.." && pwd)}
 work=$(mktemp -d)
+XVFB=
 trap 'kill $XVFB 2>/dev/null; timeout 10 wineserver -k 2>/dev/null; rm -rf "$work"' EXIT
 
 WINE=
@@ -125,6 +125,44 @@ for t in Xvfb xdotool; do
    command -v $t >/dev/null 2>&1 || { echo "no $t" >&2; exit 1; }
 done
 [ -f "$root/retroarch.exe" ] || { echo "no retroarch.exe in $root" >&2; exit 1; }
+
+lanes=${LANES:-$(( $(nproc 2>/dev/null || echo 2) - 1 ))}
+[ "$lanes" -gt 3 ] && lanes=3
+[ "$lanes" -lt 1 ] && lanes=1
+if [ -z "${LANE:-}" ] && [ "$lanes" -gt 1 ]; then
+   pids=
+   for k in $(seq 0 $((lanes - 1))); do
+      LANE=$k LANES=$lanes "$0" "$root" > "$work/lane$k.out" 2>&1 &
+      pids="$pids $!"
+   done
+   wait $pids
+   failures=0
+   for k in $(seq 0 $((lanes - 1))); do
+      grep -av '^PASS windows_wine_smoke\|^FAIL windows_wine_smoke' \
+         "$work/lane$k.out"
+      failures=$((failures + $(grep -ac '^\[FAIL\]' "$work/lane$k.out")))
+      # a lane that stopped before its end
+      grep -aq '^PASS windows_wine_smoke\|^FAIL windows_wine_smoke' \
+         "$work/lane$k.out" || { echo "[FAIL] lane $k did not finish";
+            failures=$((failures + 1)); }
+   done
+   if [ "$failures" != 0 ]; then
+      echo "FAIL windows_wine_smoke: $failures"
+      exit 1
+   fi
+   echo "PASS windows_wine_smoke"
+   exit 0
+fi
+lane=${LANE:-0}
+turn=0
+# a lane of several: a prefix of its own, so its wineserver and
+# windows are its own
+if [ "$lanes" -gt 1 ]; then
+   export WINEPREFIX="$work/prefix"
+   WINEDEBUG=-all WINEDLLOVERRIDES="mscoree=;mshtml=" $WINE wineboot -i \
+      >/dev/null 2>&1
+   timeout 60 wineserver -w 2>/dev/null
+fi
 
 ${MINGW_CC:-x86_64-w64-mingw32-gcc} -shared -O1 -Wall \
    -I"$here/../../../libretro-common/include" \
@@ -182,8 +220,8 @@ CLOSE
 ${MINGW_CC:-x86_64-w64-mingw32-gcc} -O1 -o "$work/close.exe" "$work/close.c" \
    || { echo "the close helper did not build" >&2; exit 1; }
 
-export DISPLAY=:98
-Xvfb :98 -screen 0 1280x720x24 > "$work/xvfb.log" 2>&1 &
+export DISPLAY=:$((98 - lane))
+Xvfb "$DISPLAY" -screen 0 1280x720x24 > "$work/xvfb.log" 2>&1 &
 XVFB=$!
 # The X server is up when something can connect to it and be answered.
 # A fixed wait was here, and on a loaded machine it was too short.
@@ -278,7 +316,7 @@ failures=0
 # passes through
 scenario() {
    local name=$1 threaded=$2 want_bulk=$3 want_joy=$4 nomsg=$5
-   local log="$work/$name.log" try rc video bulk joy msg ok b_down b_up j_seq stale win off byname deferred kbd menus
+   local log="$work/$name.log" try rc video bulk joy msg ok b_down b_up j_seq win off byname deferred kbd menus
    local want_video=${WANT_VIDEO:-3}
    if [ -n "${ONLY:-}" ]; then
       case "$name" in
@@ -286,6 +324,8 @@ scenario() {
          *) return ;;
       esac
    fi
+   turn=$((turn + 1))
+   [ $(( (turn - 1) % lanes )) = "$lane" ] || return
    write_cfg "$threaded" "${6:-raw}" "${7:-winraw_joypad}"
    # key delivery on a virtual display with no window manager is not
    # exact: a scenario gets a second go before it counts as failed
@@ -336,28 +376,17 @@ scenario() {
          [ "$deferred" = 0 ] || ok=no
       fi
       [ "$nomsg" != nomsg ] || [ "$msg" = 0 ] || ok=no
-      # the old path measures the wait the new one removes; the new
-      # one has nothing to measure
       win="$(count "$log" 'window is left up') $(count "$log" 'Took the window left up') $(count "$log" 'not one this driver takes')"
       [ "$win" = "${WANT_WINDOW:-2 2 0}" ] || ok=no
-      stale=$(count "$log" "Taken by the window's thread: at the poll")
-      if [ "$name" = "RETROARCH_RAWINPUT_POLL=0" ]; then
-         [ "$stale" = 3 ] || ok=no
-      else
-         [ "$stale" = 0 ] || ok=no
-      fi
       [ "$ok" = yes ] && break
    done
    if [ "$ok" = yes ]; then
       echo "[pass] $name: video driver started $video times, input driver $bulk by the poll," \
            "joypad driver $joy; the core saw B twice and J's down and up twice; quit on Escape"
-      sed 's/\x1b\[[0-9;]*m//g' "$log" | tr -d '\r' \
-         | grep -a "Taken by the window's thread" | sed 's/.*\[WinRaw\] /       /'
    else
       echo "[FAIL] $name: quit by itself: $([ "$rc" = 0 ] && echo yes || echo no);" \
            "video driver started $video (want $want_video), input driver by the poll $bulk (want $want_bulk)," \
            "joypad driver started $joy (want $want_joy);" \
-           "lines on how old the state was at the poll: $stale;" \
            "window left up, taken, not taken: $win (want ${WANT_WINDOW:-2 2 0});" \
            "the core saw B pressed $b_down and released $b_up (want 2 and 2), J: ${j_seq:-nothing}(want down up down up)," \
            "key events on a thread that is not the core's: $off (want 0)," \
@@ -377,7 +406,6 @@ scenario() {
 scenario "read by the poll, kept" true 1 2 nomsg
 RETROARCH_INPUT_KEEP=0 scenario "RETROARCH_INPUT_KEEP=0" true 3 4 nomsg
 scenario "video not threaded" false 1 2 any
-RETROARCH_RAWINPUT_POLL=0 scenario "RETROARCH_RAWINPUT_POLL=0" true 0 4 any
 scenario "DirectInput" true 0 4 any dinput dinput
 WANT_WINDOW="0 0 0" RETROARCH_WINDOW_KEEP=0 scenario "RETROARCH_WINDOW_KEEP=0" true 1 2 nomsg
 WANT_WINDOW="2 0 2" RETROARCH_WINDOW_KEEP=2 scenario "window left up and not taken" true 1 2 nomsg
@@ -448,6 +476,8 @@ focus_lost() {
    if [ -n "${ONLY:-}" ]; then
       case "focus lost: $name" in *"$ONLY"*) ;; *) return ;; esac
    fi
+   turn=$((turn + 1))
+   [ $(( (turn - 1) % lanes )) = "$lane" ] || return
    write_cfg true "$2" "$2"
    ( cd "$root" && WINEDEBUG=-all exec $WINE ./retroarch.exe --verbose \
         -c "Z:$(echo "$work/retroarch.cfg" | sed 's|/|\\|g')" \

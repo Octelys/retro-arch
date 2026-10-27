@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #ifdef _WIN32
+#define VK_USE_PLATFORM_WIN32_KHR
 #include <windows.h>
 #else
 #include <dlfcn.h>
@@ -250,7 +251,14 @@ int main(void)
    VkPhysicalDevice *gpus;
    uint32_t n = 0, i;
    int result = 0;
-   if (!library) { puts("SKIP: no Vulkan loader"); return 0; }
+   if (!library)
+   {
+      puts("SKIP: no Vulkan loader");
+#ifdef HEVC_DECODE_TEST
+      if (getenv("H26X_TEST_WEBM") || getenv("H26X_TEST_MP4")) return 77;
+#endif
+      return 0;
+   }
 #ifdef _WIN32
    get_proc = (PFN_vkGetInstanceProcAddr)GetProcAddress(library, "vkGetInstanceProcAddr");
 #else
@@ -279,6 +287,21 @@ int main(void)
    else for (i = 0; i < n; i++) if (!probe_gpu(instance, gpus[i], get_proc)) result = 1;
    free(gpus); destroy_instance(instance, NULL);
 unload:
+#ifdef HEVC_DECODE_TEST
+   if (!result && (getenv("H26X_TEST_WEBM") || getenv("H26X_TEST_MP4"))
+         && (!h26x_webm_executed || h26x_webm_skipped))
+   {
+      puts("SKIP: Matroska Vulkan fixture did not execute on a suitable device");
+      result = 77;
+   }
+#ifdef HAVE_RVP9
+   if (!result && getenv("VP9_TEST_MP4") && !vp9_mp4_executed)
+   {
+      puts("SKIP: VP9 MP4 Vulkan fixture did not execute on a suitable device");
+      result = 77;
+   }
+#endif
+#endif
 #ifdef _WIN32
    FreeLibrary(library);
 #else

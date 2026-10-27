@@ -34,12 +34,16 @@
 #include "gfx_display.h"
 #include "gfx_widgets.h"
 #include "font_driver.h"
+#if defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__)
+#include "common/win32_common.h"
+#endif
 #ifdef HAVE_THREADS
 #include "video_thread_wrapper.h"
 #endif
 
 #ifdef HAVE_MENU
 #include "../menu/menu_defines.h"
+#include "../menu/menu_driver.h"
 #endif
 
 #include "../configuration.h"
@@ -1343,6 +1347,12 @@ static INLINE bool gfx_widgets_update_layout(
       bool is_threaded)
 {
    dispgfx_widget_t *p_dispwidget   = &dispwidget_st;
+#if defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__)
+   /* Keep live resizing out of font atlas construction. */
+   if (p_dispwidget->last_scale_factor > 0.0f && win32_message_modal_active())
+      scale_factor = p_dispwidget->last_scale_factor;
+#endif
+
 
    if ((scale_factor != p_dispwidget->last_scale_factor) ||
        (dims         != p_dispwidget->last_video_dims) ||
@@ -2368,6 +2378,10 @@ void gfx_widgets_frame(void *data)
    if (     !retro_atomic_load_acquire_int(&p_dispwidget->worker)
          && p_dispwidget->video_st
          && ((video_driver_state_t*)p_dispwidget->video_st)->thread_wrapper_active)
+      return;
+#endif
+#ifdef HAVE_MENU
+   if (menu_driver_media_startup_token())
       return;
 #endif
    gfx_widgets_frame_state(data);

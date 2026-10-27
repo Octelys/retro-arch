@@ -10,7 +10,9 @@
 #include "../../../libretro-common/formats/h265/rh265.c"
 
 static unsigned failures, opened, closed, accepted, calls, abandoned, exported;
-static int decode_busy, output_busy, refuse;
+static int decode_busy, output_busy, refuse, require_sets;
+static int enable_drain, drain_busy, drain_error;
+static unsigned drains;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "line %u: %s\n", \
       (unsigned)__LINE__, #c); failures++; } } while (0)
 
@@ -49,12 +51,34 @@ static int output(void *decoder, unsigned slot, video_hw_frame_t *frame)
    return 0;
 }
 
+static int drain_backend(void *decoder)
+{
+   CHECK(decoder != NULL);
+   drains++;
+   if (drain_error)
+      return -1;
+   if (drain_busy)
+   {
+      drain_busy--;
+      return 1;
+   }
+   return 0;
+}
+
 static bool open_backend(void *user, const rh265_video *source, const rh265_video_params_t *params,
       unsigned slots, rh265_hw_ops_t *ops)
 {
    mock_decoder_t *d;
    CHECK(source != NULL);
    CHECK(user == &opened && slots == (unsigned)params->max_dec_pic_buffering + 1);
+   if (require_sets)
+   {
+      rh265_nal_t sets[3];
+      unsigned i;
+      CHECK(!rh265_video_get_parameter_sets(source, (unsigned)params->pps_id, sets));
+      for (i = 0; i < 3; i++)
+         CHECK(sets[i].data && sets[i].size > 2 && ((sets[i].data[0] >> 1) & 63u) == 32u + i);
+   }
    if (refuse) return false;
    d = (mock_decoder_t*)calloc(1, sizeof(*d));
    if (!d) return false;
@@ -62,6 +86,7 @@ static bool open_backend(void *user, const rh265_video *source, const rh265_vide
    d->height = params->height - params->crop_top - params->crop_bottom;
    d->bit_depth = params->bit_depth;
    ops->decoder = d; ops->decode = decode; ops->output = output;
+   ops->drain = enable_drain ? drain_backend : NULL;
    opened++;
    return true;
 }
@@ -196,6 +221,7 @@ static void check_mp4(void)
    bytes = (uint8_t*)malloc((size_t)size);
    CHECK(bytes != NULL); if (!bytes) { fclose(f); return; }
    CHECK(fread(bytes, 1, (size_t)size, f) == (size_t)size); fclose(f);
+   require_sets = 1;
    stream = rmp4_video_stream_open(bytes, (size_t)size);
    CHECK(stream != NULL); if (!stream) { free(bytes); return; }
    CHECK(rmp4_video_stream_set_hw(stream, 1));
@@ -224,13 +250,64 @@ static void check_mp4(void)
    /* Leave this export untaken: rewind owns its abandonment. */
    rmp4_video_stream_rewind(stream);
    rmp4_video_stream_close(stream);
+   refuse = 1;
+   stream = rmp4_video_stream_open(bytes, (size_t)size);
+   CHECK(stream != NULL);
+   if (stream)
+   {
+      CHECK(!rmp4_video_stream_set_hw(stream, 1));
+      rmp4_video_stream_set_output(stream, pixels);
+      CHECK(rmp4_video_stream_skip(stream, &duration) == 1);
+      CHECK(!rmp4_video_stream_hw_frame(stream, &frame));
+      CHECK(rmp4_video_stream_render(stream) == pixels);
+      rmp4_video_stream_close(stream);
+   }
+   refuse = require_sets = 0;
    free(bytes);
+}
+
+static void check_eof(void)
+{
+   rh265_video *v;
+   video_hw_frame_t frame;
+   unsigned before = drains;
+   memset(&frame, 0, sizeof(frame));
+   enable_drain = 1;
+   rh265_set_hw_backend(&backend);
+   v = start();
+   if (!v)
+      return;
+   output_busy = 1;
+   CHECK(rh265_video_decode(v, hevc_sample8, sizeof(hevc_sample8)) == 2);
+   CHECK(drains == before);
+   CHECK(rh265_video_drain(v) == 2 && drains == before);
+   v->hw->session.max_reorder = 1;
+   CHECK(!rh265_video_decode(v, hevc_sample8, sizeof(hevc_sample8)));
+   CHECK(drains == before && v->hw->session.state.outputs);
+   drain_busy = 1;
+   CHECK(rh265_video_drain(v) == 2 && drains == before + 1);
+   CHECK(!rh265_video_drain(v) && drains == before + 2);
+   CHECK(!rh265_video_hw_frame(v, &frame));
+   video_hw_frame_abandon(&frame);
+   CHECK(rh265_video_drain(v) == -1 && drains == before + 3);
+   rh265_video_close(v);
+
+   v = start();
+   if (!v)
+      return;
+   before = drains;
+   drain_error = 1;
+   CHECK(rh265_video_drain(v) == -2 && drains == before + 1);
+   CHECK(rh265_video_drain(v) == -2 && drains == before + 1);
+   rh265_video_close(v);
+   enable_drain = drain_error = 0;
 }
 
 int main(void)
 {
    check_decoder();
    check_pressure();
+   check_eof();
    check_mp4();
    rh265_set_hw_backend(NULL);
    CHECK(opened == closed && exported == abandoned);

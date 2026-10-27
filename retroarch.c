@@ -135,7 +135,7 @@
 #include "camera/camera_driver.h"
 #include "location_driver.h"
 #include "record/record_driver.h"
-#include "record/drivers/record_nvenc.h"
+#include "record/record_driver.h"
 
 #ifdef HAVE_MICROPHONE
 #include "audio/microphone_driver.h"
@@ -165,6 +165,7 @@
 #endif
 
 #include "input/input_remapping.h"
+#include "input/drivers_hid/winusb_bind.h"
 #ifdef HAVE_OPENXR
 #include "input/common/input_openxr.h"
 #include "gfx/video_xr.h"
@@ -1029,10 +1030,10 @@ static bool midi_driver_init(void *data)
    return true;
 }
 
-void midi_driver_request(void)
+void midi_driver_request(bool requested)
 {
-   rarch_midi_drv_requested = true;
-   if (rarch_midi_drv_inited)
+   rarch_midi_drv_requested = requested;
+   if (requested && rarch_midi_drv_inited)
       midi_driver_open(config_get_ptr());
 }
 
@@ -1559,10 +1560,13 @@ static void driver_headset_notice(runloop_state_t *runloop_st,
 }
 #endif
 
+/* @audio_input, when set, receives the audio input rate instead of the
+ * audio driver: the caller hands it over itself. */
 static void driver_adjust_system_rates(
       runloop_state_t *runloop_st,
       video_driver_state_t *video_st,
-      settings_t *settings)
+      settings_t *settings,
+      double *audio_input)
 {
    double input_sample_rate               = video_st->av_info.timing.sample_rate;
    double input_fps                       = video_st->av_info.timing.fps;
@@ -1643,10 +1647,9 @@ static void driver_adjust_system_rates(
    if (input_sample_rate > 0.0)
    {
       audio_driver_state_t *audio_st      = audio_state_get_ptr();
-      if (sync_plan & RUNLOOP_SYNC_EXACT_RATE)
-         audio_st->input = input_sample_rate;
-      else
-         audio_st->input =
+      double input                        = input_sample_rate;
+      if (!(sync_plan & RUNLOOP_SYNC_EXACT_RATE))
+         input =
             audio_driver_monitor_adjust_system_rates(
                   input_sample_rate,
                   input_fps,
@@ -1656,8 +1659,12 @@ static void driver_adjust_system_rates(
                   shader_subframes,
                   audio_max_timing_skew);
 
-      RARCH_LOG("[Audio] Set audio input rate to: %.2f Hz.\n",
-            audio_st->input);
+      if (audio_input)
+         *audio_input    = input;
+      else
+         audio_st->input = input;
+
+      RARCH_LOG("[Audio] Set audio input rate to: %.2f Hz.\n", input);
    }
 
    runloop_st->flags &= ~RUNLOOP_FLAG_FORCE_NONBLOCK;
@@ -1683,6 +1690,14 @@ static void driver_adjust_system_rates(
 
    if (video_st->data)
       driver_set_nonblock_state();
+}
+
+bool driver_set_audio_input_rate(void)
+{
+   double input = 0.0;
+   driver_adjust_system_rates(runloop_state_get_ptr(), video_state_get_ptr(),
+         config_get_ptr(), &input);
+   return audio_driver_set_input_rate(input);
 }
 
 /**
@@ -1818,6 +1833,11 @@ void drivers_init(
       }
       else if (hwr->context_reset)
          hwr->context_reset();
+#ifdef HAVE_THREADS
+      /* Taken for context_reset by video_thread_hw_bind_core_context;
+       * the core's next run takes it again. */
+      video_thread_core_context_release();
+#endif
       video_driver_cache_context_ack_clear();
       runloop_st->frame_time_last = 0;
    }
@@ -1855,7 +1875,7 @@ void drivers_init(
 
    /* Adjust rates */
    if (flags & (DRIVER_VIDEO_MASK | DRIVER_AUDIO_MASK))
-      driver_adjust_system_rates(runloop_st, video_st, settings);
+      driver_adjust_system_rates(runloop_st, video_st, settings, NULL);
 
    /* Initialize audio driver */
    if (flags & DRIVER_AUDIO_MASK)
@@ -1863,6 +1883,7 @@ void drivers_init(
       audio_driver_init_internal(
             settings,
             audio_st->callback.callback != NULL);
+      audio_driver_drop_kept();
       /* Whether or not init succeeded: the list is how the user gets
        * out of a failed device choice. */
       audio_driver_refresh_devices_list();
@@ -1961,6 +1982,7 @@ void drivers_init(
        * a global notifications on/off toggle switch */
       if (   video_font_enable
           && menu_enable_widgets
+          && video_st->data
           && video_st->current_video
           && video_st->current_video->gfx_widgets_enabled
           && video_st->current_video->gfx_widgets_enabled(video_st->data))
@@ -2151,6 +2173,7 @@ void driver_uninit(int flags, enum driver_lifetime_flags lifetime_flags)
       if (     menu_st->driver_ctx
             && menu_st->driver_ctx->context_destroy)
          menu_st->driver_ctx->context_destroy(menu_st->userdata);
+      gfx_thumbnail_anim_worker_deinit();
    }
 #endif
 
@@ -2211,7 +2234,17 @@ void driver_uninit(int flags, enum driver_lifetime_flags lifetime_flags)
    }
 
    if (flags & DRIVER_AUDIO_MASK)
-      audio_driver_deinit();
+   {
+      /* Content loaded or closed: the device is kept for drivers_init()
+       * to take back, when it would open the same one. */
+      audio_driver_keep_device(
+            (lifetime_flags & DRIVER_LIFETIME_SESSION_SWITCH) != 0);
+      if (lifetime_flags & (DRIVER_LIFETIME_RESET
+                         | DRIVER_LIFETIME_SESSION_SWITCH))
+         audio_driver_deinit_for_reinit();
+      else
+         audio_driver_deinit();
+   }
 
    /* (a driver kept across the restart keeps its data) */
    if (     (flags & DRIVER_INPUT_MASK)
@@ -2226,13 +2259,11 @@ void driver_uninit(int flags, enum driver_lifetime_flags lifetime_flags)
       microphone_driver_deinit(lifetime_flags & DRIVER_LIFETIME_RESET);
 #endif
 
+   /* The core's request outlives this: a staged content load frees
+    * the drivers after the new core has asked, and drivers_init
+    * reopens for it. The request ends with the core's unload. */
    if (flags & DRIVER_MIDI_MASK)
-   {
       midi_driver_free();
-      /* Reopen after a reinit, not after the core is unloaded */
-      if (!(lifetime_flags & DRIVER_LIFETIME_RESET))
-         rarch_midi_drv_requested = false;
-   }
 
 #ifdef HAVE_LAKKA
    cpu_scaling_driver_free();
@@ -2301,6 +2332,8 @@ static void retroarch_deinit_drivers(struct retro_callbacks *cbs)
       memset(&input_st->hold_btns, 0, sizeof(hold_buttons_t));
       memset(&input_st->analog_requested, 0,
          sizeof(input_st->analog_requested));
+      memset(&input_st->touchpad_requested, 0,
+         sizeof(input_st->touchpad_requested));
       input_st->current_driver           = NULL;
    }
 
@@ -2378,7 +2411,7 @@ bool driver_ctl(enum driver_ctl_state state, void *data)
                   && runloop_st->current_core_type == CORE_TYPE_DUMMY)
                video_st->av_info.timing.fps = *hz;
 
-            driver_adjust_system_rates(runloop_st, video_st, settings);
+            driver_adjust_system_rates(runloop_st, video_st, settings, NULL);
 
             /* Use the input rate adjusted for the new display timing. */
             audio_st->src_ratio_orig   =
@@ -2426,6 +2459,43 @@ uint32_t retroarch_get_flags(void)
 {
    struct rarch_state *p_rarch = &rarch_st;
    return p_rarch->flags;
+}
+
+void retroarch_user_dirs_hold(void)
+{
+   rarch_st.flags |= RARCH_FLAGS_USER_DIRS_HELD;
+}
+
+void retroarch_user_dirs_release(void)
+{
+   settings_t *settings = config_get_ptr();
+
+   if (!(rarch_st.flags & RARCH_FLAGS_USER_DIRS_HELD))
+      return;
+   rarch_st.flags &= ~RARCH_FLAGS_USER_DIRS_HELD;
+   if (!settings)
+      return;
+
+   {
+      char new_path[PATH_MAX_LENGTH];
+      fill_pathname_join_special(new_path,
+            settings->paths.directory_playlist,
+            FILE_PATH_BUILTIN, sizeof(new_path));
+      if (!path_is_directory(new_path))
+         path_mkdir(new_path);
+   }
+
+#ifdef HAVE_MENU
+   retroarch_favorites_init();
+   command_event(CMD_EVENT_HISTORY_INIT, NULL);
+   {
+      struct menu_state *menu_st = menu_state_get_ptr();
+      if (menu_st->driver_ctx && menu_st->driver_ctx->environ_cb)
+         menu_st->driver_ctx->environ_cb(MENU_ENVIRON_RESET_HORIZONTAL_LIST,
+               NULL, menu_st->userdata);
+      menu_st->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+   }
+#endif
 }
 
 struct retro_perf_counter **retro_get_perf_counter_rarch(void)
@@ -3272,7 +3342,7 @@ enum rarch_content_type path_is_media_type(const char *path)
 #endif
          return RARCH_CONTENT_MUSIC;
 #endif
-#ifdef HAVE_IMAGEVIEWER
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
       case FILE_TYPE_JPEG:
       case FILE_TYPE_PNG:
       case FILE_TYPE_TGA:
@@ -3693,6 +3763,86 @@ static void command_event_finish_content_deinit(void)
          if (hwr)
             memset(hwr, 0, sizeof(*hwr));
 
+}
+
+/* What the audio driver's teardown drops, put back once it is up again:
+ * the record that the core is held, the menu's entries, the system
+ * sounds the mixer lost. */
+static void retroarch_audio_restarted(runloop_state_t *runloop_st,
+      settings_t *settings)
+{
+   bool core_held = !!(runloop_st->flags & RUNLOOP_FLAG_PAUSED);
+#ifdef HAVE_MENU
+   struct menu_state *menu_st = menu_state_get_ptr();
+   if (     (menu_st->flags & MENU_ST_FLAG_ALIVE)
+         && settings->bools.menu_pause_libretro
+#ifdef HAVE_NETWORKING
+         && netplay_driver_ctl(RARCH_NETPLAY_CTL_ALLOW_PAUSE, NULL)
+#endif
+      )
+      core_held = true;
+#endif
+   (void)settings;
+   if (core_held)
+      audio_driver_pause_fade(true);
+#ifdef HAVE_MENU
+   menu_st->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+#endif
+#if defined(HAVE_AUDIOMIXER)
+   audio_driver_load_system_sounds();
+#endif
+}
+
+typedef struct
+{
+   int  cmd;
+   int  arg;
+   bool has_arg;
+} command_later_t;
+
+static void command_event_later_handler(retro_task_t *task)
+{
+   task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
+}
+
+/* on the main thread, where finished tasks are retired */
+static void command_event_later_callback(retro_task_t *task,
+      void *task_data, void *user_data, const char *error)
+{
+   command_later_t *later = (command_later_t*)task->state;
+   if (later)
+      command_event((enum event_command)later->cmd,
+            later->has_arg ? &later->arg : NULL);
+}
+
+static void command_event_later_cleanup(retro_task_t *task)
+{
+   free(task->state);
+   task->state = NULL;
+}
+
+bool command_event_later(enum event_command cmd, const int *arg)
+{
+   retro_task_t *task;
+   command_later_t *later = (command_later_t*)malloc(sizeof(*later));
+
+   if (!later)
+      return false;
+   later->cmd     = (int)cmd;
+   later->arg     = arg ? *arg : 0;
+   later->has_arg = arg != NULL;
+   if (!(task = task_init()))
+   {
+      free(later);
+      return false;
+   }
+   task->handler  = command_event_later_handler;
+   task->callback = command_event_later_callback;
+   task->cleanup  = command_event_later_cleanup;
+   task->state    = later;
+   task->flags   |= RETRO_TASK_FLG_MUTE;
+   task_queue_push(task);
+   return true;
 }
 
 bool command_event(enum event_command cmd, void *data)
@@ -4174,6 +4324,11 @@ bool command_event(enum event_command cmd, void *data)
       case CMD_EVENT_RESET:
          {
             const char *_msg = msg_hash_to_str(MSG_RESET);
+#ifdef HAVE_COMMAND
+            /* steps queued for the game before the reset, however it
+             * came - hotkey, menu, command - would play on from it */
+            command_run_frames_forget();
+#endif
             RARCH_LOG("[Core] %s.\n", _msg);
             runloop_msg_queue_push(_msg, strlen(_msg), 1, 120, true, NULL,
                   MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
@@ -4626,16 +4781,22 @@ bool command_event(enum event_command cmd, void *data)
          /* this fallthrough is on purpose, it should do
             a CMD_EVENT_REINIT too */
       case CMD_EVENT_REINIT:
-         command_event_reinit(
-               data ? *(const int*)data : DRIVERS_CMD_ALL);
-
+         {
+            int reinit_flags = data ? *(const int*)data : DRIVERS_CMD_ALL;
+            if (command_event_reinit(reinit_flags))
+            {
+               /* Audio started over with the rest; what its own
+                * reinit restores after the teardown, this does. */
+               if (reinit_flags & DRIVER_AUDIO_MASK)
+                  retroarch_audio_restarted(runloop_st, settings);
 #if defined(HAVE_AUDIOMIXER) && defined(HAVE_MENU)
-         /* Menu sounds require audio reinit. */
-         if (     settings->bools.audio_enable_menu
-               && (!data || (*(const int*)data
-                     & (DRIVER_AUDIO_MASK | DRIVER_MENU_MASK))))
-            command_event(CMD_EVENT_AUDIO_REINIT, NULL);
+               /* Menu sounds require audio reinit. */
+               else if (settings->bools.audio_enable_menu
+                     && (reinit_flags & DRIVER_MENU_MASK))
+                  command_event(CMD_EVENT_AUDIO_REINIT, NULL);
 #endif
+            }
+         }
 
          /* Recalibrate frame delay target if not pausing */
          if (settings->bools.video_frame_delay_auto && !video_st->frame_delay_pause)
@@ -4924,7 +5085,7 @@ bool command_event(enum event_command cmd, void *data)
          }
          g_defaults.music_history = NULL;
 
-#if defined(HAVE_FFMPEG) || defined(HAVE_MPV)
+#if defined(HAVE_FFMPEG) || defined(HAVE_MPV) || defined(HAVE_WEBMPLAYER)
          if (g_defaults.video_history)
          {
             playlist_write_file(g_defaults.video_history);
@@ -4933,7 +5094,7 @@ bool command_event(enum event_command cmd, void *data)
          g_defaults.video_history = NULL;
 #endif
 
-#ifdef HAVE_IMAGEVIEWER
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
          if (g_defaults.image_history)
          {
             playlist_write_file(g_defaults.image_history);
@@ -4949,10 +5110,10 @@ bool command_event(enum event_command cmd, void *data)
             bool history_list_enable               = settings->bools.history_list_enable;
             const char *path_content_history       = settings->paths.path_content_history;
             const char *path_content_music_history = settings->paths.path_content_music_history;
-#if defined(HAVE_FFMPEG) || defined(HAVE_MPV)
+#if defined(HAVE_FFMPEG) || defined(HAVE_MPV) || defined(HAVE_WEBMPLAYER)
             const char *path_content_video_history = settings->paths.path_content_video_history;
 #endif
-#ifdef HAVE_IMAGEVIEWER
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
             const char *path_content_image_history = settings->paths.path_content_image_history;
 #endif
             playlist_config.capacity               = settings->uints.content_history_size;
@@ -4964,7 +5125,9 @@ bool command_event(enum event_command cmd, void *data)
 
             command_event(CMD_EVENT_HISTORY_DEINIT, NULL);
 
-            if (!history_list_enable || !playlist_config.capacity)
+            if (     !history_list_enable
+                  || !playlist_config.capacity
+                  || (rarch_st.flags & RARCH_FLAGS_USER_DIRS_HELD))
                return false;
 
             _msg = msg_hash_to_str(MSG_LOADING_HISTORY_FILE);
@@ -4981,7 +5144,7 @@ bool command_event(enum event_command cmd, void *data)
                      g_defaults.content_history, PLAYLIST_SORT_MODE_OFF);
             }
 
-#ifdef HAVE_IMAGEVIEWER
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
             if (path_content_image_history && *path_content_image_history)
             {
                RARCH_LOG("[Playlist] %s: \"%s\".\n", _msg,
@@ -5003,7 +5166,7 @@ bool command_event(enum event_command cmd, void *data)
                      g_defaults.music_history, PLAYLIST_SORT_MODE_OFF);
             }
 
-#if defined(HAVE_FFMPEG) || defined(HAVE_MPV)
+#if defined(HAVE_FFMPEG) || defined(HAVE_MPV) || defined(HAVE_WEBMPLAYER)
             if (path_content_video_history && *path_content_video_history)
             {
                RARCH_LOG("[Playlist] %s: \"%s\".\n", _msg,
@@ -5219,27 +5382,7 @@ bool command_event(enum event_command cmd, void *data)
       case CMD_EVENT_AUDIO_REINIT:
          driver_uninit(DRIVER_AUDIO_MASK, DRIVER_LIFETIME_RESET);
          drivers_init(settings, DRIVER_AUDIO_MASK, DRIVER_LIFETIME_RESET, verbosity_is_enabled());
-         /* The teardown drops the record that the core is held. */
-         {
-            bool core_held = !!(runloop_st->flags & RUNLOOP_FLAG_PAUSED);
-#ifdef HAVE_MENU
-            if (     (menu_st->flags & MENU_ST_FLAG_ALIVE)
-                  && settings->bools.menu_pause_libretro
-#ifdef HAVE_NETWORKING
-                  && netplay_driver_ctl(RARCH_NETPLAY_CTL_ALLOW_PAUSE, NULL)
-#endif
-               )
-               core_held = true;
-#endif
-            if (core_held)
-               audio_driver_pause_fade(true);
-         }
-#ifdef HAVE_MENU
-         menu_st->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
-#endif
-#if defined(HAVE_AUDIOMIXER)
-         audio_driver_load_system_sounds();
-#endif
+         retroarch_audio_restarted(runloop_st, settings);
          break;
 #ifdef HAVE_MICROPHONE
       case CMD_EVENT_MICROPHONE_REINIT:
@@ -5847,7 +5990,11 @@ bool command_event(enum event_command cmd, void *data)
              * asks exactly as it did before. */
             netplay_mitm_query_prefetch();
 
-            if (netplay_driver_ctl(RARCH_NETPLAY_CTL_USE_CORE_PACKET_INTERFACE, NULL))
+            /* A lockstep host starts on the running content, as a joiner
+             * does: joiners get its state, and reloading restarts the
+             * game, which a core as large as Dolphin may not survive */
+            if (     netplay_driver_ctl(RARCH_NETPLAY_CTL_USE_CORE_PACKET_INTERFACE, NULL)
+                  || netplay_driver_ctl(RARCH_NETPLAY_CTL_USE_LOCKSTEP, NULL))
             {
                netplay_driver_ctl(RARCH_NETPLAY_CTL_ENABLE_SERVER, NULL);
                command_event(CMD_EVENT_NETPLAY_INIT, NULL);
@@ -7300,6 +7447,13 @@ extern "C"
 #endif
 int main(int argc, char *argv[])
 {
+#ifdef HAVE_WINUSB_BIND
+   /* the copy started with administrator rights to move a DualShock 3
+    * to WinUSB or back (winusb_bind_request()), or an installer's */
+   int ret;
+   if (argc == 2 && winusb_bind_command(argv[1], &ret))
+      return ret;
+#endif
    return rarch_main(argc, argv, NULL);
 }
 #endif
@@ -7557,6 +7711,9 @@ static void retroarch_print_features(void)
 #endif
 #ifdef HAVE_RZSTD
    _len += _PSUPP_BUF(buf, _len, SUPPORTS_ZSTD,            "zstd",            "Zstandard support");
+#endif
+#ifdef HAVE_RBZIP2
+   _len += _PSUPP_BUF(buf, _len, SUPPORTS_BZIP2,           "bzip2",           "bzip2 support");
 #endif
 #ifdef HAVE_RRAR
    _len += _PSUPP_BUF(buf, _len, SUPPORTS_RAR,             "rar",             "RAR support");
@@ -8844,6 +9001,15 @@ static bool retroarch_parse_input_and_config(
 
                   drivers_init(settings, reinit_flags, (enum driver_lifetime_flags)0, false);
                   retroarch_init_task_queue();
+#ifdef HAVE_THREADS
+                  /* Threaded for this run whatever the setting: only
+                   * there does the scan get its readers. */
+                  if (!explicit_menu && !task_queue_is_threaded())
+                  {
+                     task_queue_set_threaded();
+                     task_queue_check();
+                  }
+#endif
 
 #ifdef HAVE_MENU
                   if (explicit_menu)
@@ -9374,6 +9540,9 @@ bool retroarch_main_init_core(int argc, char *argv[],
    {
       const char    *fullpath  = p_rarch->path_content;
 
+#ifdef HAVE_MENU
+      menu_driver_media_open(NULL);
+#endif
       if (fullpath && *fullpath)
       {
          enum rarch_content_type cont_type = path_is_media_type(fullpath);
@@ -9382,6 +9551,18 @@ bool retroarch_main_init_core(int argc, char *argv[],
 #endif
          bool builtin_mediaplayer          = settings->bools.multimedia_builtin_mediaplayer_enable;
 
+#ifdef HAVE_MENU
+         if (!(runloop_st->flags & RUNLOOP_FLAG_HAS_SET_CORE)
+               && !retroarch_override_setting_is_set(
+                  RARCH_OVERRIDE_SETTING_LIBRETRO, NULL)
+               && menu_driver_media_open(fullpath))
+         {
+            path_clear(RARCH_PATH_CONTENT);
+            path_clear(RARCH_PATH_BASENAME);
+            runloop_set_current_core_type(CORE_TYPE_DUMMY, false);
+         }
+         else
+#endif
          switch (cont_type)
          {
             case RARCH_CONTENT_MOVIE:
@@ -9634,6 +9815,19 @@ bool retroarch_main_init_drivers(bool staged,
    game_ai_init();
 #endif
 
+#if !defined(HAVE_DYNAMIC)
+   /* The first time this process's drivers are up, the core salamander
+    * launched has started. */
+   {
+      static bool salamander_cleared = false;
+      if (!salamander_cleared)
+      {
+         config_clear_salamander_pending();
+         salamander_cleared = true;
+      }
+   }
+#endif
+
    rarch_st.flags &= ~RARCH_FLAGS_INIT_IN_PROGRESS;
    return true;
 }
@@ -9722,6 +9916,19 @@ void retroarch_task_queue_configure(void)
    settings_t *settings        = config_get_ptr();
    bool threaded_enable        = settings->bools.threaded_data_runloop_enable;
 
+   /* Parallel tasks (shader stage compiles) get the cores left over
+    * once the main thread, the video thread and the one worker have
+    * theirs. */
+   {
+      unsigned cores = cpu_features_get_core_amount();
+      unsigned extra = cores > 3 ? cores - 3 : 0;
+#ifdef __EMSCRIPTEN__
+      /* these and the one worker fill PTHREAD_POOL_SIZE */
+      if (extra > 4)
+         extra = 4;
+#endif
+      task_queue_set_parallel_workers(extra);
+   }
    if (threaded_enable)
       task_queue_set_threaded();
    else
@@ -10073,6 +10280,8 @@ bool retroarch_ctl(enum rarch_ctl_state state, void *data)
 
             memset(&input_st->analog_requested, 0,
                   sizeof(input_st->analog_requested));
+            memset(&input_st->touchpad_requested, 0,
+                  sizeof(input_st->touchpad_requested));
          }
          break;
       case RARCH_CTL_SET_SHUTDOWN:
@@ -10400,7 +10609,9 @@ static bool retroarch_main_quit_begin(void)
 
    if (runloop_st->flags & RUNLOOP_FLAG_SHUTDOWN_INITIATED)
       return false;
-   record_nvenc_stop();
+   recording_gpu_stop();
+   if (recording_state_get_ptr()->start_pending)
+      command_event(CMD_EVENT_RECORD_DEINIT, NULL);
    if (   settings->bools.savestate_auto_save
        && runloop_st->current_core_type != CORE_TYPE_DUMMY)
       command_event_save_auto_state();
@@ -10547,11 +10758,11 @@ bool retroarch_main_quit_staged(void)
          || !video_st->data
          || !video_st->current_video->alive
          || !video_st->current_video->alive(video_st->data))
-         && !record_nvenc_pending())
+         && !recording_gpu_pending())
       return retroarch_main_quit();
 
    first = retroarch_main_quit_begin();
-   if (!first || (!retroarch_quit_state_task_pending(NULL) && !record_nvenc_pending()))
+   if (!first || (!retroarch_quit_state_task_pending(NULL) && !recording_gpu_pending()))
    {
       retroarch_main_quit_finish(first);
       return true;
@@ -10580,8 +10791,8 @@ bool retroarch_main_quit_poll(void)
 
    if (!runloop_st->quit_pending)
       return false;
-   record_nvenc_poll();
-   if (retroarch_quit_state_task_pending(NULL) || record_nvenc_pending())
+   recording_gpu_poll();
+   if (retroarch_quit_state_task_pending(NULL) || recording_gpu_pending())
       return false;
    runloop_st->quit_pending = false;
    retroarch_main_quit_finish(true);
@@ -10675,7 +10886,7 @@ void retroarch_favorites_init(void)
    playlist_config.fuzzy_archive_match = settings ? settings->bools.playlist_fuzzy_archive_match : false;
    playlist_config_set_base_content_directory(&playlist_config, NULL);
 
-   if (!settings)
+   if (!settings || (rarch_st.flags & RARCH_FLAGS_USER_DIRS_HELD))
       return;
 
    if (content_favorites_size >= 0)

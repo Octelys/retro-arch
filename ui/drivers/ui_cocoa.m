@@ -21,6 +21,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 
 #include <mach/task.h>
 #include <mach/mach_init.h>
@@ -76,6 +77,10 @@
 #include "../../steam/steam.h"
 #endif
 
+#ifdef HAVE_MENU
+#include "../../menu/menu_driver.h"
+#endif
+
 /* Selectors this file names with @selector() for methods newer than an
  * old SDK (each call is behind -respondsToSelector: or a version
  * check): declared for -Wundeclared-selector only where the SDK has
@@ -106,8 +111,13 @@ static int waiting_argc;
 static char **waiting_argv;
 static bool cocoa_termination_pending;
 static bool cocoa_window_restored;
+static bool cocoa_started;
+static bool cocoa_launching;
+static bool cocoa_documents_probed;
 
 extern id<ApplePlatform> apple_platform;
+
+bool frontend_darwin_documents_dir(char *s, size_t len);
 
 static void* ui_window_cocoa_init(void)
 {
@@ -509,6 +519,8 @@ static ui_application_t ui_application_cocoa = {
  * full-screen RAWindow made by -[RetroArch_OSX
  * enterBorderlessFullScreen] needs it to receive keystrokes. */
 - (BOOL)canBecomeKeyWindow { return YES; }
+/* Likewise main: -makeMainWindow asserts on a window that cannot. */
+- (BOOL)canBecomeMainWindow { return YES; }
 
 #define CONVERT_POINT() [[apple_platform renderView] convertPoint:[event locationInWindow] fromView:nil]
 
@@ -531,6 +543,9 @@ static ui_application_t ui_application_cocoa = {
    NSEventType event_type = [event type];
 
    [super sendEvent:event];
+
+   if (!cocoa_started)
+      return;
 
    switch ((int32_t)event_type)
    {
@@ -789,34 +804,34 @@ static ui_application_t ui_application_cocoa = {
 
 #define NS_WINDOW_COLLECTION_BEHAVIOR_FULLSCREEN_PRIMARY (1 << 7)
 
-- (void)applicationDidFinishLaunching:(NSNotification *)aNotification
+- (void)probeDocuments:(NSString *)path
 {
-   int i;
-   apple_platform   = self;
-   [self.window setAcceptsMouseMovedEvents: YES];
+   DIR *dir;
+   RARCH_AUTORELEASEPOOL_BEGIN
+   if ((dir = opendir([path fileSystemRepresentation])))
+      closedir(dir);
+   [self performSelectorOnMainThread:@selector(documentsProbed)
+                          withObject:nil
+                       waitUntilDone:NO];
+   RARCH_AUTORELEASEPOOL_END
+}
 
-   if (!cocoa_window_restored)
-      [self.window makeKeyAndOrderFront:nil];
-   [NSApp activateIgnoringOtherApps:YES];
+- (void)startRetroArch
+{
+   cocoa_launching = true;
 
    _listener = [WindowListener new];
    [_listener setWindow:self.window];
 
    [self.window setNextResponder:_listener];
    [self.window setDelegate:_listener];
-   [[self.window contentView] setAutoresizesSubviews:YES];
 
-   for (i = 0; i < waiting_argc; i++)
-   {
-      if (string_is_equal(waiting_argv[i], "-NSDocumentRevisionsDebugMode"))
-      {
-         waiting_argv[i]   = NULL;
-         waiting_argv[i+1] = NULL;
-         waiting_argc     -= 2;
-      }
-   }
    if (rarch_main(waiting_argc, waiting_argv, NULL))
+   {
       [[NSApplication sharedApplication] terminate:nil];
+      return;
+   }
+   cocoa_started         = true;
 
    cocoa_window_restored = false;
    waiting_argc = 0;
@@ -838,12 +853,80 @@ static ui_application_t ui_application_cocoa = {
 #endif
 }
 
+- (void)documentsProbed
+{
+   cocoa_documents_probed = true;
+   if (cocoa_launching)
+      retroarch_user_dirs_release();
+   else
+   {
+      [NSObject cancelPreviousPerformRequestsWithTarget:self
+                                               selector:@selector(startWhileProbing)
+                                                 object:nil];
+      [self startRetroArch];
+   }
+}
+
+/* The probe is still out, so the access prompt is up: start without
+ * the user directories and let the probe's return release them. */
+- (void)startWhileProbing
+{
+   if (cocoa_launching || cocoa_documents_probed)
+      return;
+   retroarch_user_dirs_hold();
+   [self startRetroArch];
+}
+
+- (void)applicationDidFinishLaunching:(NSNotification *)aNotification
+{
+   int i;
+   char docs[PATH_MAX_LENGTH];
+   apple_platform   = self;
+   [self.window setAcceptsMouseMovedEvents: YES];
+
+   if (!cocoa_window_restored)
+      [self.window makeKeyAndOrderFront:nil];
+   [NSApp activateIgnoringOtherApps:YES];
+
+   [[self.window contentView] setAutoresizesSubviews:YES];
+
+   for (i = 0; i < waiting_argc; i++)
+   {
+      if (string_is_equal(waiting_argv[i], "-NSDocumentRevisionsDebugMode"))
+      {
+         waiting_argv[i]   = NULL;
+         waiting_argv[i+1] = NULL;
+         waiting_argc     -= 2;
+      }
+   }
+
+   /* The first touch of Documents raises the system's access prompt
+    * and blocks the touching thread until it is answered, so it is
+    * made on a thread of its own while the main one keeps running. */
+   if (frontend_darwin_documents_dir(docs, sizeof(docs)))
+   {
+      [NSThread detachNewThreadSelector:@selector(probeDocuments:)
+                               toTarget:self
+                             withObject:BOXSTRING(docs)];
+      [self performSelector:@selector(startWhileProbing)
+                 withObject:nil
+                 afterDelay:0.25];
+   }
+   else
+      [self startRetroArch];
+}
+
 #pragma mark - ApplePlatform
 
 - (void)setupMainWindow
 {
-   [self.window makeMainWindow];
-   [self.window makeKeyWindow];
+   /* The borderless window in full screen; the titled one is not on
+    * screen then, and -makeMainWindow on it is an assertion. */
+   NSWindow *host = [self hostWindow];
+   if ([host canBecomeMainWindow])
+      [host makeMainWindow];
+   if ([host canBecomeKeyWindow])
+      [host makeKeyWindow];
 }
 
 - (NSWindow *)hostWindow
@@ -1313,9 +1396,10 @@ static void open_document_handler(
    if (!result)
       return;
 
-#ifdef HAVE_LIBRETRODB
-   if (filebrowser_get_type() == FILEBROWSER_SCAN_FILE)
-      action_scan_file(state->result, NULL, 0, 0);
+#ifdef HAVE_MENU
+   if (     (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE)
+         && action_ok_manual_content_scan_dir_browsing())
+      action_ok_manual_content_scan_set_dir(state->result);
    else
 #endif
    {
@@ -1389,6 +1473,12 @@ static void open_document_handler(
       free(browser_state.startdir);
       free(browser_state.title);
    }
+}
+
+/* The menu bar's actions need the settings rarch_main sets up. */
+- (BOOL)validateMenuItem:(NSMenuItem *)item
+{
+   return cocoa_started;
 }
 
 - (void)unloadingCore { }

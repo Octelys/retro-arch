@@ -25,6 +25,9 @@
 #include "video_thread_hw.h"
 #include "video_thread_hw_fence.h"
 #include "gfx_instrument.h"
+#ifdef HAVE_TEMPORAL_UPSCALER
+#include "video_upscaler.h"
+#endif
 #include "../configuration.h"
 #include "../verbosity.h"
 
@@ -105,6 +108,14 @@ typedef struct
     * took back; the next user of the slot waits it first. Handed
     * between the two threads lock-free: video_thread_hw_fence.h. */
    hw_fence_t       fence;
+#ifdef HAVE_TEMPORAL_UPSCALER
+   /* The temporal upscaler's inputs the core set for this frame, a
+    * copy: the core rewrites its own for its next frame while the
+    * video thread is still presenting this one, and the driver takes
+    * them inside its frame call, on that thread. */
+   struct retro_hw_upscaler_inputs upscaler;
+   bool             has_upscaler;
+#endif
 } hw_slot_t;
 
 enum hw_api
@@ -173,7 +184,51 @@ typedef struct
    /* For waiting a dropped frame's semaphores, see video_thread_hw_drop. */
    PFN_vkQueueSubmit queue_submit;
 #endif
+   /* OpenGL on a context that cannot share (one GL context per process):
+    * the driver's one context is handed between the threads. The owner
+    * word, moved only by compare-and-swap, holds who has it
+    * (HW_CTX_HOLDER: FREE, MAIN or VIDEO), HW_CTX_GRANT while a release
+    * has handed it to a holder that has not bound it yet, and the
+    * HW_CTX_WANT bit of a thread parked on ctx_free waiting for it. A
+    * release goes to the thread that asked, never back to the free
+    * pool, so a waiter has it after the other thread's current hold
+    * and no later. The main thread holds it around the core's work,
+    * the video thread around a pass of its loop. */
+   retro_atomic_int_t  ctx_owner;
+   retro_eventcount_t  ctx_free;
+   bool                handoff;
 } hw_ring_t;
+
+#define HW_CTX_FREE      0
+#define HW_CTX_MAIN      1
+#define HW_CTX_VIDEO     2
+#define HW_CTX_HOLDER    3
+#define HW_CTX_GRANT     4
+#define HW_CTX_WANT(who) (4 << (who))
+
+static hw_ring_t *hw_handoff_ring(thread_video_t *thr);
+
+/* Give the context up on the calling thread `me`, if it holds it:
+ * unbound here first, since a context current on this thread cannot be
+ * made current on the other. It goes to the other thread when that
+ * thread asked for it, or when `give` says it will take it - only for
+ * a thread certain to call video_thread_hw_ctx_take(), since nothing
+ * else ends a grant. True when it was held. */
+static bool hw_ctx_hand(hw_ring_t *ring, int me, bool give)
+{
+   int other = HW_CTX_MAIN + HW_CTX_VIDEO - me;
+   int v     = retro_atomic_load_acquire_int(&ring->ctx_owner);
+   if ((v & (HW_CTX_HOLDER | HW_CTX_GRANT)) != me)
+      return false;
+   video_context_driver_release_current();
+   /* Only the other thread moves the word meanwhile, and only to ask */
+   while (!retro_atomic_cas_int(&ring->ctx_owner, v,
+            (give || (v & HW_CTX_WANT(other)))
+            ? (other | HW_CTX_GRANT) : HW_CTX_FREE))
+      v = retro_atomic_load_acquire_int(&ring->ctx_owner);
+   retro_eventcount_notify(&ring->ctx_free);
+   return true;
+}
 
 #ifdef HAVE_VULKAN
 /* The Vulkan interface a core is handed under the wrapper. It is kept
@@ -720,6 +775,8 @@ static bool hw_ring_setup(thread_video_t *thr, hw_ring_t **out)
       return false;
    ring->thr            = thr;
    retro_atomic_int_init(&ring->last_presented, -1);
+   retro_atomic_int_init(&ring->ctx_owner, HW_CTX_FREE);
+   retro_eventcount_init(&ring->ctx_free);
    for (i = 0; i < VIDEO_THREAD_HW_RING; i++)
       hw_fence_init(&ring->slot[i].fence);
    for (i = 0; i < VIDEO_THREAD_HW_RING * HW_FENCE_CELLS; i++)
@@ -926,8 +983,45 @@ bool video_thread_get_hw_render_interface(void *data,
 
 /* OpenGL: there is no interface to interpose - the core renders into a
  * framebuffer the driver hands it, on the context that is current. The
- * ring is set up when the main thread takes the core's context, which
- * must happen before the core's context_reset runs there. */
+ * single-context ring is prepared on the video thread; shared rings
+ * are set up when the main thread takes the core's context, before
+ * the core's context_reset runs there. */
+/* Video thread, before the poke-install command replies. Establish the
+ * token for init's current context. The normal end-of-pass release gives
+ * it up after any remaining uploads or frame work on this pass. */
+void video_thread_hw_prepare_context(thread_video_t *thr)
+{
+   gfx_ctx_flags_t flags;
+   hw_ring_t *ring;
+   video_driver_state_t *video_st = video_state_get_ptr();
+
+   if (!thr || !thr->driver_data || !thr->poke)
+      return;
+   switch (video_st->hw_render.context_type)
+   {
+      case RETRO_HW_CONTEXT_OPENGL:
+      case RETRO_HW_CONTEXT_OPENGL_CORE:
+      case RETRO_HW_CONTEXT_OPENGLES2:
+      case RETRO_HW_CONTEXT_OPENGLES3:
+      case RETRO_HW_CONTEXT_OPENGLES_VERSION:
+         break;
+      default:
+         return;
+   }
+   flags.flags = 0;
+   if (!thr->poke->hw_ring_context_new || !thr->poke->hw_ring_framebuffer
+         || !thr->poke->hw_ring_capture || !thr->poke->hw_ring_present_slot
+         || !thr->poke->hw_ring_fence_new
+         || !video_context_driver_get_flags(&flags)
+         || !BIT32_GET(flags.flags, GFX_CTX_FLAGS_NO_SHARED_CONTEXT))
+      return;
+   if (!hw_ring_setup(thr, &ring) || ring->handoff)
+      return;
+   ring->handoff = true;
+   retro_atomic_store_release_int(&ring->ctx_owner, HW_CTX_VIDEO);
+   retro_atomic_store_release_int(&thr->frame.hw_handoff, 1);
+}
+
 bool video_thread_hw_bind_core_context(void *data)
 {
    thread_video_t *thr = (thread_video_t*)data;
@@ -953,12 +1047,29 @@ bool video_thread_hw_bind_core_context(void *data)
       return false;
    if (!hw_ring_setup(thr, &ring))
       return false;
-   if (!ring->core_ctx
-         && !thr->poke->hw_ring_context_new(thr->driver_data, &ring->core_ctx))
+   if (!ring->core_ctx)
    {
-      RARCH_ERR("[Video] Threaded video: the core's GL context could not be "
-            "taken on the main thread; the core will have no context.\n");
-      return false;
+      gfx_ctx_flags_t flags;
+      flags.flags = 0;
+      /* The poke-install command prepared the single-context token
+       * before replying. Never bind a context still current on the
+       * video thread if preparation failed. */
+      if (     video_context_driver_get_flags(&flags)
+            && BIT32_GET(flags.flags, GFX_CTX_FLAGS_NO_SHARED_CONTEXT))
+      {
+         if (!ring->handoff)
+            return false;
+         RARCH_LOG("[Video] Threaded video: one GL context, handed between "
+               "the core's thread and the video thread.\n");
+      }
+      if (!thr->poke->hw_ring_context_new(thr->driver_data, &ring->core_ctx))
+      {
+         RARCH_ERR("[Video] Threaded video: the core's GL context could not be "
+               "taken on the main thread; the core will have no context.\n");
+         return false;
+      }
+      if (ring->handoff)
+         video_thread_hw_ctx_take(thr, false);
    }
    ring->api = HW_API_GL;
    return true;
@@ -1019,6 +1130,17 @@ int video_thread_hw_publish(thread_video_t *thr, unsigned *taken_back)
    *taken_back     = 0;
    if (!ring)
       return -1;
+#ifdef HAVE_TEMPORAL_UPSCALER
+   {
+      /* The push is the core's call: its inputs for this frame go with
+       * the frame, not to whichever frame the video thread draws next */
+      const struct retro_hw_upscaler_inputs *inputs = video_upscaler_take_set_inputs();
+      hw_slot_t *s   = &ring->slot[ring->index];
+      s->has_upscaler = inputs != NULL;
+      if (inputs)
+         s->upscaler = *inputs;
+   }
+#endif
    /* A core that did not ask for its framebuffer rendered into the one
     * it has: that slot is the frame, and the ring stays on it */
    stay = (ring->api == HW_API_GL && !ring->gl_queried);
@@ -1066,6 +1188,14 @@ int video_thread_hw_publish(thread_video_t *thr, unsigned *taken_back)
       /* Fence the core's rendering into the slot, on its context. */
       if (!thr->poke->hw_ring_capture(thr->driver_data, published, NULL, 0))
          return -1;
+      /* One context: the present needs it from here, and the waits
+       * below are for the video thread's work - which needs it too.
+       * Handed to the video thread before any of them: the push queues
+       * this frame, and a queued frame always brings a pass of its
+       * loop, which takes the grant. The push takes it back after
+       * that pass. */
+      if (ring->handoff)
+         hw_ctx_hand(ring, HW_CTX_MAIN, true);
    }
 #ifdef HAVE_D3D12
    if (ring->api == HW_API_D3D12)
@@ -1130,6 +1260,12 @@ int video_thread_hw_publish(thread_video_t *thr, unsigned *taken_back)
       hw_wait_queued(ring, ring->index);
 #endif
 #if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+   /* One context: its commands run in order, the video thread's draw
+    * of the next slot ahead of what the core puts there after its
+    * turn; and the fences are the video thread's to wait, on the
+    * context this thread no longer holds. */
+   if (ring->api == HW_API_GL && ring->handoff)
+      return (int)published;
    if (ring->api == HW_API_GL)
       hw_wait_queued(ring, ring->index);
 #endif
@@ -1143,6 +1279,12 @@ void video_thread_hw_before_frame(thread_video_t *thr, int hw_slot,
    hw_ring_t *ring = (hw_ring_t*)thr->frame.hw_ring;
    if (!ring || hw_slot < 0 || hw_slot >= VIDEO_THREAD_HW_RING)
       return;
+#ifdef HAVE_TEMPORAL_UPSCALER
+   /* (a frame reading the slot again shows the upscaler's last output
+    * as a dupe does) */
+   video_upscaler_carry_inputs(!reread && ring->slot[hw_slot].has_upscaler
+         ? &ring->slot[hw_slot].upscaler : NULL);
+#endif
    switch (ring->api)
    {
 #ifdef HAVE_VULKAN
@@ -1430,8 +1572,98 @@ void video_thread_hw_free(thread_video_t *thr)
        * free command the main thread is waiting on. */
       video_thread_call_on_waiter(hw_context_free_cb, thr);
    }
+   /* The main thread is parked in the free command this runs under;
+    * nothing reads the ring after the word says there is no handoff. */
+   retro_atomic_store_release_int(&thr->frame.hw_handoff, 0);
+   retro_eventcount_free(&ring->ctx_free);
+#ifdef HAVE_TEMPORAL_UPSCALER
+   /* (a carry still pending points into the ring) */
+   video_upscaler_drop_carry();
+#endif
    free(ring);
    thr->frame.hw_ring = NULL;
+}
+
+/* --- the single-context handoff --------------------------------------- */
+
+bool video_thread_hw_handoff(thread_video_t *thr)
+{
+   return hw_handoff_ring(thr) != NULL;
+}
+
+/* The ring, for the handoff entries: the video thread goes by the
+ * published word, since the ring is the main thread's to set up. */
+static hw_ring_t *hw_handoff_ring(thread_video_t *thr)
+{
+   hw_ring_t *ring;
+   if (!thr || !retro_atomic_load_acquire_int(&thr->frame.hw_handoff))
+      return NULL;
+   ring = (hw_ring_t*)thr->frame.hw_ring;
+   return (ring && ring->handoff) ? ring : NULL;
+}
+
+/* Take the one context on the calling thread and bind it - the core's
+ * thread off the window surface, the video thread with it. A thread
+ * that holds it already keeps it. Held by the other thread, the wait
+ * asks for it and ends at that thread's next release, which hands it
+ * over: the wait is one hold of the other thread long. */
+void video_thread_hw_ctx_take(thread_video_t *thr, bool video_thread)
+{
+   hw_ring_t *ring = hw_handoff_ring(thr);
+   int me;
+   if (!ring)
+      return;
+   me = video_thread ? HW_CTX_VIDEO : HW_CTX_MAIN;
+   for (;;)
+   {
+      int key;
+      int v = retro_atomic_load_acquire_int(&ring->ctx_owner);
+      if ((v & HW_CTX_HOLDER) == me)
+      {
+         if (!(v & HW_CTX_GRANT))
+            return;
+         /* Handed over: unbound by the releasing thread. The other
+          * thread's ask, if it made one since, stays on the word. */
+         if (retro_atomic_cas_int(&ring->ctx_owner, v, v & ~HW_CTX_GRANT))
+            break;
+         continue;
+      }
+      if ((v & HW_CTX_HOLDER) == HW_CTX_FREE)
+      {
+         if (retro_atomic_cas_int(&ring->ctx_owner, v, me))
+            break;
+         continue;
+      }
+      if (     !(v & HW_CTX_WANT(me))
+            && !retro_atomic_cas_int(&ring->ctx_owner, v, v | HW_CTX_WANT(me)))
+         continue;
+      key = retro_eventcount_prepare_wait(&ring->ctx_free);
+      if (retro_atomic_load_acquire_int(&ring->ctx_owner) != (v | HW_CTX_WANT(me)))
+      {
+         retro_eventcount_cancel_wait(&ring->ctx_free);
+         continue;
+      }
+      retro_eventcount_commit_wait(&ring->ctx_free, key);
+   }
+   video_context_driver_bind_hw_render(!video_thread);
+}
+
+/* Whether the main thread holds the context. */
+bool video_thread_hw_ctx_held(thread_video_t *thr)
+{
+   hw_ring_t *ring = hw_handoff_ring(thr);
+   return ring && (retro_atomic_load_acquire_int(&ring->ctx_owner)
+         & (HW_CTX_HOLDER | HW_CTX_GRANT)) == HW_CTX_MAIN;
+}
+
+/* Give the context up on the calling thread, if it holds it; to the
+ * other thread if that one is waiting for it. True when it was held. */
+bool video_thread_hw_ctx_release(thread_video_t *thr, bool video_thread)
+{
+   hw_ring_t *ring = hw_handoff_ring(thr);
+   if (!ring)
+      return false;
+   return hw_ctx_hand(ring, video_thread ? HW_CTX_VIDEO : HW_CTX_MAIN, false);
 }
 
 /* Hardware cores run under the wrapper whenever the wrapper runs, where
@@ -1504,7 +1736,12 @@ void video_thread_hw_after_frame(thread_video_t *thr, int hw_slot)  { (void)thr;
 void video_thread_hw_drop(thread_video_t *thr, int hw_slot) { (void)thr; (void)hw_slot; }
 void video_thread_hw_free(thread_video_t *thr) { (void)thr; }
 bool video_thread_hw_allowed(void) { return false; }
+void video_thread_hw_prepare_context(thread_video_t *thr) { (void)thr; }
 bool video_thread_hw_bind_core_context(void *data) { (void)data; return false; }
+bool video_thread_hw_handoff(thread_video_t *thr) { (void)thr; return false; }
+void video_thread_hw_ctx_take(thread_video_t *thr, bool video_thread) { (void)thr; (void)video_thread; }
+bool video_thread_hw_ctx_held(thread_video_t *thr) { (void)thr; return false; }
+bool video_thread_hw_ctx_release(thread_video_t *thr, bool video_thread) { (void)thr; (void)video_thread; return false; }
 uintptr_t video_thread_hw_get_current_framebuffer(void *data) { (void)data; return 0; }
 bool video_thread_hw_holds_frame(thread_video_t *thr) { (void)thr; return false; }
 void video_thread_hw_forget(thread_video_t *thr) { (void)thr; }

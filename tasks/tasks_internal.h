@@ -50,6 +50,11 @@
 
 RETRO_BEGIN_DECLS
 
+#ifdef HAVE_BLUETOOTH
+bool task_push_bluetooth_scan(retro_task_callback_t cb);
+#endif
+
+
 typedef struct nbio_buf
 {
    void *buf;
@@ -148,9 +153,6 @@ void *task_push_webdav_move(const char *url, const char *dest, bool mute, const 
       retro_task_callback_t cb, void *userdata);
 void *task_push_webdav_copy(const char *url, const char *dest, bool mute, const char *headers,
       retro_task_callback_t cb, void *userdata);
-
-bool task_push_bluetooth_scan(retro_task_callback_t cb);
-
 
 bool task_push_wifi_scan(retro_task_callback_t cb);
 bool task_push_wifi_enable(retro_task_callback_t cb);
@@ -461,6 +463,9 @@ enum autoconfig_handle_flags
 
 void input_autoconfigure_blissbox_override_handler(
       int vid, int pid, char *device_name, size_t len);
+/* From a thread other than the main one, a connect or disconnect is
+ * handed to the main thread and returns true once it is queued; what
+ * it does is decided there. */
 bool input_autoconfigure_connect(
       const char *name,
       const char *display_name,

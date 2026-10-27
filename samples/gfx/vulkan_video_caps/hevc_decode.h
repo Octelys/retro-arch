@@ -383,10 +383,54 @@ done:
 
 #ifdef HAVE_RVP9
 #include "vp9_decode.h"
+#include "vp9_mp4_decode.h"
 #endif
 
 #ifdef HAVE_RAV1
 #include "av1_decode.h"
+#endif
+
+#include "h26x_webm_decode.h"
+
+#ifdef _WIN32
+static int h264_driver_admission(vulkan_context_t *ctx)
+{
+   static const struct
+   {
+      uint32_t vendor, device, driver;
+      int h264, av1;
+   } cases[] = {
+      {0x10de, 0x2b85, (621u << 22) | (1u << 14), 1, 0},
+      {0x10de, 0x2b85, (621u << 22) | (2u << 14), 0, 0},
+      {0x10de, 0x2684, (621u << 22) | (1u << 14), 0, 0},
+      {0x1002, 0x2b85, (621u << 22) | (1u << 14), 0, 0},
+      {0x10de, 0x2684, (610u << 22) | (47u << 14), 1, 1}
+   };
+   uint32_t vendor = ctx->gpu_properties.vendorID;
+   uint32_t device = ctx->gpu_properties.deviceID;
+   uint32_t driver = ctx->gpu_properties.driverVersion;
+   unsigned i;
+   int ok = 1;
+   for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+   {
+      ctx->gpu_properties.vendorID = cases[i].vendor;
+      ctx->gpu_properties.deviceID = cases[i].device;
+      ctx->gpu_properties.driverVersion = cases[i].driver;
+      if (!vulkan_video_decode_init(ctx)
+            || vvd.h264_broken != !!cases[i].h264)
+         ok = 0;
+#ifdef HAVE_RAV1
+      if (vvd.av1_intrabc_broken != !!cases[i].av1) ok = 0;
+#endif
+      vulkan_video_decode_deinit();
+      if (!ok) break;
+   }
+   ctx->gpu_properties.vendorID = vendor;
+   ctx->gpu_properties.deviceID = device;
+   ctx->gpu_properties.driverVersion = driver;
+   printf("H.264 driver admission and independent AV1 guard: %s\n", ok ? "PASS" : "FAIL");
+   return ok;
+}
 #endif
 
 static int hevc_decode_probe(VkInstance instance, VkPhysicalDevice gpu,
@@ -469,9 +513,9 @@ static int hevc_decode_probe(VkInstance instance, VkPhysicalDevice gpu,
    ctx->video_xfer_family = graphics; ctx->video_lanes = 1;
    ctx->video_codec_operations = VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR;
    vkGetPhysicalDeviceMemoryProperties(gpu, &ctx->memory_properties);
+   vkGetPhysicalDeviceProperties(gpu, &ctx->gpu_properties);
 #ifdef HEVC_RENDER_TEST
    ctx->flags |= VK_CTX_FLAG_TIMELINE_SEMAPHORE;
-   vkGetPhysicalDeviceProperties(gpu, &ctx->gpu_properties);
    vkGetDeviceQueue(device, graphics, 0, &ctx->queue);
    render_context = ctx;
 #endif
@@ -480,7 +524,30 @@ static int hevc_decode_probe(VkInstance instance, VkPhysicalDevice gpu,
    sample_rejections = 0;
    vulkan_symbol_wrapper_vkCreateImage = sample_image_fault;
    vulkan_symbol_wrapper_vkCreateImageView = sample_view_fault;
+   if ((getenv("H26X_TEST_WEBM") || getenv("H26X_TEST_MP4"))) ctx->video_codec_operations = codecs;
+#ifdef _WIN32
+   if (!h264_driver_admission(ctx)) goto done;
+#endif
    if (!vulkan_video_decode_init(ctx)) goto done;
+   if ((getenv("H26X_TEST_WEBM") || getenv("H26X_TEST_MP4")))
+   {
+      ok = h26x_webm_decode_fixture();
+      vkDeviceWaitIdle(device);
+      vulkan_video_decode_deinit();
+      goto done;
+   }
+#ifdef HAVE_RVP9
+   if (getenv("VP9_TEST_MP4"))
+   {
+      vkDeviceWaitIdle(device);
+      vulkan_video_decode_deinit();
+      ctx->video_codec_operations = codecs;
+      ok = vulkan_video_decode_init(ctx) && vp9_mp4_decode_fixture();
+      vkDeviceWaitIdle(device);
+      vulkan_video_decode_deinit();
+      goto done;
+   }
+#endif
    ok = 1;
    for (i = 0; i < 10; i++) if (!decode_fixture(&fixtures[i])) ok = 0;
    if (!decode_external()) ok = 0;
@@ -492,6 +559,7 @@ static int hevc_decode_probe(VkInstance instance, VkPhysicalDevice gpu,
       if (!vulkan_video_decode_init(ctx) || !h264_regression()) ok = 0;
 #ifdef HAVE_RVP9
       if ((codecs & VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR) && !vp9_decode_fixture()) ok = 0;
+      if ((codecs & VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR) && !vp9_mp4_decode_fixture()) ok = 0;
 #endif
 #ifdef HAVE_RAV1
       if ((codecs & VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR) && !av1_decode_fixture()) ok = 0;

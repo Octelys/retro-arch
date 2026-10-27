@@ -22,6 +22,7 @@
 #include <stdint.h>
 
 #include <boolean.h>
+#include <libretro.h>
 #include <retro_common_api.h>
 #include <retro_miscellaneous.h>
 #include <file/config_file.h>
@@ -163,6 +164,12 @@ typedef struct settings
       unsigned input_keyboard_index[MAX_USERS];
       /* 0 off, 1 the left stick, 2 the right: enum input_aim_stick */
       unsigned input_aim_stick[MAX_USERS];
+      /* 0 off, 1 a touchscreen, 2 a mouse: enum input_touchpad */
+      unsigned input_touchpad[MAX_USERS];
+      /* the RetroPad buttons the touchpad's halves press, in its
+       * Buttons mode */
+      unsigned input_touchpad_left[MAX_USERS];
+      unsigned input_touchpad_right[MAX_USERS];
 
       unsigned input_libretro_device[MAX_USERS];
       unsigned input_analog_dpad_mode[MAX_USERS];
@@ -224,6 +231,7 @@ typedef struct settings
 #endif
       unsigned input_touch_scale;
       unsigned input_hotkey_block_delay;
+      unsigned input_hotkey_tap_delay;
       unsigned input_quit_gamepad_combo;
       unsigned input_menu_toggle_gamepad_combo;
       unsigned input_keyboard_gamepad_mapping_type;
@@ -278,6 +286,16 @@ typedef struct settings
       unsigned video_max_swapchain_images;
       unsigned video_filter_threads;
       unsigned video_swap_interval;
+      unsigned video_driver_pacing;
+      unsigned video_temporal_upscaler;
+      unsigned video_temporal_upscaler_quality;
+      unsigned video_temporal_upscaler_preset;
+      unsigned video_temporal_upscaler_sharpness;
+      unsigned video_dlss_nr_preset;
+      unsigned video_dlss_nr_style;
+      unsigned video_dlss_nr_intensity;
+      unsigned video_dlss_nr_local_structure;
+      unsigned video_dlss_nr_local_tone;
       unsigned video_hard_sync_frames;
       unsigned video_frame_delay;
       unsigned video_scanline_sync_offset;
@@ -289,6 +307,12 @@ typedef struct settings
       unsigned video_rotation;
       unsigned video_stereo_mode;
       unsigned video_screen_layout;
+#ifdef HAVE_VIDEO_WINDOWS
+      unsigned video_screen_window_mode[RETRO_VIDEO_VIEWS_MAX];
+      unsigned video_screen_window_pos[RETRO_VIDEO_VIEWS_MAX];
+      unsigned video_screen_window_dims[RETRO_VIDEO_VIEWS_MAX];
+      unsigned video_screen_window_monitor[RETRO_VIDEO_VIEWS_MAX];
+#endif
       unsigned video_openxr_refresh_rate;
       unsigned video_openxr_controllers;
       unsigned video_openxr_laser;
@@ -313,6 +337,11 @@ typedef struct settings
       unsigned video_overscan_correction_bottom;
 #endif
       unsigned video_shader_delay;
+      unsigned video_shader_simulated_input_resolution_width;
+      unsigned video_shader_simulated_input_resolution_height;
+#if defined(HAVE_RSLC) && defined(HAVE_GLSLANG)
+      unsigned video_shader_compiler;
+#endif
 #ifdef HAVE_SCREENSHOTS
       unsigned notification_show_screenshot_duration;
       unsigned notification_show_screenshot_flash;
@@ -330,6 +359,8 @@ typedef struct settings
       unsigned menu_icon_thumbnails;
       unsigned gfx_thumbnail_upscale_threshold;
       unsigned menu_thumbnail_preview_threads;
+      unsigned media_player_seek_seconds;
+      unsigned media_player_controls_timeout;
       unsigned menu_rgui_thumbnail_downscaler;
       unsigned menu_rgui_thumbnail_delay;
       unsigned menu_rgui_color_theme;
@@ -402,6 +433,9 @@ typedef struct settings
       unsigned input_overlay_dpad_diagonal_sensitivity;
       unsigned input_overlay_abxy_diagonal_sensitivity;
       unsigned input_overlay_analog_recenter_zone;
+      unsigned input_overlay_dpad_method;
+      unsigned input_overlay_abxy_method;
+      unsigned input_overlay_contact_scale;
       unsigned input_overlay_lightgun_trigger_delay;
       unsigned input_overlay_lightgun_two_touch_input;
       unsigned input_overlay_lightgun_three_touch_input;
@@ -504,6 +538,7 @@ typedef struct settings
       int crt_switch_porch_adjust;
       int crt_switch_vertical_adjust;
       int video_max_frame_latency;
+      int video_dlss_nr_skin_structure;
 #ifdef HAVE_VULKAN
       int vulkan_gpu_index;
 #endif
@@ -541,6 +576,7 @@ typedef struct settings
       int input_overlay_lightgun_port;
 #endif
       int input_turbo_bind;
+      int media_player_subtitle_delay;
    } ints;
 
    struct
@@ -641,6 +677,10 @@ typedef struct settings
    struct
    {
       bool placeholder;
+#ifdef HAVE_VIDEO_WINDOWS
+      bool video_windows_enable;
+      bool video_screen_window_fullscreen[RETRO_VIDEO_VIEWS_MAX];
+#endif
 
       /* Video */
       bool video_fullscreen;
@@ -669,6 +709,7 @@ typedef struct settings
       bool video_dingux_ipu_keep_aspect;
       bool video_scale_integer;
       bool video_shader_enable;
+      bool video_shader_simulated_input_resolution;
       bool video_shader_deferred_loading;
       bool video_shader_watch_files;
       bool video_shader_remember_last_dir;
@@ -703,6 +744,8 @@ typedef struct settings
       bool video_wiiu_prefer_drc;
       bool video_notch_write_over_enable;
       bool video_hdr_scanlines;
+      bool video_dlss_nr_enable;
+      bool video_dlss_nr_auto_mask;
       bool video_hdr_use_display_peak;
       bool video_hdr_send_luminance;
       bool video_use_metal_arg_buffers;
@@ -987,6 +1030,8 @@ typedef struct settings
       bool netplay_start_as_spectator;
       bool netplay_fade_chat;
       bool netplay_allow_pausing;
+      bool netplay_analog_joypads;
+      bool netplay_lockstep;
       bool netplay_allow_slaves;
       bool netplay_require_slaves;
       bool netplay_nat_traversal;
@@ -1052,6 +1097,10 @@ typedef struct settings
       /* Multimedia */
       bool multimedia_builtin_mediaplayer_enable;
       bool multimedia_builtin_imageviewer_enable;
+      bool media_player_continuous;
+      bool media_player_crt_switch;
+      bool media_player_refresh_rate;
+      bool media_player_subtitles;
 
       /* Bundle */
       bool bundle_finished;
@@ -1216,6 +1265,7 @@ typedef struct settings
       bool input_stylus_enable;
       bool input_stylus_require_contact_for_click;
       bool input_stylus_hover_moves_pointer;
+      bool input_stylus_hide_overlay;
 #endif
 
 #if defined(HAVE_COCOATOUCH)
@@ -1290,6 +1340,9 @@ typedef struct settings
 #ifdef ANDROID
       char input_android_physical_keyboard[NAME_MAX_LENGTH];
 #endif
+      /* Controllers the user leaves out, as SDL's
+       * SDL_GAMECONTROLLER_IGNORE_DEVICES writes them: "054c/09cc,..." */
+      char input_ignore_devices[512];
       char audio_device[NAME_MAX_LENGTH];
       /* Desktop companion dock layout, one plain row per dock:
        * "<area>,<shown>,<width>,<height>,<tabbed_with>,<raised>" - see
@@ -1403,6 +1456,9 @@ typedef struct settings
       char directory_osk_overlay[DIR_MAX_LENGTH];
       char directory_screenshot[DIR_MAX_LENGTH];
       char directory_system[DIR_MAX_LENGTH];
+      char directory_dlss[DIR_MAX_LENGTH];
+      char directory_fsr[DIR_MAX_LENGTH];
+      char directory_xess[DIR_MAX_LENGTH];
       char directory_cache[DIR_MAX_LENGTH];
       char directory_playlist[DIR_MAX_LENGTH];
       char directory_content_favorites[DIR_MAX_LENGTH];
@@ -1684,6 +1740,7 @@ void config_load(void);
  *   when launching a salamander build */
 void config_load_file_salamander(void);
 void config_save_file_salamander(void);
+void config_clear_salamander_pending(void);
 #endif
 
 void retroarch_config_init(void);

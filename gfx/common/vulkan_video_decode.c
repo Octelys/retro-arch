@@ -49,8 +49,13 @@
 #include "vksym.h"
 #include "vulkan_video_planes.h"
 #include "../video_defines.h"
-#include "../../configuration.h"
 #include "../../verbosity.h"
+
+#if defined(_WIN32) && !defined(__WINRT__) \
+   && (defined(HAVE_D3D11) || defined(HAVE_D3D12))
+#include <dxgi1_2.h>
+#include "d3d11_video_decode.h"
+#endif
 
 #define VVD_MAX_LANES  2
 #define VVD_MAX_SLOTS  32
@@ -164,6 +169,16 @@ static struct
 #endif
 #ifdef HAVE_RAV1
    rav1_hw_backend_t av1;
+#ifdef _WIN32
+   bool av1_intrabc_broken;
+#endif
+#endif
+#ifdef _WIN32
+   bool h264_broken;
+#endif
+#if defined(_WIN32) && !defined(__WINRT__) \
+   && (defined(HAVE_D3D11) || defined(HAVE_D3D12))
+   bool win32_fallback;
 #endif
    VkVideoCodecOperationFlagsKHR codecs;
 
@@ -932,18 +947,17 @@ static void vvd_lane_release(unsigned lane)
    retro_atomic_store_release_int(&vvd.lane_busy[lane], 0);
 }
 
+/* The player captures application policy before requesting a backend.
+ * Native opens use the renderer capabilities published for this device. */
 static void *vvd_open(void *user, const rh264_hw_sps_t *sps, unsigned slots)
 {
-   settings_t *settings = config_get_ptr();
    VkVideoCapabilitiesKHR caps;
    VkVideoDecodeCapabilitiesKHR dcaps;
    vvd_dec_t *d;
    unsigned lane;
    (void)user;
 
-   if (     !vvd.up || slots > VVD_MAX_SLOTS
-         || (settings && settings->uints.video_hw_decode
-               == VIDEO_HW_DECODE_OFF))
+   if (!vvd.up || slots > VVD_MAX_SLOTS)
       return NULL;
    vvd_grave_reap(false);
    for (lane = 0; lane < vvd.lanes; lane++)
@@ -1751,6 +1765,17 @@ bool vulkan_video_decode_init(const vulkan_context_t *ctx)
    vvd.codecs      = ctx->video_codec_operations;
    vvd.general     = (ctx->flags & VK_CTX_FLAG_VIDEO_GENERAL) != 0;
    vvd.mem         = ctx->memory_properties;
+#ifdef _WIN32
+   /* NVIDIA H.264 corruption; 610.47 also faults on AV1 intra block copy. */
+   vvd.h264_broken = ctx->gpu_properties.vendorID == 0x10de
+      && (ctx->gpu_properties.driverVersion == ((610u << 22) | (47u << 14))
+         || (ctx->gpu_properties.deviceID == 0x2b85
+            && ctx->gpu_properties.driverVersion == ((621u << 22) | (1u << 14))));
+#ifdef HAVE_RAV1
+   vvd.av1_intrabc_broken = ctx->gpu_properties.vendorID == 0x10de
+      && ctx->gpu_properties.driverVersion == ((610u << 22) | (47u << 14));
+#endif
+#endif
    vvd.gfx_family  = ctx->graphics_queue_index;
    vvd.dec_family  = ctx->video_decode_family;
    vvd.xfer_family = ctx->video_xfer_family;
@@ -1811,15 +1836,28 @@ bool vulkan_video_decode_init(const vulkan_context_t *ctx)
    vvd.hevc.open = vvd_hevc_open;
    vvd.hevc.close = vvd_hevc_close;
    if (vvd.codecs & VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR)
-      rh264_set_hw_backend(&vvd.ops);
+   {
+#ifdef _WIN32
+      if (!vvd.h264_broken)
+#endif
+         rh264_set_hw_backend(&vvd.ops);
+   }
    if (vvd.codecs & VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR)
       rh265_set_hw_backend(&vvd.hevc);
 #ifdef HAVE_RVP9
    vvd.vp9.user = NULL; vvd.vp9.open = vvd_vp9_open; vvd.vp9.close = vvd_vp9_close;
+   vvd.vp9.packet_decoder = false;
+   vvd.vp9.open_color = NULL;
+   vvd.vp9.open_config = NULL;
+   vvd.vp9.restart = NULL;
+   vvd.vp9.drain = NULL;
    if (vvd.codecs & VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR)
       rvp9_set_hw_backend(&vvd.vp9);
 #endif
 #ifdef HAVE_RAV1
+   vvd.av1.packet_decoder = false;
+   vvd.av1.open_config = NULL;
+   vvd.av1.drain = NULL;
    vvd.av1.user = NULL;
    vvd.av1.open = vvd_av1_open;
    vvd.av1.close = vvd_av1_close;
@@ -1829,17 +1867,30 @@ bool vulkan_video_decode_init(const vulkan_context_t *ctx)
    return true;
 }
 
+#if defined(_WIN32) && !defined(__WINRT__) \
+   && (defined(HAVE_D3D11) || defined(HAVE_D3D12))
+#include "vulkan_video_win32.h"
+#endif
+
 void vulkan_video_decode_deinit(void)
 {
    if (!vvd.up)
       return;
+#if defined(_WIN32) && !defined(__WINRT__) \
+   && (defined(HAVE_D3D11) || defined(HAVE_D3D12))
+   if (vvd.win32_fallback)
+   {
+      d3d11_video_decode_deinit();
+      vvd.win32_fallback = false;
+   }
+#endif
 #ifdef HAVE_RAV1
-   rav1_set_hw_backend(NULL);
+   rav1_unset_hw_backend(&vvd.av1);
 #endif
    rh264_set_hw_backend(NULL);
-   rh265_set_hw_backend(NULL);
+   rh265_unset_hw_backend(&vvd.hevc);
 #ifdef HAVE_RVP9
-   rvp9_set_hw_backend(NULL);
+   rvp9_unset_hw_backend(&vvd.vp9);
 #endif
    if (retro_atomic_load_acquire_int(&vvd.live))
       RARCH_ERR("[Vulkan] Video decode: %d decoder(s) still open at teardown.\n",

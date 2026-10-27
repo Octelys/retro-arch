@@ -198,7 +198,9 @@ static void send_queued(gekko_hid_pad_t *pad)
 
 /* ---- pads coming and going ---- */
 
-static void pad_remove(gekko_hid_t *hid, gekko_hid_pad_t *pad)
+/* @gone: the pad left, and is said to have; not when the driver is
+ * only stopping, as every joypad driver does at a restart. */
+static void pad_remove(gekko_hid_t *hid, gekko_hid_pad_t *pad, bool gone)
 {
    unsigned tries;
    /* The reader may be waiting on the pad: cancel until it stops. */
@@ -211,8 +213,9 @@ static void pad_remove(gekko_hid_t *hid, gekko_hid_pad_t *pad)
       gk_thread_join(pad->reader);
    else
       gk_thread_detach(pad->reader);
-   input_autoconfigure_disconnect(pad->slot,
-         pad_connection_get_name(&hid->connections[pad->slot], pad->slot));
+   if (gone)
+      input_autoconfigure_disconnect(pad->slot,
+            pad_connection_get_name(&hid->connections[pad->slot], pad->slot));
    pad_connection_pad_deinit(&hid->connections[pad->slot], pad->slot);
    gk_usb_close(pad->id);
    hid->pads[pad->slot] = NULL;
@@ -324,7 +327,7 @@ static void scan(gekko_hid_t *hid)
          if (devs[k].id == pad->id)
             present = 1;
       if (!present || pad->done)
-         pad_remove(hid, pad);
+         pad_remove(hid, pad, true);
    }
    /* Forget ignored devices that left, so they are looked at again. */
    for (i = 0; i < hid->num_ignored; )
@@ -376,7 +379,7 @@ static void gekko_hid_free(const void *data)
    }
    for (i = 0; i < MAX_USERS; i++)
       if (hid->pads[i])
-         pad_remove(hid, hid->pads[i]);
+         pad_remove(hid, hid->pads[i], false);
    pad_connection_destroy(hid->connections);
    free(hid);
 }
@@ -486,6 +489,14 @@ static bool gekko_hid_joypad_rumble(void *data, unsigned pad,
    return pad_connection_rumble(&hid->connections[pad], pad, effect, strength);
 }
 
+static void gekko_hid_set_player(void *data, unsigned pad, unsigned player)
+{
+   gekko_hid_t *hid = (gekko_hid_t*)data;
+   if (!hid || pad >= MAX_USERS)
+      return;
+   pad_connection_set_player(&hid->connections[pad], player);
+}
+
 static void gekko_hid_poll(void *data)
 {
    (void)data;
@@ -508,5 +519,9 @@ hid_driver_t gekko_hid = {
    gekko_hid_get_report,
    gekko_hid_set_idle,
    gekko_hid_set_protocol,
-   gekko_hid_read
+   gekko_hid_read,
+   NULL, /* get_bt_host */
+   NULL, /* set_bt_host */
+   NULL, /* is_bluetooth */
+   gekko_hid_set_player
 };

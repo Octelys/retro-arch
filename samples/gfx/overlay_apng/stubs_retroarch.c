@@ -7,11 +7,17 @@
 #include <stdlib.h>
 #include <boolean.h>
 
+#include "../../../configuration.h"
 #include "../../../gfx/video_driver.h"
 #include "../../../gfx/gfx_surface.h"
 
 static uintptr_t stub_next_handle = 0x100;
 static unsigned  stub_updates;
+
+settings_t *config_get_ptr(void)
+{
+   return NULL;
+}
 
 bool video_driver_texture_load(void *data, unsigned filter, uintptr_t *id)
 {
@@ -77,3 +83,14 @@ bool video_driver_texture_lend_ready(uintptr_t id, unsigned slot)
    (void)id; (void)slot;
    return true;
 }
+
+bool video_driver_texture_lend_needs_refresh(void) { return false; }
+bool video_thread_lend_get(int idx, void **mem, size_t *pitch)
+{
+   (void)idx;
+   (void)mem;
+   (void)pitch;
+   return false;
+}
+
+bool video_thread_lend_ready(int idx) { (void)idx; return true; }

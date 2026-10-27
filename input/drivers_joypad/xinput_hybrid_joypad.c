@@ -49,6 +49,8 @@
 #include "../../retroarch.h"
 
 #include "../../verbosity.h"
+#include "../common/input_ignore_devices.h"
+#include "../common/win_pad_ident.h"
 
 #include <queues/task_queue.h>
 
@@ -720,8 +722,8 @@ static void dinput_hid_dev_cache_free(struct dinput_enum_job *job)
 }
 
 /* Lazily resolves and memoizes whether the device ID of a cached
- * HID device contains "IG_" (the XInput marker; this information
- * can not be found from DirectInput). */
+ * HID device contains "IG_", in either case (the XInput marker; this
+ * information can not be found from DirectInput). */
 static bool dinput_hid_dev_cache_is_ig(dinput_hid_dev_cache_entry_t *e)
 {
    UINT name_size = 0;
@@ -736,7 +738,7 @@ static bool dinput_hid_dev_cache_is_ig(dinput_hid_dev_cache_entry_t *e)
        && ((dev_name = (char*)malloc(name_size)) != NULL)
        && (GetRawInputDeviceInfoA(e->hDevice,
            RIDI_DEVICENAME, dev_name, &name_size) != ((UINT)-1))
-       && (strstr(dev_name, "IG_")))
+       && win_pad_path_is_xinput(dev_name))
       e->is_ig = 1;
 
    if (dev_name)
@@ -832,6 +834,19 @@ static BOOL CALLBACK enum_joypad_cb_hybrid(
       if (job->next_xuser < 4)
          job->xuser[idx] = (int)job->next_xuser++;
       goto enum_iteration_done;
+   }
+
+   /* Another program reads it and stands in for it (Steam Input), or
+    * a pad already listed, on its other link */
+   pad->link_addr = dinput_pad_link_addr(dev, pad->vid, pad->pid);
+   if (     input_device_ignored((uint16_t)pad->vid, (uint16_t)pad->pid)
+         || dinput_pad_is_link(job->pads, job->cnt, pad->link_addr))
+   {
+      IDirectInputDevice8_Release(dev);
+      free(pad->joy_name);
+      free(pad->joy_friendly_name);
+      memset(pad, 0, sizeof(*pad));
+      return DIENUM_CONTINUE;
    }
 
    /* Set data format to simple joystick */

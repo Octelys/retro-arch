@@ -20,10 +20,18 @@
 #include <stdint.h>
 #include <boolean.h>
 #include <retro_common_api.h>
+#include <retro_inline.h>
 
 #include "../video_shader_parse.h"
 #include "../../retroarch.h"
 #include "glslang_util.h"
+#include "slang_rect.h"
+
+/* Built with rslc and without SPIRV-Cross: rslc's tables and printed
+ * text serve every pass and every driver pipeline. */
+#if defined(HAVE_RSLC) && !defined(HAVE_SPIRV_CROSS)
+#define SLANG_RSLC_ONLY
+#endif
 
 /* Vulkan maximum texture bindings inside shader. 
  * D3D11 has a hard limit of 16 */
@@ -329,17 +337,64 @@ typedef struct glslang_meta
    char name[64];                      /* '\0' terminated, empty if unset */
 } glslang_meta;
 
+struct slang_blob;
+
 typedef struct glslang_output
 {
-   uint32_t *vertex;                   /* malloc'd SPIR-V words */
-   uint32_t *fragment;                 /* malloc'd SPIR-V words */
+   struct slang_blob *vertex_blob;     /* one reference each; the words
+                                          below are views into them */
+   struct slang_blob *fragment_blob;
+   const uint32_t *vertex;             /* SPIR-V words */
+   const uint32_t *fragment;
+   char *vertex_text;                  /* malloc'd stage source for a driver that
+                                          takes text, when the compiler printed
+                                          one (see struct slang_text_target);
+                                          NULL otherwise */
+   char *fragment_text;
    size_t vertex_len;                  /* in words */
    size_t fragment_len;                /* in words */
    glslang_meta meta;
 } glslang_output;
 
+/* What a driver that compiles source text wants printed beside the
+ * SPIR-V: the language (GLSL, GLSL ES, HLSL or MSL), its version (a
+ * GLSL #version or an HLSL shader model, 40 / 50) and, for GLSL, how
+ * the interface is named, since the GL driver binds attributes,
+ * varyings, blocks and samplers by name; HLSL binds by register and
+ * semantic, MSL by buffer, texture and sampler index.
+ * Prefixes take the location or binding as a decimal suffix.  Only
+ * rslc prints; with glslang the text pointers stay NULL and the driver
+ * crosses the SPIR-V as it does today. */
+struct slang_text_target
+{
+   unsigned    version;
+   bool        es;
+   bool        hlsl;
+   bool        msl;
+   const char *attr_prefix;
+   const char *varying_prefix;
+   const char *sampler_prefix;
+   /* block names per stage: [0] vertex, [1] fragment */
+   const char *ubo_block[2];
+   const char *ubo_instance[2];
+   const char *push_block[2];
+   const char *push_instance[2];
+   /* GLSL: each block one array of vec4 named as its block, as glcore's
+    * own pipelines upload them (rslc_names.flatten) */
+   bool        flatten;
+};
+
+/* Accumulate active feedback resources from the compiled stages. */
+bool slang_last_pass_feedback(struct glslang_last_pass *state,
+      const glslang_output *output);
+
 void glslang_output_init(glslang_output *output);
 void glslang_output_free(glslang_output *output);
+
+/* Gives a stage of @output to @blob, taking the reference: the words
+ * the output's readers see are the blob's.  NULL clears the stage. */
+void glslang_output_set_blob(glslang_output *output, bool fragment,
+      struct slang_blob *blob);
 
 /* Append a parameter to @meta, growing the array as needed.
  * Returns false on allocation failure ONLY; duplicate checking
@@ -362,6 +417,71 @@ bool glslang_compile_shader(const char *shader_path,
  * behaves exactly like the uncached call. */
 bool glslang_compile_shader_cached(const char *shader_path,
       glslang_output *output, void *include_cache);
+
+/* As glslang_compile_shader_cached(), and when rslc is the compiler
+ * also prints each stage as @text asks, into output->vertex_text and
+ * output->fragment_text.  A cache hit brings words only. */
+bool glslang_compile_shader_text(const char *shader_path,
+      glslang_output *output, void *include_cache,
+      const struct slang_text_target *text);
+
+#ifdef HAVE_RSLC
+/* One stage of GLSL source - include-expanded, as a driver embeds its
+ * own shaders - printed for @t by rslc; malloc'd, NULL with the reason
+ * logged when it cannot be. */
+char *slang_print_stage(const char *source, bool fragment,
+      const struct slang_text_target *t);
+
+/* One of a driver's own stages built by rslc from its GLSL source, as
+ * a pass is: the module with its tables in *blob and, for @t, its text
+ * in *text (malloc'd).  False with nothing held when it cannot be. */
+bool slang_compile_builtin(const char *source, bool fragment,
+      const struct slang_text_target *t, struct slang_blob **blob,
+      char **text);
+
+/* A pass's frame-rectangle remap (slang_rect.h) done by rslc on the
+ * pass's own source: placed from @vs, @fs, the stages as compiled, it
+ * hands back the stages it rewrote with their tables and, for @text,
+ * their text; a stage left as it was comes back NULL. *verdict as
+ * slang_rect_remap_pass() says. False when rslc cannot do it: the
+ * caller rewrites the SPIR-V. */
+bool slang_compile_remapped(const char *shader_path,
+      const uint32_t *vs, size_t vs_words,
+      const uint32_t *fs, size_t fs_words,
+      bool source, bool linear, enum slang_rect_wrap wrap,
+      const struct slang_text_target *text,
+      enum slang_rect_result *verdict,
+      struct slang_blob **vs_out, struct slang_blob **fs_out,
+      char **vs_text, char **fs_text);
+#endif
+
+/* The compile of one pass on a thread that is not the chain's: it
+ * reads, compiles and writes the cache as the chain's thread would,
+ * but asks and tells the blob table nothing, prints no text and falls
+ * back to no other compiler.  False, with nothing done, when the
+ * chain's compiler would be glslang (@hlsl_or_msl: the driver takes
+ * HLSL or MSL text, which decides that under auto).  @key (33 bytes) gets the pass's
+ * cache key.  The chain's thread then offers the output's blobs under
+ * it (slang_blob_offer) and its own compile of the pass takes them. */
+bool slang_compile_pass_detached(const char *shader_path, bool hlsl_or_msl,
+      glslang_output *output, char *key);
+
+/* Lists @vs and @fs under @key for the passes to come, holding one
+ * reference to each until the chain has taken them or the offers ring
+ * (64 passes) has moved on; takes the references passed.  Nothing is
+ * listed, and both are released, when the key is listed already.  On
+ * the thread that builds chains. */
+void slang_blob_offer(const char *key, struct slang_blob *vs,
+      struct slang_blob *fs);
+
+/* Drops the references the offers ring holds. */
+void slang_blob_offers_release(void);
+
+/* While held - by each deferred load in progress - the slang compiles
+ * reuse rslc arenas from a pool of blocks instead of allocating every
+ * stage's arena afresh; the last drop frees the blocks.  Any thread. */
+void slang_arena_pool_hold(void);
+void slang_arena_pool_drop(void);
 
 /* Merge parameters harvested into @meta into @shader, enforcing the
  * duplicate-must-match rule.  @pass is the pass @meta was harvested
@@ -410,12 +530,66 @@ void slang_semantic_name_map_free(slang_semantic_name_map *map);
 bool slang_reflection_init(slang_reflection *reflection);
 void slang_reflection_free(slang_reflection *reflection);
 
+/* The same for a pass processed by slang_process(), whose LUT views
+ * and sizes were mapped from @views and @sizes, @stride apart. */
+static INLINE void slang_semantics_luts_read(const pass_semantics_t *sem,
+      const void *views, const void *sizes, size_t stride, unsigned count,
+      uint8_t *read)
+{
+   int i, j;
+   uintptr_t v = (uintptr_t)views, z = (uintptr_t)sizes;
+   uintptr_t n = (uintptr_t)stride * count;
+   for (i = 0; i < sem->texture_count; i++)
+   {
+      uintptr_t t = (uintptr_t)sem->textures[i].texture_data;
+      if (t >= v && t - v < n && !((t - v) % stride))
+         read[(t - v) / stride] = 1;
+   }
+   for (j = 0; j < SLANG_CBUFFER_MAX; j++)
+      for (i = 0; i < sem->cbuffers[j].uniform_count; i++)
+      {
+         uintptr_t u = (uintptr_t)sem->cbuffers[j].uniforms[i].data;
+         if (u >= z && u - z < n && !((u - z) % stride))
+            read[(u - z) / stride] = 1;
+      }
+}
+
+/* Sets read[i] for each of the first @count LUTs the pass samples or
+ * takes the size of; the others are left as they are. */
+static INLINE void slang_reflection_luts_read(
+      const slang_reflection *reflection, uint8_t *read, unsigned count)
+{
+   unsigned i;
+   const slang_texture_semantic_array *luts =
+      &reflection->semantic_textures[SLANG_TEXTURE_SEMANTIC_USER];
+   for (i = 0; i < luts->size && i < count; i++)
+      if (     luts->data[i].texture
+            || luts->data[i].uniform
+            || luts->data[i].push_constant)
+         read[i] = 1;
+}
+
 /* Reflect the two SPIR-V stages into @reflection.  The name-map
  * pointers and pass_number must be set by the caller after init(). */
 bool slang_reflect_spirv(
       const uint32_t *vertex,   size_t vertex_len,
       const uint32_t *fragment, size_t fragment_len,
       slang_reflection *reflection);
+
+#if defined(HAVE_RSLC)
+/* Reflect a pass from the tables its compiler wrote into each stage's
+ * blob (struct rslc_reflect): the same tables, checks and messages as
+ * slang_reflect_spirv() derives through SPIRV-Cross, without a SPIR-V
+ * parse.  Both blobs must carry tables. */
+bool slang_reflect_blobs(const struct slang_blob *vertex,
+      const struct slang_blob *fragment, slang_reflection *reflection);
+#endif
+
+/* Reflect a pass: by its blobs' tables when both stages carry them, by
+ * SPIRV-Cross on the words otherwise (glslang's modules, a stage
+ * slang_rect rewrote). */
+bool slang_reflect_pass(const struct slang_blob *vertex,
+      const struct slang_blob *fragment, slang_reflection *reflection);
 
 bool slang_process(
       struct video_shader*   shader_info,

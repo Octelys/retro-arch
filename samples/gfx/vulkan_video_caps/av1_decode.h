@@ -77,9 +77,11 @@ static int av1_decode_fixture(void)
             else if (i == 2)
                session->sequence.bit_depth = 12;
             else if (i == 3)
-               session->sequence.transfer_characteristics = 16;
+               { session->sequence.transfer_characteristics = 16;
+                 session->sequence.matrix_coefficients = 10; }
             else if (i == 4)
-               session->sequence.matrix_coefficients = 9;
+               { session->sequence.transfer_characteristics = 18;
+                 session->sequence.color_primaries = 12; }
             if (rav1_hw_backend_open(&session->sequence, i == 5 ? 33 : 9,
                                      &refused, &factory))
             {
@@ -173,6 +175,32 @@ static int av1_decode_fixture(void)
                goto done;
             }
          }
+#ifdef _WIN32
+         if (ret == RAV1_HW_STREAM_FRAME && !count && vvd.av1_intrabc_broken)
+         {
+            vvd_dec_t *d = (vvd_dec_t *)ops.decoder;
+            rav1_hw_picture_t *unsupported =
+               (rav1_hw_picture_t *)malloc(sizeof(*unsupported));
+            unsigned ring = d->dring;
+            uint64_t value = d->tl_value;
+            int refused;
+            if (!unsupported)
+            {
+               video_hw_frame_abandon(&frame);
+               goto done;
+            }
+            *unsupported = session->pending;
+            unsupported->setup.allow_intrabc = 1;
+            refused = ops.decode(ops.decoder, packet_start, packet_size,
+                  &session->sequence, unsupported);
+            free(unsupported);
+            if (refused != -2 || d->dring != ring || d->tl_value != value)
+            {
+               video_hw_frame_abandon(&frame);
+               goto done;
+            }
+         }
+#endif
          memset((void *)packet_start, 0, packet_size);
          packet_start = data + offset;
       }

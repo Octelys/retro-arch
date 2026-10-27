@@ -195,6 +195,19 @@ int rh265_video_get_access_unit(rh265_video *v, const uint8_t *data,
       size_t size, unsigned length_size, rh265_nal_t *slices,
       unsigned capacity, rh265_access_unit_t *out);
 
+/* Opt in before supplying parameter sets. Retained complete NALs include
+ * their headers and escape bytes; software-only decoders allocate nothing.
+ * Owner thread only. Returns 0 on success, -1 on failure or late opt-in. */
+int rh265_video_retain_parameter_sets(rh265_video *v);
+
+/* Borrow the selected PPS -> SPS -> VPS chain, in VPS/SPS/PPS order.
+ * Valid until the next parameter update or close. No allocation. Failure
+ * clears all three entries; missing/invalid/unretained chains return -1.
+ * A failed copy or NAL over 64 KiB disables that chain until replacement,
+ * without changing software parameter parsing. */
+int rh265_video_get_parameter_sets(const rh265_video *v, unsigned pps_id,
+      rh265_nal_t out[3]);
+
 /* Create a decoder. Returns NULL on allocation failure. */
 rh265_video *rh265_video_open(void);
 
@@ -220,7 +233,30 @@ int rh265_video_decode(rh265_video *v, const uint8_t *data, size_t len);
  * available through rh265_video_plane, -1 when nothing is pending.
  */
 /* Hardware: 2 busy; retry without waiting. */
+/* -2 on terminal hardware failure; -1 means no pending output. */
 int rh265_video_drain(rh265_video *v);
+
+/* Owner-thread timed submission. Use for every access unit, retaining the
+ * timestamp on busy/unconsumed retries. Decode 1/3 or drain 0 returns that
+ * picture's original timestamp; other results leave output_timestamp alone. */
+int rh265_video_decode_timed(rh265_video *v, const uint8_t *data, size_t len,
+      int64_t timestamp, int64_t *output_timestamp);
+int rh265_video_drain_timed(rh265_video *v, int64_t *output_timestamp);
+
+typedef struct rh265_output_timing
+{
+   int64_t pending[32], next_timestamp;
+   unsigned count;
+   int next_valid, started, rasl_skip, skip_nonref;
+} rh265_output_timing_t;
+
+/* Owner-thread metadata snapshot for bounded container lookahead. Queued
+ * output is final; pending pictures may be discarded by a later IRAP. */
+int rh265_video_output_timing(const rh265_video *v, int64_t after,
+      rh265_output_timing_t *out);
+int rh265_video_output_timing_advance(const rh265_video *v,
+      rh265_output_timing_t *timing, const rh265_slice_info_t *slice,
+      int64_t timestamp, int64_t after);
 
 /* Borrow a decoded plane (0=Y, 1=U, 2=V). Valid until the next decode call. */
 /* Active luma bit depth of the stream (8 or 10).  At 10 bits the
@@ -238,6 +274,7 @@ void rh265_video_set_skip_nonref(rh265_video *v, int skip);
 int rh265_video_dropped(const rh265_video *v);
 
 int rh265_video_bit_depth(const rh265_video *v);
+unsigned rh265_video_reorder_depth(const rh265_video *v);
 
 const uint8_t *rh265_video_plane(const rh265_video *v, int plane,
       int *stride, int *width, int *height);
@@ -279,6 +316,8 @@ void rh265_video_set_thread_pool(rh265_video *v, void *pool,
  * withdraws the offer; existing sessions retain their callbacks. */
 struct rh265_hw_backend;
 void rh265_set_hw_backend(const struct rh265_hw_backend *backend);
+/* Withdraw only this offer; never remove a replacement backend. */
+int rh265_unset_hw_backend(const struct rh265_hw_backend *backend);
 /* Opt in before the first picture, after parameter sets. Returns 1 on
  * hardware, 0 on software; disabling an active session requires reopen. */
 int rh265_video_set_hw(rh265_video *v, int enable);

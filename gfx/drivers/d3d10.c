@@ -56,7 +56,8 @@
 #include "../common/d3dcompiler_common.h"
 /* slang_process.h is self-contained - it only defines types and
  * constants used by pass state.  The actual slang_process() call
- * sites remain guarded with HAVE_SLANG+HAVE_SPIRV_CROSS. */
+ * sites remain guarded with HAVE_SLANG and a compiler that prints
+ * text: SPIRV-Cross or rslc. */
 #include "../drivers_shader/slang_process.h"
 #ifdef HAVE_MENU
 #include "../../menu/menu_driver.h"
@@ -2026,14 +2027,63 @@ typedef struct d3d10_deferred_state
 {
    struct video_shader      *shader_preset;
    d3d10_deferred_pass_t     passes[GFX_MAX_SHADERS];
-   d3d10_texture_t           luts[GFX_MAX_TEXTURES];
-   bool                      luts_loaded;
 } d3d10_deferred_state_t;
+
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
+/* The preset's LUTs some pass samples or takes the size of, loaded
+ * once every pass is processed; one no pass reads is never decoded. */
+static bool d3d10_load_luts(d3d10_video_t *d3d10)
+{
+   unsigned i;
+   uint8_t read[GFX_MAX_TEXTURES];
+   const struct video_shader *preset = d3d10->chain.shader_preset;
+   memset(read, 0, sizeof(read));
+   for (i = 0; i < preset->passes; i++)
+      slang_semantics_luts_read(&d3d10->chain.pass[i].semantics,
+            &d3d10->chain.luts[0].view, &d3d10->chain.luts[0].size_data,
+            sizeof(*d3d10->chain.luts), preset->luts, read);
+   for (i = 0; i < preset->luts; i++)
+   {
+      struct texture_image image;
+      if (!read[i])
+         continue;
+      memset(&image, 0, sizeof(image));
+      image.supports_rgba        = true;
+
+      if (!image_texture_load(&image, preset->lut[i].path))
+      {
+         RARCH_ERR("[D3D10] Failed to load LUT: \"%s\".\n", preset->lut[i].path);
+         return false;
+      }
+
+      d3d10->chain.luts[i].desc.Width  = image.width;
+      d3d10->chain.luts[i].desc.Height = image.height;
+      d3d10->chain.luts[i].desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+      if (preset->lut[i].mipmap)
+         d3d10->chain.luts[i].desc.MiscFlags = D3D10_RESOURCE_MISC_GENERATE_MIPS;
+
+      d3d10_release_texture(&d3d10->chain.luts[i]);
+      d3d10_init_texture(d3d10->device, &d3d10->chain.luts[i]);
+
+      if (d3d10->chain.luts[i].staging)
+         d3d10_update_texture(
+               d3d10->device,
+               image.width, image.height, 0,
+               DXGI_FORMAT_R8G8B8A8_UNORM, image.pixels,
+               &d3d10->chain.luts[i]);
+
+      image_texture_free(&image);
+   }
+   return true;
+}
+
+#endif
 
 static bool d3d10_shader_load_begin(void *data,
       shader_load_deferred_t *deferred)
 {
-#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
    d3d10_video_t *d3d10 = (d3d10_video_t*)data;
    d3d10_deferred_state_t *ds;
 
@@ -2066,60 +2116,11 @@ static bool d3d10_shader_load_begin(void *data,
 
    deferred->total_passes = ds->shader_preset->passes;
 
-   /* Load LUTs synchronously */
-   {
-      unsigned i;
-      for (i = 0; i < ds->shader_preset->luts; i++)
-      {
-         struct texture_image image;
-         /* pix10 is a request the load reads: cleared with the rest */
-         memset(&image, 0, sizeof(image));
-         image.supports_rgba = true;
-
-         if (!image_texture_load(&image,
-                  ds->shader_preset->lut[i].path))
-         {
-            RARCH_ERR("[D3D10] Deferred: failed to load LUT: \"%s\".\n",
-                  ds->shader_preset->lut[i].path);
-            goto error;
-         }
-
-         ds->luts[i].desc.Width  = image.width;
-         ds->luts[i].desc.Height = image.height;
-         ds->luts[i].desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-
-         if (ds->shader_preset->lut[i].mipmap)
-            ds->luts[i].desc.MiscFlags = D3D10_RESOURCE_MISC_GENERATE_MIPS;
-
-         d3d10_init_texture(d3d10->device, &ds->luts[i]);
-
-         if (ds->luts[i].staging)
-            d3d10_update_texture(
-                  d3d10->device,
-                  image.width, image.height, 0,
-                  DXGI_FORMAT_R8G8B8A8_UNORM, image.pixels,
-                  &ds->luts[i]);
-
-         image_texture_free(&image);
-      }
-      ds->luts_loaded = true;
-   }
-
    RARCH_LOG("[D3D10] Deferred: prepared %u passes for \"%s\".\n",
          deferred->total_passes, deferred->preset_path);
 
    deferred->driver_data = ds;
    return true;
-
-error:
-   {
-      unsigned j;
-      for (j = 0; j < ds->shader_preset->luts; j++)
-         d3d10_release_texture(&ds->luts[j]);
-   }
-   free(ds->shader_preset);
-   free(ds);
-   return false;
 #else
    return false;
 #endif
@@ -2148,12 +2149,6 @@ static void d3d10_deferred_state_free(
       }
    }
 
-   if (ds->luts_loaded && ds->shader_preset)
-   {
-      for (i = 0; i < ds->shader_preset->luts; i++)
-         d3d10_release_texture(&ds->luts[i]);
-   }
-
    if (ds->shader_preset)
    {
       for (i = 0; i < ds->shader_preset->passes; i++)
@@ -2170,7 +2165,7 @@ static void d3d10_deferred_state_free(
 static bool d3d10_shader_load_step(void *data,
       shader_load_deferred_t *deferred)
 {
-#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
    d3d10_video_t *d3d10          = (d3d10_video_t*)data;
    d3d10_deferred_state_t *ds    =
       (d3d10_deferred_state_t*)deferred->driver_data;
@@ -2212,7 +2207,7 @@ static bool d3d10_shader_load_step(void *data,
                { &d3d10->chain.pass[0].feedback.view, sizeof(*d3d10->chain.pass),
                   &d3d10->chain.pass[0].feedback.size_data,
                   sizeof(*d3d10->chain.pass) },
-               /* Point at d3d10->chain.luts, not ds->luts */
+               /* the LUTs are the chain's, loaded at the install */
                { &d3d10->chain.luts[0].view, sizeof(*d3d10->chain.luts),
                   &d3d10->chain.luts[0].size_data, sizeof(*d3d10->chain.luts) },
             },
@@ -2335,11 +2330,6 @@ static bool d3d10_shader_load_step(void *data,
    d3d10->chain.shader_preset = ds->shader_preset;
    ds->shader_preset    = NULL;
 
-   /* Install LUTs */
-   memcpy(d3d10->chain.luts, ds->luts, sizeof(ds->luts));
-   memset(ds->luts, 0, sizeof(ds->luts));
-   ds->luts_loaded = false;
-
    /* Install per-pass state */
    {
       unsigned i;
@@ -2361,6 +2351,16 @@ static bool d3d10_shader_load_step(void *data,
       }
    }
 
+   /* The LUTs the installed passes read */
+   if (!d3d10_load_luts(d3d10))
+   {
+      d3d10_free_shader_preset(d3d10);
+      d3d10_deferred_state_free(ds, deferred->total_passes);
+      deferred->state       = SHADER_LOAD_FAILED;
+      deferred->driver_data = NULL;
+      return false;
+   }
+
    d3d10->flags |= D3D10_ST_FLAG_INIT_HISTORY | D3D10_ST_FLAG_RESIZE_RTS;
 
    deferred->state = SHADER_LOAD_DONE;
@@ -2378,7 +2378,7 @@ static bool d3d10_shader_load_step(void *data,
 static bool d3d10_gfx_set_shader(void* data,
       enum rarch_shader_type type, const char* path)
 {
-#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
    unsigned         i;
    d3d10_texture_t* source = NULL;
    d3d10_video_t*   d3d10  = (d3d10_video_t*)data;
@@ -2512,34 +2512,8 @@ static bool d3d10_gfx_set_shader(void* data,
       }
    }
 
-   for (i = 0; i < d3d10->chain.shader_preset->luts; i++)
-   {
-      struct texture_image image;
-      memset(&image, 0, sizeof(image));
-      image.supports_rgba        = true;
-
-      if (!image_texture_load(&image, d3d10->chain.shader_preset->lut[i].path))
-         goto error;
-
-      d3d10->chain.luts[i].desc.Width  = image.width;
-      d3d10->chain.luts[i].desc.Height = image.height;
-      d3d10->chain.luts[i].desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-
-      if (d3d10->chain.shader_preset->lut[i].mipmap)
-         d3d10->chain.luts[i].desc.MiscFlags = D3D10_RESOURCE_MISC_GENERATE_MIPS;
-
-      d3d10_release_texture(&d3d10->chain.luts[i]);
-      d3d10_init_texture(d3d10->device, &d3d10->chain.luts[i]);
-
-      if (d3d10->chain.luts[i].staging)
-         d3d10_update_texture(
-               d3d10->device,
-               image.width, image.height, 0,
-               DXGI_FORMAT_R8G8B8A8_UNORM, image.pixels,
-               &d3d10->chain.luts[i]);
-
-      image_texture_free(&image);
-   }
+   if (!d3d10_load_luts(d3d10))
+      goto error;
 
    d3d10->flags                |=  (D3D10_ST_FLAG_INIT_HISTORY
                                 |   D3D10_ST_FLAG_RESIZE_RTS);
@@ -4190,7 +4164,7 @@ static bool d3d10_gfx_frame(
 {
    unsigned width = VIDEO_SCALE_W(dims);
    unsigned height = VIDEO_SCALE_H(dims);
-   unsigned           i, k, m;
+   unsigned           k, m;
    UINT offset = 0, stride    = 0;
    d3d10_texture_t*   texture = NULL;
    d3d10_video_t      * d3d10 = (d3d10_video_t*)data;
@@ -5315,7 +5289,7 @@ static uint32_t d3d10_get_flags(void *data)
    BIT32_SET(flags, GFX_CTX_FLAGS_MENU_FRAME_FILTERING);
    BIT32_SET(flags, GFX_CTX_FLAGS_OVERLAY_BEHIND_MENU_SUPPORTED);
    BIT32_SET(flags, GFX_CTX_FLAGS_BLACK_FRAME_INSERTION);
-#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
    BIT32_SET(flags, GFX_CTX_FLAGS_SHADERS_SLANG);
    BIT32_SET(flags, GFX_CTX_FLAGS_SUBFRAME_SHADERS);
 #endif

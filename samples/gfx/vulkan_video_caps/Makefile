@@ -27,6 +27,8 @@ endif
 
 all: av1_params_test$(EXE) vp9_picture_test$(EXE) $(TARGET) $(PARAMS) video_layout_test$(EXE)
 
+hevc_decode_test$(EXE) hevc_render_test$(EXE): h26x_webm_decode.h ../video_fixture_stream.h
+
 $(PARAMS): hevc_params_test.c $(HEVC_DEPS) $(DECODERS)
 	$(CC) $(CFLAGS) -o $@ hevc_params_test.c $(DECODERS) $(LDFLAGS) -lm
 
@@ -63,7 +65,7 @@ AV1_MP4_SOURCES := $(RA)/libretro-common/formats/mp4/rmp4_video.c \
       $(RA)/libretro-common/formats/image/image_hdr_blit.c \
       $(RA)/libretro-common/features/features_cpu.c $(RA)/libretro-common/time/rtime.c
 
-hevc_decode_test$(EXE): av1_core_decode.h $(RA)/cores/libretro-media/media_core.c $(AV1_CORE_SOURCES) av1_mp4_decode.h av1_webm_decode.h $(AV1_MP4_SOURCES) $(AV1_PARAMS_DEPS) $(RA)/gfx/common/vulkan_video_decode_av1.h $(RA)/libretro-common/formats/av1/rav1_hw.c $(SAMPLED_DEPS) probe.c hevc_decode.h h264_decode.h vp9_decode.h av1_decode.h $(DECODERS) $(HEVC_DEPS) \
+hevc_decode_test$(EXE): av1_core_decode.h $(RA)/cores/libretro-media/media_core.c $(AV1_CORE_SOURCES) av1_mp4_decode.h av1_webm_decode.h $(AV1_MP4_SOURCES) $(AV1_PARAMS_DEPS) $(RA)/gfx/common/vulkan_video_decode_av1.h $(RA)/libretro-common/formats/av1/rav1_hw.c $(SAMPLED_DEPS) probe.c hevc_decode.h h264_decode.h vp9_decode.h vp9_mp4_decode.h av1_decode.h $(DECODERS) $(HEVC_DEPS) \
       $(RA)/gfx/common/vulkan_video_decode.c $(RA)/gfx/common/vulkan_video_decode_hevc.h \
       $(RA)/gfx/common/vulkan_video_decode_vp9.h $(RA)/gfx/common/vulkan_vp9_picture.h \
       $(RA)/gfx/common/vulkan_hevc_picture.h ../d3d11_video_decode/d3d11_video_decode_test_data.h \
@@ -86,11 +88,13 @@ probe$(EXE): probe.c $(RA)/gfx/common/vulkan_video_caps.h $(VP9_DEPS)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) $(if $(filter .exe,$(EXE)),,-ldl)
 
 import_test$(EXE): $(SAMPLED_DEPS) probe.c import_test.h build_import_test.py $(RA)/gfx/drivers/vulkan.c \
+      $(RA)/gfx/common/vulkan_common.c $(RA)/gfx/drivers/vulkan_win32_video.h \
       $(RA)/gfx/common/vulkan_video_import.h $(RA)/gfx/drivers/vulkan_shaders/yuv420_to_rgba8888.comp.inc
 	CC="$(CC)" CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" python3 build_import_test.py $@
 
-hevc_render_test$(EXE): av1_core_decode.h $(RA)/cores/libretro-media/media_core.c $(AV1_CORE_SOURCES) av1_mp4_decode.h av1_webm_decode.h $(AV1_MP4_SOURCES) $(AV1_PARAMS_DEPS) av1_decode.h $(RA)/gfx/common/vulkan_video_decode_av1.h $(RA)/libretro-common/formats/av1/rav1_hw.c $(SAMPLED_DEPS) probe.c hevc_decode.h vp9_decode.h hevc_render.c hevc_render.h import_test.h \
+hevc_render_test$(EXE): av1_core_decode.h $(RA)/cores/libretro-media/media_core.c $(AV1_CORE_SOURCES) av1_mp4_decode.h av1_webm_decode.h $(AV1_MP4_SOURCES) $(AV1_PARAMS_DEPS) av1_decode.h $(RA)/gfx/common/vulkan_video_decode_av1.h $(RA)/libretro-common/formats/av1/rav1_hw.c $(SAMPLED_DEPS) probe.c hevc_decode.h vp9_decode.h vp9_mp4_decode.h hevc_render.c hevc_render.h import_test.h \
       build_import_test.py $(HEVC_DEPS) $(DECODERS) $(RA)/gfx/drivers/vulkan.c \
+      $(RA)/gfx/drivers/vulkan_win32_video.h \
       h264_decode.h ../d3d11_video_decode/d3d11_video_decode_test_data.h \
       $(RA)/gfx/common/vulkan_common.c $(RA)/gfx/common/vulkan_video_import.h \
       $(RA)/libretro-common/formats/h264/rh264.c \
@@ -129,6 +133,9 @@ direct-check: hevc_decode_test$(EXE) hevc_render_test$(EXE) import_test$(EXE)
 decode-check: hevc_decode_test$(EXE)
 	$(RUNNER) ./hevc_decode_test$(EXE)
 
+matroska-check: hevc_decode_test$(EXE)
+	python3 check_matroska.py --vulkan-test ./hevc_decode_test$(EXE) --codec $(or $(MATROSKA_CODEC),both)
+
 clean:
 	rm -f av1_params_test av1_params_test.exe av1_session_test av1_session_test.exe
 	rm -f vp9_picture_test vp9_picture_test.exe
@@ -137,4 +144,4 @@ clean:
 	rm -f hevc_decode_test hevc_decode_test.exe hevc_render_test hevc_render_test.exe
 	rm -f import_test import_test.exe video_layout_test video_layout_test.exe
 
-.PHONY: all check av1-session-check session-check decode-check import-check render-check direct-check clean
+.PHONY: all check av1-session-check session-check decode-check matroska-check import-check render-check direct-check clean

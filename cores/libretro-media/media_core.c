@@ -111,6 +111,14 @@ static retro_input_poll_t MEDIA_CORE_PREFIX(input_poll_cb);
 static retro_input_state_t MEDIA_CORE_PREFIX(input_state_cb);
 static retro_environment_t MEDIA_CORE_PREFIX(environ_cb);
 
+#ifdef MEDIA_HAVE_AUDIO
+struct media_audio_time
+{
+   int64_t pts, source, end, media, prior_end;
+   int continued;
+};
+#endif
+
 typedef struct
 {
    uint8_t     *file_buf;
@@ -132,6 +140,7 @@ typedef struct
    int64_t      webm_seek_slot;
    int          webm_step;
    int          webm_restore_clock;
+   int          webm_cpu_resume;
    video_hw_frame_t hw_frame;
    int          hw_video;
    int64_t      hw_restart_ns;
@@ -170,6 +179,13 @@ typedef struct
                                         file it came from - so growth
                                         never copies and never spikes  */
    uint32_t    *asizes;
+   struct media_audio_time *atimes;
+   size_t       amapped, amap_bytes, atime_cursor;
+   int64_t      araw_frames, asource, atime_bias, atime_end;
+   int          atime_ready, atime_failed;
+   size_t       aorigin_scan, aorigin_bytes;
+   int64_t      avorbis_origin;
+   int          aorigin_ready;
 #ifdef HAVE_RMP4
    rmp4_t      *agather;             /* persistent audio-gather demuxer
                                         for the progressive MP4 path    */
@@ -180,7 +196,8 @@ typedef struct
    int64_t      atoc;                /* opus TOC frame sum so far       */
    int64_t      apreskip;
    int64_t      adiscard_ns;         /* webm DiscardPadding sum         */
-   uint64_t     atrim;               /* AAC start trim (frames)         */
+   uint64_t     atrim_left;          /* owner-side trim beyond codec pre-skip */
+   uint64_t     atrim;               /* container start trim (frames)   */
    unsigned     ach;                 /* decoded channels (1 or 2)       */
    unsigned     arate;
    int64_t      apos;                /* frames emitted so far           */
@@ -217,6 +234,7 @@ typedef struct
    int64_t      dur_ns;              /* stream duration, 0 if unknown   */
    unsigned     last_input;          /* previous frame's buttons        */
    int          seeking;             /* suppress presentation           */
+   rwebm_video_hdr_tone_t tone;
    int          pix10;               /* frontend accepted XRGB2101010   */
 } media_player_t;
 
@@ -247,6 +265,303 @@ bool media_set_video_hw_refresh(media_hw_refresh_t cb, void *user)
    return true;
 }
 
+#ifdef MEDIA_HAVE_AUDIO
+/* A current packet prefix is not an audio end. MP4 knows the eventual
+ * packet count, so a short audio track can still finish before the file. */
+static bool media_audio_may_grow(media_player_t *p)
+{
+   if (!p->dt || data_transfer_complete(p->dt)
+         || data_transfer_failed(p->dt) || data_transfer_capped(p->dt))
+      return false;
+#ifdef HAVE_RMP4
+   if (p->agather)
+   {
+      uint32_t count = 0;
+      rmp4_track_pts(p->agather, p->agtrack, &count);
+      return p->anpkts < count;
+   }
+#endif
+   return true;
+}
+static bool media_audio_ns_frames(int64_t ns, unsigned rate, int64_t *frames);
+
+/* An MP4 edit and codec pre-skip address the same original sample
+ * clock. Apply their maximum, not their sum; AAC/Vorbis setup has no
+ * built-in pre-skip. The decoder has already handled Opus's portion. */
+static int64_t media_audio_trim_frames(media_player_t *p)
+{
+   const uint64_t maximum = (~(uint64_t)0) >> 1;
+   int64_t trim;
+   if (p->atrim > maximum || p->apreskip < 0)
+   { p->atime_failed = 1; return 0; }
+   trim = (int64_t)p->atrim;
+   if (p->atype == AUDIO_TYPE_VORBIS && trim && p->actx)
+   {
+      unsigned walked;
+      for (walked = 0; !p->aorigin_ready && p->aorigin_scan < p->anpkts
+            && walked < 256; walked++)
+      {
+         size_t i = p->aorigin_scan;
+         int frames = audio_transfer_demuxed_packet_frames(p->actx, p->atype,
+               p->apkts + p->aorigin_bytes, p->asizes[i], i);
+         if (frames < 0) { p->atime_failed = 1; return 0; }
+         if (frames)
+         {
+            /* Overlap priming consumes media time but emits no PCM.
+             * A trim is relative to that first producing packet's PTS. */
+            if (!media_audio_ns_frames(p->atimes[i].pts, p->arate, &p->avorbis_origin))
+            { p->atime_failed = 1; return 0; }
+            p->aorigin_ready = 1;
+         }
+         p->aorigin_bytes += p->asizes[p->aorigin_scan++];
+      }
+      if (!p->aorigin_ready && p->aorigin_scan == p->anpkts && !media_audio_may_grow(p))
+         p->aorigin_ready = 1;
+      if (p->avorbis_origin < 0 && trim > (int64_t)maximum + p->avorbis_origin)
+      { p->atime_failed = 1; return 0; }
+      trim = p->avorbis_origin < trim ? trim - p->avorbis_origin : 0;
+   }
+   if (p->atype == AUDIO_TYPE_OPUS && p->apreskip > trim) trim = p->apreskip;
+   return trim;
+}
+
+static void media_audio_trim_reset(media_player_t *p)
+{
+   int64_t trim = media_audio_trim_frames(p);
+   p->atrim_left = 0;
+   if (p->atype == AUDIO_TYPE_VORBIS) p->atrim_left = (uint64_t)trim;
+   else if (p->atype == AUDIO_TYPE_OPUS && trim > p->apreskip)
+      p->atrim_left = (uint64_t)(trim - p->apreskip);
+}
+
+/* Both arrays grow under the core owner; borrowed decoder bindings are
+ * refreshed by the pump after a successful append. */
+static bool media_audio_packet_reserve(media_player_t *p)
+{
+   size_t cap;
+   uint32_t *sizes;
+   struct media_audio_time *times;
+   if (p->atime_failed) goto failed;
+   if (p->anpkts < p->anpkts_cap) return true;
+   cap = p->anpkts_cap ? p->anpkts_cap : 2048;
+   if (cap > (size_t)-1 / 2 / sizeof(*times)) goto failed;
+   cap *= 2;
+   sizes = (uint32_t*)malloc(cap * sizeof(*sizes));
+   times = (struct media_audio_time*)malloc(cap * sizeof(*times));
+   if (!sizes || !times) { free(sizes); free(times); goto failed; }
+   if (p->anpkts)
+   {
+      memcpy(sizes, p->asizes, p->anpkts * sizeof(*sizes));
+      memcpy(times, p->atimes, p->anpkts * sizeof(*times));
+   }
+   free(p->asizes); free(p->atimes);
+   p->asizes = sizes; p->atimes = times;
+   /* A later append can fail before the pump's final growth update.
+    * Refresh borrowed table pointers immediately, even at old count. */
+   if (p->actx)
+   {
+      const void *setup = NULL;
+      size_t size = 0;
+      if (p->wgather)
+      {
+         const rwebm_track *at = rwebm_get_track(p->wgather, p->atrack);
+         setup = at->codec_private; size = at->codec_private_size;
+      }
+#ifdef HAVE_RMP4
+      else if (p->agather)
+      {
+         const rmp4_track *at = rmp4_get_track(p->agather, p->agtrack);
+         setup = at->codec_private; size = at->codec_private_size;
+      }
+#endif
+      if (!audio_transfer_set_demuxed_ptr(p->actx, p->atype, setup, size,
+               p->apkts, p->apkts_used, p->asizes, p->anpkts)) goto failed;
+   }
+   p->anpkts_cap = cap;
+   return true;
+failed:
+   p->atime_failed = 1;
+   return false;
+}
+
+static bool media_audio_ns_frames(int64_t ns, unsigned rate, int64_t *frames)
+{
+   const int64_t maximum = (int64_t)((~(uint64_t)0) >> 1);
+   int64_t seconds = ns / 1000000000;
+   int64_t fraction = (ns % 1000000000) * (int64_t)rate;
+   fraction = (fraction + (fraction >= 0 ? 500000000 : -500000000)) / 1000000000;
+   if (!rate || seconds > maximum / rate || seconds < -maximum / rate)
+      return false;
+   seconds *= rate;
+   if ((fraction > 0 && seconds > maximum - fraction)
+         || (fraction < 0 && seconds < -maximum - fraction)) return false;
+   *frames = seconds + fraction;
+   return true;
+}
+
+/* Packet timestamps are quantised, but cumulative codec sample counts
+ * are exact. Snap only rounding jitter; retain real discontinuities. A
+ * fixed metadata slice bounds each query over a newly grown prefix. */
+static int media_audio_map(media_player_t *p)
+{
+   const int64_t maximum = (int64_t)((~(uint64_t)0) >> 1);
+   int origin_before = p->aorigin_ready;
+   int64_t trim = media_audio_trim_frames(p);
+   int64_t jitter = (int64_t)p->arate / 1000 + 1;
+   unsigned walked;
+   if (p->atype == AUDIO_TYPE_VORBIS && p->atrim)
+   {
+      if (!p->aorigin_ready) return p->atime_failed ? -1 : 0;
+      if (!origin_before) p->atrim_left = (uint64_t)trim;
+   }
+   if (p->atime_failed || p->apreskip < 0
+         || (p->atype != AUDIO_TYPE_OPUS && p->atrim > (uint64_t)maximum)) goto failed;
+   for (walked = 0; p->amapped < p->anpkts && walked < 256; walked++)
+   {
+      struct media_audio_time *t = &p->atimes[p->amapped];
+      int frames = audio_transfer_demuxed_packet_frames(p->actx, p->atype,
+            p->apkts + p->amap_bytes, p->asizes[p->amapped], p->amapped);
+      int64_t pts, skip, start, anchor;
+      if (frames < 0 || p->araw_frames > maximum - frames
+            || !media_audio_ns_frames(t->pts, p->arate, &pts)) goto failed;
+      t->source = p->araw_frames > trim ? p->araw_frames - trim : 0;
+      p->araw_frames += frames;
+      t->end = p->araw_frames > trim ? p->araw_frames - trim : 0;
+      t->prior_end = p->atime_end;
+      t->media = p->atime_end;
+      skip = trim > p->araw_frames - frames ? trim - (p->araw_frames - frames) : 0;
+      if (skip > frames) skip = frames;
+      if (t->end > t->source)
+      {
+         if (pts > maximum - skip) goto failed;
+         start = pts + skip;
+         if (!p->atime_ready)
+         {
+            if (p->atype == AUDIO_TYPE_VORBIS) anchor = start;
+            else if (!media_audio_ns_frames(p->atimes[0].pts, p->arate, &anchor)
+                  || anchor > maximum - trim) goto failed;
+            /* MP4 sample-table times still include the edit-list
+             * priming samples. WebM already subtracts CodecDelay. */
+#ifdef HAVE_RMP4
+            if (p->agather)
+            {
+               const rmp4_track *at = rmp4_get_track(p->agather, p->agtrack);
+               int64_t delay;
+               if (p->atype == AUDIO_TYPE_VORBIS && p->atrim)
+                  anchor = p->avorbis_origin > (int64_t)p->atrim
+                     ? p->avorbis_origin - (int64_t)p->atrim : 0;
+               if (!media_audio_ns_frames(at->presentation_delay_ns, p->arate, &delay)
+                     || delay < 0 || anchor > maximum - delay) goto failed;
+               anchor += delay;
+            }
+            else
+#endif
+               anchor += trim;
+            if (anchor >= -jitter && anchor <= jitter) anchor = 0;
+            if ((start < 0 && anchor > maximum + start)
+                  || (start > 0 && anchor < -maximum + start)) goto failed;
+            p->atime_bias = anchor - start;
+            p->atime_ready = 1;
+         }
+         if ((p->atime_bias > 0 && start > maximum - p->atime_bias)
+               || (p->atime_bias < 0 && start < -maximum - p->atime_bias)) goto failed;
+         start += p->atime_bias;
+         if (t->continued || (start >= p->atime_end - jitter
+                  && start - jitter <= p->atime_end)) start = p->atime_end;
+         t->media = start;
+         if (start > maximum - (t->end - t->source)) goto failed;
+         if (start + (t->end - t->source) > p->atime_end)
+            p->atime_end = start + (t->end - t->source);
+      }
+      p->amap_bytes += p->asizes[p->amapped++];
+   }
+   return p->amapped == p->anpkts;
+failed:
+   p->atime_failed = 1;
+   return -1;
+}
+
+static int64_t media_audio_timeline_total(media_player_t *p)
+{
+   size_t lo = 0, hi = p->amapped;
+   struct media_audio_time *t;
+   int64_t end;
+   if (p->atotal < 0 || !hi || p->amapped != p->anpkts) return -1;
+   while (lo < hi)
+   {
+      size_t mid = lo + (hi - lo) / 2;
+      if (p->atimes[mid].end < p->atotal) lo = mid + 1;
+      else hi = mid;
+   }
+   if (lo == p->amapped) return p->atime_end;
+   t = &p->atimes[lo];
+   end = p->atotal < t->end ? p->atotal : t->end;
+   if (end < t->source) end = t->source;
+   end = t->media + (end - t->source);
+   return end > t->prior_end ? end : t->prior_end;
+}
+
+/* One shared reader for playback and seek. apos is the presentation
+ * position; asource is the decoder position. A positive jump emits
+ * silence; a negative jump discards only the overlapping source frames.
+ * No decoder call crosses a packet timing boundary. */
+static int media_audio_read(media_player_t *p, int16_t *out, size_t want, size_t *got)
+{
+   unsigned walked;
+   int mapped = media_audio_map(p);
+   *got = 0;
+   if (mapped < 0) return AUDIO_PROCESS_ERROR_END;
+   if (!mapped && p->atime_cursor >= p->amapped) return AUDIO_PROCESS_NEXT;
+   for (walked = 0; walked < 16; walked++)
+   {
+      struct media_audio_time *t;
+      int64_t end, position;
+      size_t count;
+      int ret;
+      /* Keep trim beyond codec pre-skip in the core owner, preserving
+       * each decoder's prediction/overlap history while discarding. */
+      if (p->atrim_left)
+      {
+         size_t dropped = 0;
+         count = p->atrim_left < (uint64_t)want ? (size_t)p->atrim_left : want;
+         ret = audio_transfer_read_s16(p->actx, p->atype, out, count, &dropped);
+         p->atrim_left -= dropped;
+         if (ret != AUDIO_PROCESS_NEXT || !dropped) return ret;
+         continue;
+      }
+      if (p->atime_cursor >= p->amapped)
+         return mapped ? AUDIO_PROCESS_END : AUDIO_PROCESS_NEXT;
+      t = &p->atimes[p->atime_cursor];
+      end = t->end;
+      if (p->atotal >= 0 && end > p->atotal) end = p->atotal;
+      if (p->asource >= end)
+      {
+         p->atime_cursor++;
+         continue;
+      }
+      position = t->media + (p->asource - t->source);
+      if (position > p->apos)
+      {
+         count = position - p->apos < (int64_t)want
+            ? (size_t)(position - p->apos) : want;
+         memset(out, 0, count * p->ach * sizeof(*out));
+         *got = count;
+         return AUDIO_PROCESS_NEXT;
+      }
+      count = end - p->asource < (int64_t)want ? (size_t)(end - p->asource) : want;
+      if (position < p->apos && position > p->apos - (int64_t)count)
+         count = (size_t)(p->apos - position);
+      ret = audio_transfer_read_s16(p->actx, p->atype, out, count, got);
+      p->asource += (int64_t)*got;
+      if (position == p->apos) return ret;
+      *got = 0;
+      if (ret != AUDIO_PROCESS_NEXT) return ret;
+   }
+   return AUDIO_PROCESS_NEXT;
+}
+
+#endif
+
 static void media_drop_hw(media_player_t *p)
 {
    if (p->hw_frame.image)
@@ -260,12 +575,14 @@ static void media_close_webm_hw(media_player_t *p)
    if (p->webmvs)
       rwebm_video_stream_close(p->webmvs);
    p->webmvs = NULL;
+   p->webm_cpu_resume = 0;
    p->hw_video = 0;
 }
 
 static void media_rewind_webm_hw(media_player_t *p)
 {
    media_drop_hw(p);
+   p->webm_cpu_resume = 0;
    if (p->webmvs)
    {
       rwebm_video_stream_rewind(p->webmvs);
@@ -553,22 +870,28 @@ static int media_present_vp9(media_player_t *p, int show)
    if (p->vp9->hd.bit_depth == 10)
    {
       const rwebm_track *ct = rwebm_get_track(p->webm, p->vtrack);
+      unsigned peak = video_color_tonemap_peak_nits(
+            ct ? ct->transfer_characteristics : 0,
+            ct ? ct->max_cll : 0, ct ? &ct->mastering : NULL);
+      if (ct && ct->transfer_characteristics == 16
+            && (!p->tone.ready || p->tone.peak != peak))
+         rwebm_video_hdr_tone_init(&p->tone, peak);
       if (p->pix10)
-         rwebm_video_blit_i420_10bit(p->fb, p->width, w, h,
+         rwebm_video_blit_i420_10bit_tone(p->fb, p->width, w, h,
             (const uint16_t*)fb->y, p->vp9->ys,
             (const uint16_t*)fb->u, (const uint16_t*)fb->v, p->vp9->uvs,
             ct ? ct->matrix_coefficients : 0,
             ct ? ct->transfer_characteristics : 0,
             ct ? ct->colour_range : 0,
-            ct ? ct->max_cll : 0);
+            peak, ct ? ct->primaries : 0, &p->tone);
       else
-         rwebm_video_blit_i420_hbd(p->fb, p->width, w, h,
+         rwebm_video_blit_i420_hbd_tone(p->fb, p->width, w, h,
             (const uint16_t*)fb->y, p->vp9->ys,
             (const uint16_t*)fb->u, (const uint16_t*)fb->v, p->vp9->uvs,
             ct ? ct->matrix_coefficients : 0,
             ct ? ct->transfer_characteristics : 0,
             ct ? ct->colour_range : 0,
-            ct ? ct->max_cll : 0, 0);
+            peak, ct ? ct->primaries : 0, 0, &p->tone);
    }
    else
       {
@@ -777,6 +1100,29 @@ static size_t media_native_consumed(media_player_t *p)
    return consumed;
 }
 
+static int media_native_inert(void *user, size_t lo, size_t hi)
+{
+   return data_transfer_prefix_inert((data_transfer_t*)user, lo, hi);
+}
+
+static size_t media_native_read_end(media_player_t *p)
+{
+   size_t lo, hi, end;
+   if (p->webmvs) rwebm_video_stream_read_span(p->webmvs, &lo, &hi);
+   else rwebm_read_span(p->webm, &lo, &hi);
+   end = hi;
+   if (p->wgather)
+   {
+      size_t cursor = rwebm_tell(p->wgather);
+      rwebm_read_span(p->wgather, &lo, &hi);
+      if (hi > end) end = hi;
+      /* A metadata-only skip can leave the gather waiting for a header
+       * beyond the prefix without a complete-element request yet. */
+      if (cursor > end) end = cursor;
+   }
+   return end;
+}
+
 static void media_free_player(media_player_t *p)
 {
    media_close_webm_hw(p);
@@ -805,6 +1151,8 @@ static void media_free_player(media_player_t *p)
       audio_transfer_free(p->actx, p->atype);
    data_transfer_arena_release(&p->aark);
    free(p->asizes);
+   free(p->atimes);
+   p->atimes = NULL;
 #if defined(HAVE_RMP4)
    if (p->agather)
       rmp4_close(p->agather);
@@ -856,17 +1204,24 @@ void MEDIA_CORE_PREFIX(retro_get_system_info)(
 #endif
 }
 
+static unsigned media_audio_rate(const media_player_t *p)
+{
+#ifdef MEDIA_HAVE_AUDIO
+   if (p->actx)
+      return p->arate;
+#else
+   (void)p;
+#endif
+   return MEDIA_AUDIO_RATE;
+}
+
 void MEDIA_CORE_PREFIX(retro_get_system_av_info)(
       struct retro_system_av_info *info)
 {
    media_player_t *p = &media_player;
    memset(info, 0, sizeof(*info));
    info->timing.fps            = p->fps;
-   info->timing.sample_rate    = MEDIA_AUDIO_RATE;
-#ifdef MEDIA_HAVE_AUDIO
-   if (media_player.actx)
-      info->timing.sample_rate = (double)media_player.arate;
-#endif
+   info->timing.sample_rate    = (double)media_audio_rate(p);
    info->geometry.base_width   = p->width;
    info->geometry.base_height  = p->height;
    info->geometry.max_width    = p->width;
@@ -972,10 +1327,21 @@ void MEDIA_CORE_PREFIX(retro_reset)(void)
 #ifdef MEDIA_HAVE_AUDIO
    if (p->actx)
       audio_transfer_seek(p->actx, p->atype, 0);
+   p->asource = 0;
+   media_audio_trim_reset(p);
+   p->atime_cursor = 0;
    p->apos    = 0;
    p->aeof    = 0;
 #endif
    p->vpts_ns = 0;
+#ifdef HAVE_RMP4
+   if (p->mp4vs)
+   {
+      p->vpts_ns = rmp4_video_stream_presentation_delay_ns(p->mp4vs);
+      if (p->vpts_ns && p->fb)
+         memset(p->fb, 0, (size_t)p->width * p->height * sizeof(*p->fb));
+   }
+#endif
    p->vshown  = 0;
    p->play_ns = p->nvts ? p->vts[0] : 0;
    p->eof = 0;
@@ -995,18 +1361,40 @@ static bool media_seek_audio(media_player_t *p, int64_t want)
    if (!audio_transfer_seek(p->actx, p->atype, 0))
       return false;
    p->apos = 0;
+   p->asource = 0;
+   media_audio_trim_reset(p);
+   p->atime_cursor = 0;
    p->aeof = 0;
-   if (p->atotal >= 0 && want > p->atotal)
-      want = p->atotal;
+   {
+      int64_t total;
+      media_audio_map(p);
+      total = media_audio_timeline_total(p);
+      if (total >= 0 && want > total) want = total;
+   }
    while (p->apos < want)
    {
       size_t chunk = (size_t)(want - p->apos);
       size_t got   = 0;
       int r;
+      int64_t source_before = p->asource;
+      uint64_t trim_before = p->atrim_left;
+      size_t mapped_before = p->amapped, cursor_before = p->atime_cursor;
+      size_t origin_before = p->aorigin_scan;
       if (chunk > MEDIA_AUDIO_CHUNK)
          chunk = MEDIA_AUDIO_CHUNK;
-      r = audio_transfer_read_s16(p->actx, p->atype, scratch, chunk, &got);
+      r = media_audio_read(p, scratch, chunk, &got);
       p->apos += (int64_t)got;
+      if (r == AUDIO_PROCESS_NEXT && !got)
+      {
+         /* A seek already walks decoded source frames synchronously.
+          * Continue a bounded metadata/trim/overlap slice only when it
+          * made progress; a true resident wall must return to its feeder. */
+         if (p->asource != source_before || p->atrim_left != trim_before
+               || p->amapped != mapped_before || p->atime_cursor != cursor_before
+               || p->aorigin_scan != origin_before)
+            continue;
+         return false;
+      }
       if (r != AUDIO_PROCESS_NEXT || !got)
       {
          p->aeof = 1;
@@ -1022,8 +1410,8 @@ static bool media_seek_audio(media_player_t *p, int64_t want)
  * slot itself and target_ns only clamps (save-state restore, where
  * the slot is exact but the pts clock may run ahead of it under
  * display reordering). */
-static int64_t media_seek_internal(media_player_t *p, int64_t target_ns,
-      int64_t to_slot)
+static int64_t media_seek_internal_resume(media_player_t *p, int64_t target_ns,
+      int64_t to_slot, int resume)
 {
    p->webm_restore_clock = 0;
    if (target_ns < 0)
@@ -1081,11 +1469,18 @@ static int64_t media_seek_internal(media_player_t *p, int64_t target_ns,
    if (p->mp4vs)
    {
       int64_t ms;
+      int64_t delay = rmp4_video_stream_presentation_delay_ns(p->mp4vs);
+      int64_t relative = target_ns > delay ? target_ns - delay : 0;
       media_drop_hw(p);
-      ms = rmp4_video_stream_seek_ms(p->mp4vs, target_ns / 1000000);
+      ms = rmp4_video_stream_seek_ms(p->mp4vs, relative / 1000000);
+      if (target_ns < delay && p->fb)
+         memset(p->fb, 0, (size_t)p->width * p->height * sizeof(*p->fb));
+      /* States restore by display ordinal. Seeking consumes pictures
+       * without passing through the normal playback counter. */
+      p->vshown = rmp4_video_stream_frame_index(p->mp4vs);
       p->hw_video = media_hw_refresh && rmp4_video_stream_set_hw(p->mp4vs, 0);
-      p->vpts_ns = ms >= 0 ? ms * 1000000 : 0;
-      p->play_ns = p->vpts_ns;
+      p->vpts_ns = (ms >= 0 ? ms * 1000000 : 0) + delay;
+      p->play_ns = target_ns < delay ? target_ns : p->vpts_ns;
       p->eof     = 0;
       (void)to_slot;   /* the mp4 glue's timestamp table is exact */
    }
@@ -1167,7 +1562,7 @@ static int64_t media_seek_internal(media_player_t *p, int64_t target_ns,
       p->eof = 0;
       {
          int shown = kf_idx;
-         p->seeking = shown < tidx;
+         p->seeking = resume || shown < tidx;
          while (rwebm_read_packet(p->webm, &pkt) == 1)
          {
             int r;
@@ -1178,13 +1573,13 @@ static int64_t media_seek_internal(media_player_t *p, int64_t target_ns,
                break;
             if (r > 0)
             {
-               if (!p->seeking)
+               if (shown >= tidx)
                {
                   shown = tidx + 1;   /* target slot presented */
                   break;
                }
                shown++;
-               p->seeking = shown < tidx;
+               p->seeking = resume || shown < tidx;
             }
          }
 #ifdef MEDIA_HAVE_H264
@@ -1205,21 +1600,37 @@ static int64_t media_seek_internal(media_player_t *p, int64_t target_ns,
        * the display position under reordering); the wall clock sits a
        * frame past it - where the run loop would be at this point in
        * linear playback */
-      p->vpts_ns = p->vts && tidx < p->nvts ? p->vts[tidx] : target_ns;
-      p->play_ns = p->vpts_ns + p->frame_ns;
+      if (!resume)
+      {
+         p->vpts_ns = p->vts && tidx < p->nvts ? p->vts[tidx] : target_ns;
+         p->play_ns = p->vpts_ns + p->frame_ns;
+      }
       p->vshown  = (int64_t)tidx + 1;
    }
 
 seek_audio:
 #ifdef MEDIA_HAVE_AUDIO
-   if (p->actx)
+   if (!resume && p->actx)
    {
-      int64_t want = (int64_t)((double)p->vpts_ns * 1e-9
-            * (double)p->arate);
+      int64_t audio_ns = p->vpts_ns;
+      int64_t want;
+#ifdef HAVE_RMP4
+      if (p->mp4vs && p->play_ns < audio_ns) audio_ns = p->play_ns;
+#endif
+      want = (int64_t)((double)audio_ns * 1e-9 * (double)p->arate);
       media_seek_audio(p, want);
    }
 #endif
+#ifdef HAVE_RMP4
+   if (p->mp4vs && p->play_ns < p->vpts_ns) return p->play_ns;
+#endif
    return p->vpts_ns;
+}
+
+static int64_t media_seek_internal(media_player_t *p, int64_t target_ns,
+      int64_t to_slot)
+{
+   return media_seek_internal_resume(p, target_ns, to_slot, 0);
 }
 
 /* Edge-triggered transport controls: left/right seek 10 seconds,
@@ -1300,6 +1711,16 @@ void media_video_hw_ready(void)
 #endif
 {
    media_player_t *p = &media_player;
+   if (p->hw_video && (!media_hw_refresh
+            || !media_hw_refresh(media_hw_user, NULL)))
+   {
+#ifdef RARCH_INTERNAL
+      libretro_media_suspend_video_hw();
+#else
+      media_suspend_video_hw();
+#endif
+   }
+
    if (p->webm && (p->codec == RWEBM_CODEC_VP9
             || p->webm_hw_required) && !p->hw_started)
    {
@@ -1321,6 +1742,8 @@ void media_video_hw_ready(void)
          if (p->webmvs && rwebm_video_stream_set_hw(p->webmvs, 1))
          {
             p->hw_video = 1;
+            p->webm_cpu_resume = p->hw_restart && p->fb
+                  && !p->webm_hw_required && !p->webm_restore_clock;
             p->webm_hw_shown = 0;
             p->webm_seek_slot = -1;
             p->webm_step = 0;
@@ -1334,27 +1757,72 @@ void media_video_hw_ready(void)
          p->hw_restart = 0;
          if (p->webm_restore_clock && p->webmvs)
             p->webm_seek_slot = restart_slot;
-         else if (media_seek_internal(p, target,
-                  p->webm_hw_required ? restart_slot : -1)
-               + 500000000 < target)
-            p->pending_seek_ns = target;
+         /* Backend replacement preserves the display ordinal, wall clock
+          * and PCM position. A fresh GPU stream catches up silently in
+          * media_run_webm_hw; CPU replay rebuilds references without
+          * presenting a seek picture or rewinding audio. */
+         else if (!p->webmvs)
+         {
+            if (!p->vshown)
+               rwebm_rewind(p->webm);
+            else if (media_seek_internal_resume(p, target,
+                     p->vshown - 1, 1) + 500000000 < target)
+               p->pending_seek_ns = target;
+         }
       }
    }
 #ifdef HAVE_RMP4
    if (p->mp4vs)
    {
+      if (p->hw_restart && p->dt && p->discarded)
+      {
+         if (!data_transfer_refill(p->dt, 0))
+         {
+            p->hw_restart = 0;
+            p->eof = 1;
+            return;
+         }
+         p->discarded = 0;
+      }
       if (!p->hw_started)
       {
          bool ready = media_hw_refresh
             && media_hw_refresh(media_hw_user, NULL);
          p->hw_started = 1;
          p->hw_video = ready && rmp4_video_stream_set_hw(p->mp4vs, 1);
-         if (p->hw_restart)
+      }
+      if (p->hw_restart)
+      {
+         /* A backend replacement is not a user seek. Resume at the next
+          * display ordinal and leave the video clock and PCM state intact.
+          * Millisecond timestamps lose the fractional frame duration and
+          * can include an MP4 composition offset. */
+         if (p->vshown > INT_MAX || (p->hw_restart == 1
+               && rmp4_video_stream_seek_frame(p->mp4vs,
+                     (int)p->vshown) < 0))
          {
-            int64_t target = p->hw_restart_ns;
             p->hw_restart = 0;
-            if (media_seek(p, target) + 500000000 < target)
-               p->pending_seek_ns = target;
+            p->eof = 1;
+            return;
+         }
+         p->hw_restart = 2;
+         while (rmp4_video_stream_frame_index(p->mp4vs) < p->vshown)
+         {
+            int result = rmp4_video_stream_discard(p->mp4vs, NULL);
+            if (result == 2)
+               break;
+            if (result != 1)
+            {
+               p->hw_restart = 0;
+               p->eof = 1;
+               return;
+            }
+         }
+         if (rmp4_video_stream_frame_index(p->mp4vs) == p->vshown)
+         {
+            p->hw_video = media_hw_refresh
+               && rmp4_video_stream_set_hw(p->mp4vs, 0);
+            p->hw_restart = 0;
          }
       }
    }
@@ -1365,299 +1833,9 @@ void media_video_hw_ready(void)
 #endif
 }
 
-static void media_run_webm_hw(media_player_t *p)
+static void media_run_webm_cpu(media_player_t *p, int advance_clock)
 {
-   int64_t started = cpu_features_get_time_usec();
-   int64_t target = p->webm_seek_slot;
-   if (p->webm_restore_clock)
-   {
-      p->play_ns += p->frame_ns;
-      p->webm_restore_clock = 0;
-   }
-   if (target < 0)
-   {
-      target = p->vshown - 1;
-      p->play_ns += p->frame_ns;
-      while (target + 1 < p->nvts
-            && p->vts[target + 1] + p->frame_ns / 2 <= p->play_ns)
-         target++;
-   }
-   while ((!p->eof || p->webm_seek_slot >= 0)
-         && !p->hw_frame.image && p->webm_hw_shown <= target)
-   {
-      int ret, skipped;
-      if (!p->webm_step)
-         p->webm_step = p->webm_hw_shown < target ? 2 : 1;
-      skipped = p->webm_step == 2;
-      if (skipped)
-         ret = rwebm_video_stream_skip(p->webmvs, NULL);
-      else if (rwebm_video_stream_next(p->webmvs, NULL))
-         ret = 1;
-      else
-         ret = rwebm_video_stream_waiting(p->webmvs) ? 2 : 0;
-      if (ret != 1)
-      {
-         if (ret != 2)
-         {
-            p->eof = 1;
-            p->webm_seek_slot = -1;
-            p->webm_step = 0;
-         }
-         break;
-      }
-      p->webm_step = 0;
-      p->webm_hw_shown++;
-      if (!skipped && !rwebm_video_stream_hw_frame(p->webmvs, &p->hw_frame))
-      {
-         p->eof = 1;
-         p->webm_seek_slot = -1;
-         break;
-      }
-      if (p->webm_hw_shown - 1 < target)
-         media_drop_hw(p);
-      else if (!skipped)
-      {
-         p->vshown = p->webm_hw_shown;
-         p->vpts_ns = p->vts && p->vshown <= p->nvts
-               ? p->vts[p->vshown - 1] : p->vpts_ns;
-         p->webm_seek_slot = -1;
-      }
-      if (cpu_features_get_time_usec() - started >= 4000)
-         break;
-   }
-   media_present_hw(p);
-   if (!p->hw_frame.image && p->nvts > 0 && p->webm_hw_shown >= p->nvts
-         && (!p->dt || data_transfer_complete(p->dt) || data_transfer_failed(p->dt)))
-      p->eof = 1;
-   if (p->eof && !p->hw_frame.image && p->webm_seek_slot < 0)
-   {
-      int audio_done = 1;
-#ifdef MEDIA_HAVE_AUDIO
-      if (p->actx && !p->aeof)
-         audio_done = 0;
-#endif
-      if (audio_done)
-         MEDIA_CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
-   }
-}
-
-void MEDIA_CORE_PREFIX(retro_run)(void)
-{
-   media_player_t *p = &media_player;
    rwebm_packet pkt;
-
-#ifdef RARCH_INTERNAL
-   libretro_media_video_hw_ready();
-#else
-   media_video_hw_ready();
-#endif
-
-   if (p->webm_hw_required && !p->hw_video)
-   {
-      MEDIA_CORE_PREFIX(video_cb)(NULL, p->width, p->height, 0);
-      if (p->hw_started)
-      {
-         p->eof = 1;
-         MEDIA_CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
-      }
-      return;
-   }
-
-   MEDIA_CORE_PREFIX(input_poll_cb)();
-   media_check_input(p);
-
-#ifdef HAVE_RMP4
-   if (p->mp4vs)
-   {
-      if (p->mp4_hw_required && !p->hw_video)
-      {
-         MEDIA_CORE_PREFIX(video_cb)(NULL, p->width, p->height, 0);
-         if (p->hw_started)
-         {
-            p->eof = 1;
-            MEDIA_CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
-         }
-         return;
-      }
-      /* Progressive fill: a budget of file bytes per run - orders of
-       * magnitude above any realtime bitrate, so starvation is a
-       * startup transient at most - then the arrivals fan out to the
-       * video stream and the audio gather. */
-      if (p->dt && !data_transfer_complete(p->dt)
-            && !data_transfer_failed(p->dt)
-            && !data_transfer_capped(p->dt)
-            && (   p->pending_seek_ns >= 0
-                || data_transfer_avail(p->dt)
-                   < rmp4_video_stream_consumed(p->mp4vs)
-                     + MEDIA_FILL_LOOKAHEAD))
-      {
-         size_t avail = data_transfer_iterate(p->dt, 4 * 1024 * 1024);
-         rmp4_video_stream_set_avail(p->mp4vs, avail);
-         if (p->pending_seek_ns >= 0)
-         {
-            int64_t pos = media_seek(p, p->pending_seek_ns);
-            if (   data_transfer_complete(p->dt)
-                || data_transfer_capped(p->dt)
-                || pos + 500000000 >= p->pending_seek_ns)
-               p->pending_seek_ns = -1;
-         }
-#ifdef MEDIA_HAVE_AUDIO
-         if (p->agather)
-         {
-            rmp4_set_avail(p->agather, avail);
-            media_mp4_audio_pump(p);
-         }
-#endif
-      }
-
-      /* Terminal short states are latched outside the fill block:
-       * once capped, the block above is no longer entered. */
-      if (   p->dt
-          && (   data_transfer_failed(p->dt)
-              || data_transfer_capped(p->dt))
-          && !p->fill_warned)
-      {
-         p->fill_warned = 1;
-         if (MEDIA_CORE_PREFIX(log_cb))
-            MEDIA_CORE_PREFIX(log_cb)(RETRO_LOG_WARN,
-               data_transfer_capped(p->dt)
-                  ? "[media] file exceeds this platform's read "
-                    "window; playing the prefix.\n"
-                  : "[media] file read ended short; playing what "
-                    "arrived.\n");
-      }
-
-      /* Bounded-memory streaming: release the pages behind what the
-       * video stream has fully consumed (audio packets are copied
-       * into the pump's blob as they arrive, so the gather region
-       * needs no residency of its own).  The metadata floor - sample
-       * tables, codec private data - always stays. */
-      if (p->dt && p->pending_seek_ns < 0)
-      {
-         size_t mfloor  = rmp4_video_stream_media_floor(p->mp4vs);
-         size_t consumed = rmp4_video_stream_consumed(p->mp4vs);
-         if (   consumed > mfloor
-             && consumed - mfloor > MEDIA_DISCARD_MARGIN)
-         {
-            data_transfer_discard(p->dt, consumed - MEDIA_DISCARD_MARGIN);
-            p->discarded = 1;
-         }
-      }
-      /* Pacing: one frame interval of wall time per run, advancing
-       * the stream while the next frame's timestamp (the running
-       * duration sum) falls inside it, with half a frame of tolerance
-       * for millisecond quantisation.  Constant-rate files advance
-       * exactly one frame per run; variable-rate files hold the
-       * picture through slow stretches and pass through several
-       * frames in fast ones, converting only the last. */
-      p->play_ns += p->frame_ns;
-      {
-         int have = 0;
-         while (!p->eof && !p->hw_frame.image
-               && p->vpts_ns + p->frame_ns / 2 <= p->play_ns)
-         {
-            int dur_ms = 0;
-            /* Pass-over frames are consumed without colour
-             * conversion; only the frame actually presented is
-             * rendered, below.  In fast variable-rate stretches this
-             * saves a full-resolution blit per dropped frame. */
-            int r = rmp4_video_stream_skip(p->mp4vs, &dur_ms);
-            if (r == 2 && (rmp4_video_stream_wait_reason(p->mp4vs)
-                        == RMP4_VIDEO_WAIT_DECODER
-                     || (p->dt && !data_transfer_complete(p->dt)
-                        && !data_transfer_failed(p->dt))))
-               /* Hold the picture until input or decoder capacity returns. */
-               break;
-            if (r != 1)
-            {
-               p->eof = 1;
-               break;
-            }
-            have        = 1;
-            p->vpts_ns += (int64_t)dur_ms * 1000000;
-            p->vshown++;
-         }
-         media_present_mp4(p, have);
-      }
-      if (p->eof && !p->hw_frame.image)
-      {
-         int audio_done = 1;
-#ifdef MEDIA_HAVE_AUDIO
-         if (p->actx && !p->aeof)
-            audio_done = 0;
-#endif
-         if (audio_done)
-            MEDIA_CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
-      }
-      goto audio;
-   }
-#endif
-
-   /* Progressive fill for the native path: budget, then fan the
-    * arrivals to the playback demuxer and the gather. */
-   if (p->dt && !data_transfer_complete(p->dt)
-         && !data_transfer_failed(p->dt)
-         && !data_transfer_capped(p->dt)
-         && (   p->pending_seek_ns >= 0
-             || data_transfer_avail(p->dt)
-                < (p->webmvs ? rwebm_video_stream_consumed(p->webmvs)
-                   : rwebm_tell(p->webm)) + MEDIA_FILL_LOOKAHEAD))
-   {
-      size_t avail = data_transfer_iterate(p->dt, 4 * 1024 * 1024);
-      rwebm_set_avail(p->webm, avail);
-      if (p->webmvs)
-         rwebm_video_stream_set_avail(p->webmvs, avail);
-      if (p->wgather)
-      {
-         rwebm_set_avail(p->wgather, avail);
-         media_native_pump(p);
-      }
-      if (p->pending_seek_ns >= 0)
-      {
-         int64_t pos = media_seek(p, p->pending_seek_ns);
-         if (   data_transfer_complete(p->dt)
-             || data_transfer_capped(p->dt)
-             || pos + 500000000 >= p->pending_seek_ns)
-            p->pending_seek_ns = -1;
-      }
-   }
-
-   /* Terminal short states are latched outside the fill block: once
-    * capped, the block above is no longer entered. */
-   if (   p->dt
-       && (   data_transfer_failed(p->dt)
-           || data_transfer_capped(p->dt))
-       && !p->fill_warned)
-   {
-      p->fill_warned = 1;
-      if (MEDIA_CORE_PREFIX(log_cb))
-         MEDIA_CORE_PREFIX(log_cb)(RETRO_LOG_WARN,
-            data_transfer_capped(p->dt)
-               ? "[media] file exceeds this platform's read "
-                 "window; playing the prefix.\n"
-               : "[media] file read ended short; playing what "
-                 "arrived.\n");
-   }
-
-   /* Both demuxers can retain unread laces behind their walk cursor. */
-   if (p->dt && p->webm && p->pending_seek_ns < 0)
-   {
-      size_t mfloor   = rwebm_media_floor(p->webm);
-      size_t consumed = media_native_consumed(p);
-      if (   consumed > mfloor
-          && consumed - mfloor > MEDIA_DISCARD_MARGIN)
-      {
-         data_transfer_discard(p->dt, consumed - MEDIA_DISCARD_MARGIN);
-         p->discarded = 1;
-      }
-   }
-
-   if (p->webmvs)
-   {
-      media_run_webm_hw(p);
-      goto audio;
-   }
-
    if (!media_make_framebuffer(p))
    {
       p->eof = 1;
@@ -1676,7 +1854,8 @@ void MEDIA_CORE_PREFIX(retro_run)(void)
        * Constant-rate files advance exactly one slot per run;
        * variable-rate files repeat the current picture through slow
        * stretches and drop intermediates through fast ones. */
-      p->play_ns += p->frame_ns;
+      if (advance_clock)
+         p->play_ns += p->frame_ns;
       while (target_slot + 1 < p->nvts
             && p->vts[target_slot + 1] + p->frame_ns / 2 <= p->play_ns)
          target_slot++;
@@ -1759,6 +1938,328 @@ void MEDIA_CORE_PREFIX(retro_run)(void)
          MEDIA_CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
    }
 
+}
+
+static void media_run_webm_hw(media_player_t *p)
+{
+   int64_t started = cpu_features_get_time_usec();
+   int64_t target = p->webm_seek_slot;
+   if (p->webm_restore_clock)
+   {
+      p->play_ns += p->frame_ns;
+      p->webm_restore_clock = 0;
+   }
+   if (target < 0)
+   {
+      target = p->vshown - 1;
+      p->play_ns += p->frame_ns;
+      while (target + 1 < p->nvts
+            && p->vts[target + 1] + p->frame_ns / 2 <= p->play_ns)
+         target++;
+   }
+   while ((!p->eof || p->webm_seek_slot >= 0)
+         && !p->hw_frame.image && p->webm_hw_shown <= target)
+   {
+      int ret, skipped;
+      if (!p->webm_step)
+         p->webm_step = p->webm_hw_shown < target ? 2 : 1;
+      skipped = p->webm_step == 2;
+      if (skipped)
+         ret = rwebm_video_stream_skip(p->webmvs, NULL);
+      else if (rwebm_video_stream_next(p->webmvs, NULL))
+         ret = 1;
+      else
+         ret = rwebm_video_stream_waiting(p->webmvs) ? 2 : 0;
+      if (ret != 1)
+      {
+         if (ret != 2)
+         {
+            p->eof = 1;
+            p->webm_seek_slot = -1;
+            p->webm_step = 0;
+         }
+         break;
+      }
+      p->webm_step = 0;
+      p->webm_hw_shown++;
+      if (!skipped && !rwebm_video_stream_hw_frame(p->webmvs, &p->hw_frame))
+      {
+         p->eof = 1;
+         p->webm_seek_slot = -1;
+         break;
+      }
+      if (p->webm_hw_shown - 1 < target)
+         media_drop_hw(p);
+      else if (!skipped)
+      {
+         p->webm_cpu_resume = 0;
+         p->vshown = p->webm_hw_shown;
+         p->vpts_ns = p->vts && p->vshown <= p->nvts
+               ? p->vts[p->vshown - 1] : p->vpts_ns;
+         p->webm_seek_slot = -1;
+      }
+      if (cpu_features_get_time_usec() - started >= 4000)
+         break;
+   }
+   /* A replacement renderer has no cached imported picture yet. Keep the
+    * last CPU image visible while the new decoder rebuilds references. */
+   if (!p->hw_frame.image && p->webm_cpu_resume
+         && p->webm_hw_shown <= target)
+      media_run_webm_cpu(p, 0);
+   else if (!p->hw_frame.image && p->fb && p->webm_hw_shown <= target)
+      MEDIA_CORE_PREFIX(video_cb)(p->fb, p->width, p->height,
+            p->width * sizeof(uint32_t));
+   else
+      media_present_hw(p);
+   if (!p->hw_frame.image && p->nvts > 0 && p->webm_hw_shown >= p->nvts
+         && (!p->dt || data_transfer_complete(p->dt) || data_transfer_failed(p->dt)))
+      p->eof = 1;
+   if (p->eof && !p->hw_frame.image && p->webm_seek_slot < 0)
+   {
+      int audio_done = 1;
+#ifdef MEDIA_HAVE_AUDIO
+      if (p->actx && !p->aeof)
+         audio_done = 0;
+#endif
+      if (audio_done)
+         MEDIA_CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
+   }
+}
+
+void MEDIA_CORE_PREFIX(retro_run)(void)
+{
+   media_player_t *p = &media_player;
+
+#ifdef RARCH_INTERNAL
+   libretro_media_video_hw_ready();
+#else
+   media_video_hw_ready();
+#endif
+
+   if (p->webm_hw_required && !p->hw_video)
+   {
+      MEDIA_CORE_PREFIX(video_cb)(NULL, p->width, p->height, 0);
+      if (p->hw_started)
+      {
+         p->eof = 1;
+         MEDIA_CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
+      }
+      return;
+   }
+
+   MEDIA_CORE_PREFIX(input_poll_cb)();
+   media_check_input(p);
+
+#ifdef HAVE_RMP4
+   if (p->mp4vs)
+   {
+      if (p->mp4_hw_required && !p->hw_video)
+      {
+         MEDIA_CORE_PREFIX(video_cb)(NULL, p->width, p->height, 0);
+         if (p->hw_started)
+         {
+            p->eof = 1;
+            MEDIA_CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
+         }
+         return;
+      }
+      /* Progressive fill: a budget of file bytes per run - orders of
+       * magnitude above any realtime bitrate, so starvation is a
+       * startup transient at most - then the arrivals fan out to the
+       * video stream and the audio gather. */
+      if (p->dt && !data_transfer_complete(p->dt)
+            && !data_transfer_failed(p->dt)
+            && !data_transfer_capped(p->dt)
+            && (   p->pending_seek_ns >= 0
+                || data_transfer_avail(p->dt)
+                   < rmp4_video_stream_consumed(p->mp4vs)
+                     + MEDIA_FILL_LOOKAHEAD))
+      {
+         size_t avail = data_transfer_iterate(p->dt, 4 * 1024 * 1024);
+         rmp4_video_stream_set_avail(p->mp4vs, avail);
+         if (p->pending_seek_ns >= 0)
+         {
+            int64_t pos = media_seek(p, p->pending_seek_ns);
+            if (   data_transfer_complete(p->dt)
+                || data_transfer_capped(p->dt)
+                || pos + 500000000 >= p->pending_seek_ns)
+               p->pending_seek_ns = -1;
+         }
+#ifdef MEDIA_HAVE_AUDIO
+         if (p->agather)
+         {
+            rmp4_set_avail(p->agather, avail);
+            media_mp4_audio_pump(p);
+         }
+#endif
+      }
+
+      if (p->hw_restart)
+      {
+         /* Decoder catch-up may span runs. Keep wall time moving so the
+          * next ready picture catches up with audio, and supply the last
+          * CPU picture if the replacement renderer has no cached frame. */
+         p->play_ns += p->frame_ns;
+         MEDIA_CORE_PREFIX(video_cb)(p->fb, p->width, p->height,
+               p->fb ? p->width * sizeof(uint32_t) : 0);
+         goto audio;
+      }
+
+      /* Terminal short states are latched outside the fill block:
+       * once capped, the block above is no longer entered. */
+      if (   p->dt
+          && (   data_transfer_failed(p->dt)
+              || data_transfer_capped(p->dt))
+          && !p->fill_warned)
+      {
+         p->fill_warned = 1;
+         if (MEDIA_CORE_PREFIX(log_cb))
+            MEDIA_CORE_PREFIX(log_cb)(RETRO_LOG_WARN,
+               data_transfer_capped(p->dt)
+                  ? "[media] file exceeds this platform's read "
+                    "window; playing the prefix.\n"
+                  : "[media] file read ended short; playing what "
+                    "arrived.\n");
+      }
+
+      /* Bounded-memory streaming: release the pages behind what the
+       * video stream has fully consumed (audio packets are copied
+       * into the pump's blob as they arrive, so the gather region
+       * needs no residency of its own). The demuxer owns its sample
+       * tables and decoder setup independently of these file pages. */
+      if (p->dt && p->pending_seek_ns < 0)
+      {
+         size_t mfloor  = rmp4_video_stream_media_floor(p->mp4vs);
+         size_t consumed = rmp4_video_stream_consumed(p->mp4vs);
+         if (   consumed > mfloor
+             && consumed - mfloor > MEDIA_DISCARD_MARGIN)
+         {
+            data_transfer_discard(p->dt, consumed - MEDIA_DISCARD_MARGIN);
+            p->discarded = 1;
+         }
+      }
+      /* Pacing: one frame interval of wall time per run, advancing
+       * the stream while the next frame's timestamp (the running
+       * duration sum) falls inside it, with half a frame of tolerance
+       * for millisecond quantisation.  Constant-rate files advance
+       * exactly one frame per run; variable-rate files hold the
+       * picture through slow stretches and pass through several
+       * frames in fast ones, converting only the last. */
+      p->play_ns += p->frame_ns;
+      {
+         int have = 0;
+         while (!p->eof && !p->hw_frame.image
+               && p->vpts_ns <= p->play_ns - p->frame_ns / 2)
+         {
+            int dur_ms = 0;
+            /* Pass-over frames are consumed without colour
+             * conversion; only the frame actually presented is
+             * rendered, below.  In fast variable-rate stretches this
+             * saves a full-resolution blit per dropped frame. */
+            int r = rmp4_video_stream_skip(p->mp4vs, &dur_ms);
+            if (r == 2 && (rmp4_video_stream_wait_reason(p->mp4vs)
+                        == RMP4_VIDEO_WAIT_DECODER
+                     || (p->dt && !data_transfer_complete(p->dt)
+                        && !data_transfer_failed(p->dt))))
+            {
+               /* Hold the picture until input or decoder capacity returns. */
+               if (p->mp4_hw_required && !p->vshown)
+                  p->play_ns -= p->frame_ns;
+               break;
+            }
+            if (r != 1)
+            {
+               p->eof = 1;
+               break;
+            }
+            have        = 1;
+            p->vpts_ns += (int64_t)dur_ms * 1000000;
+            p->vshown++;
+         }
+         media_present_mp4(p, have);
+      }
+      if (p->eof && !p->hw_frame.image)
+      {
+         int audio_done = 1;
+#ifdef MEDIA_HAVE_AUDIO
+         if (p->actx && !p->aeof)
+            audio_done = 0;
+#endif
+         if (audio_done)
+            MEDIA_CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
+      }
+      goto audio;
+   }
+#endif
+
+   /* Progressive fill for the native path: budget, then fan the
+    * arrivals to the playback demuxer and the gather. */
+   if (p->dt && !data_transfer_complete(p->dt)
+         && !data_transfer_failed(p->dt)
+         && !data_transfer_capped(p->dt)
+         && (   p->pending_seek_ns >= 0
+             || data_transfer_avail(p->dt) < media_native_read_end(p)
+             || data_transfer_avail(p->dt)
+                < (p->webmvs ? rwebm_video_stream_feed_frontier(p->webmvs)
+                   : rwebm_tell(p->webm)) + MEDIA_FILL_LOOKAHEAD))
+   {
+      size_t avail = data_transfer_iterate(p->dt, 4 * 1024 * 1024);
+      rwebm_set_avail(p->webm, avail);
+      if (p->webmvs)
+         rwebm_video_stream_set_avail(p->webmvs, avail);
+      if (p->wgather)
+      {
+         rwebm_set_avail(p->wgather, avail);
+         media_native_pump(p);
+      }
+      if (p->pending_seek_ns >= 0)
+      {
+         int64_t pos = media_seek(p, p->pending_seek_ns);
+         if (   data_transfer_complete(p->dt)
+             || data_transfer_capped(p->dt)
+             || pos + 500000000 >= p->pending_seek_ns)
+            p->pending_seek_ns = -1;
+      }
+   }
+
+   /* Terminal short states are latched outside the fill block: once
+    * capped, the block above is no longer entered. */
+   if (   p->dt
+       && (   data_transfer_failed(p->dt)
+           || data_transfer_capped(p->dt))
+       && !p->fill_warned)
+   {
+      p->fill_warned = 1;
+      if (MEDIA_CORE_PREFIX(log_cb))
+         MEDIA_CORE_PREFIX(log_cb)(RETRO_LOG_WARN,
+            data_transfer_capped(p->dt)
+               ? "[media] file exceeds this platform's read "
+                 "window; playing the prefix.\n"
+               : "[media] file read ended short; playing what "
+                 "arrived.\n");
+   }
+
+   /* Both demuxers can retain unread laces behind their walk cursor. */
+   if (p->dt && p->webm && p->pending_seek_ns < 0)
+   {
+      size_t mfloor   = rwebm_media_floor(p->webm);
+      size_t consumed = media_native_consumed(p);
+      if (   consumed > mfloor
+          && consumed - mfloor > MEDIA_DISCARD_MARGIN)
+      {
+         data_transfer_discard(p->dt, consumed - MEDIA_DISCARD_MARGIN);
+         p->discarded = 1;
+      }
+   }
+
+   if (p->webmvs)
+   {
+      media_run_webm_hw(p);
+      goto audio;
+   }
+
+   media_run_webm_cpu(p, 1);
+
 audio:
 #ifdef MEDIA_HAVE_AUDIO
    if (p->actx && !p->aeof)
@@ -1774,11 +2275,15 @@ audio:
        * time - and the audience's audio - keeps moving */
       int64_t target = (int64_t)(((double)p->play_ns * 1e-9 + 1.0 / p->fps)
          * (double)p->arate);
+      int64_t timeline_total;
       if (p->eof)
          target = p->apos + (int64_t)((double)p->arate / p->fps) + 1;
-      if (p->atotal >= 0 && target > p->atotal)
-         target = p->atotal;
-      if (p->atotal >= 0 && p->apos >= p->atotal)
+      media_audio_map(p);
+      timeline_total = media_audio_timeline_total(p);
+      if (timeline_total >= 0 && target > timeline_total)
+         target = timeline_total;
+      if (timeline_total >= 0 && p->apos >= timeline_total
+            && !media_audio_may_grow(p))
          p->aeof = 1;
       while (p->apos < target)
       {
@@ -1787,7 +2292,7 @@ audio:
          int r;
          if (want > MEDIA_AUDIO_CHUNK)
             want = MEDIA_AUDIO_CHUNK;
-         r = audio_transfer_read_s16(p->actx, p->atype, buf, want, &got);
+         r = media_audio_read(p, buf, want, &got);
          if (got)
          {
             const int16_t *out = buf;
@@ -1801,8 +2306,14 @@ audio:
             MEDIA_CORE_PREFIX(audio_batch_cb)(out, got);
             p->apos += (int64_t)got;
          }
+         if (r == AUDIO_PROCESS_NEXT && !got) break;
          if (r != AUDIO_PROCESS_NEXT || !got)
          {
+            /* A demuxed progressive source can grow after this read.
+             * Keep its decoder and position until more bytes arrive. */
+            if ((r == AUDIO_PROCESS_NEXT || r == AUDIO_PROCESS_END)
+                  && media_audio_may_grow(p))
+               break;
             p->aeof = 1;
             break;
          }
@@ -1837,15 +2348,15 @@ static void media_native_pump(media_player_t *p)
                p->apkts_used + pkt.size))
             return;
          p->apkts = p->aark.base;
-         if (p->anpkts >= p->anpkts_cap)
+         if (!media_audio_packet_reserve(p)) return;
          {
-            size_t nc = p->anpkts_cap ? p->anpkts_cap * 2 : 4096;
-            uint32_t *ns;
-            if (!(ns = (uint32_t*)realloc(p->asizes,
-                  nc * sizeof(uint32_t))))
-               return;
-            p->asizes     = ns;
-            p->anpkts_cap = nc;
+            const rwebm_track *at = rwebm_get_track(p->wgather, p->atrack);
+            const int64_t maximum = (int64_t)((~(uint64_t)0) >> 1);
+            if (at->codec_delay_ns > (uint64_t)maximum
+                  || pkt.timestamp < -maximum + (int64_t)at->codec_delay_ns)
+            { p->atime_failed = 1; return; }
+            p->atimes[p->anpkts].pts = pkt.timestamp - (int64_t)at->codec_delay_ns;
+            p->atimes[p->anpkts].continued = pkt.timestamp_continuation;
          }
          memcpy(p->apkts + p->apkts_used, pkt.data, pkt.size);
          p->asizes[p->anpkts++] = (uint32_t)pkt.size;
@@ -1888,7 +2399,7 @@ static void media_native_pump(media_player_t *p)
        * after the fill has finished) */
       if (p->atype == AUDIO_TYPE_OPUS && p->atoc > 0)
       {
-         p->atotal = p->atoc - p->apreskip
+         p->atotal = p->atoc - media_audio_trim_frames(p)
             - (p->adiscard_ns * 48000 + 500000000) / 1000000000;
          if (p->atotal < 0)
             p->atotal = 0;
@@ -1940,15 +2451,9 @@ static void media_mp4_audio_pump(media_player_t *p)
             p->apkts_used + pkt.size))
          return;
       p->apkts = p->aark.base;
-      if (p->anpkts >= p->anpkts_cap)
-      {
-         size_t nc = p->anpkts_cap ? p->anpkts_cap * 2 : 4096;
-         uint32_t *ns;
-         if (!(ns = (uint32_t*)realloc(p->asizes, nc * sizeof(uint32_t))))
-            return;
-         p->asizes     = ns;
-         p->anpkts_cap = nc;
-      }
+      if (!media_audio_packet_reserve(p)) return;
+      p->atimes[p->anpkts].pts = pkt.timestamp;
+      p->atimes[p->anpkts].continued = 0;
       memcpy(p->apkts + p->apkts_used, pkt.data, pkt.size);
       p->asizes[p->anpkts++] = (uint32_t)pkt.size;
       p->apkts_used         += pkt.size;
@@ -1958,15 +2463,23 @@ static void media_mp4_audio_pump(media_player_t *p)
 #endif
       grew = 1;
    }
-   if (grew && p->actx)
+   if (grew)
    {
-      const rmp4_track *at = rmp4_get_track(p->agather, p->agtrack);
-      audio_transfer_set_demuxed_ptr(p->actx, p->atype,
-            at->codec_private, at->codec_private_size,
-            p->apkts, p->apkts_used, p->asizes, p->anpkts);
+      if (p->actx)
+      {
+         const rmp4_track *at = rmp4_get_track(p->agather, p->agtrack);
+         audio_transfer_set_demuxed_ptr(p->actx, p->atype,
+               at->codec_private, at->codec_private_size,
+               p->apkts, p->apkts_used, p->asizes, p->anpkts);
+      }
 #ifdef HAVE_ROPUS
+      /* Initial gathering can finish before a decoder exists. The
+       * playable total must not remain zero for a resident Opus track. */
       if (p->atype == AUDIO_TYPE_OPUS)
-         p->atotal = p->atoc - p->apreskip;
+      {
+         p->atotal = p->atoc - media_audio_trim_frames(p);
+         if (p->atotal < 0) p->atotal = 0;
+      }
 #endif
    }
 }
@@ -2101,6 +2614,7 @@ static bool media_load_mp4(media_player_t *p)
                 * presentation timeline.  For AAC it comes straight
                 * from the sample tables - no packet walk; for Opus it
                 * accumulates from each appended packet's TOC. */
+               p->atrim = at->media_skip;
                p->atotal = -1;
                if (p->atype == AUDIO_TYPE_AAC)
                   p->atotal = (int64_t)tcount * 1024
@@ -2126,6 +2640,7 @@ static bool media_load_mp4(media_player_t *p)
                         &p->ach, &p->arate, NULL)
                      && p->ach >= 1 && p->ach <= 2 && p->arate)
                {
+                  media_audio_trim_reset(p);
                   if (MEDIA_CORE_PREFIX(log_cb))
                      MEDIA_CORE_PREFIX(log_cb)(RETRO_LOG_INFO,
                         "[media] mp4 audio: %s, %u Hz, %u ch, "
@@ -2146,8 +2661,13 @@ static bool media_load_mp4(media_player_t *p)
                   p->actx = NULL;
                   data_transfer_arena_release(&p->aark);
                   free(p->asizes);
+                  free(p->atimes);
+                  p->atimes = NULL;
                   p->apkts  = NULL;
                   p->asizes = NULL;
+                  p->apkts_used = p->anpkts = p->anpkts_cap = 0;
+                  rmp4_close(p->agather);
+                  p->agather = NULL;
                }
             }
          }
@@ -2177,12 +2697,21 @@ static bool media_load_mp4(media_player_t *p)
    if (!p->mp4_hw_required && !media_hw_refresh
          && !media_make_framebuffer(p))
       return false;
-   p->silence_frames = (size_t)(MEDIA_AUDIO_RATE / p->fps) + 1;
+   p->silence_frames = (size_t)(media_audio_rate(p) / p->fps) + 1;
    p->frame_ns       = (int64_t)(1000000000.0 / p->fps + 0.5);
    p->silence = (int16_t*)calloc(p->silence_frames * 2, sizeof(int16_t));
    if (!p->silence)
       return false;
    rmp4_video_stream_set_output(p->mp4vs, p->fb);
+   {
+      const int64_t maximum = (int64_t)((~(uint64_t)0) >> 1);
+      int64_t span_ms = rmp4_video_stream_span_ms(p->mp4vs);
+      int64_t delay = rmp4_video_stream_presentation_delay_ns(p->mp4vs);
+      if (span_ms < 0 || span_ms > (maximum - p->frame_ns) / 1000000
+            || delay < 0 || delay > maximum - p->frame_ns - span_ms * 1000000)
+         return false;
+      p->vpts_ns = delay;
+   }
 
    if (MEDIA_CORE_PREFIX(log_cb))
       MEDIA_CORE_PREFIX(log_cb)(RETRO_LOG_INFO,
@@ -2403,6 +2932,7 @@ bool MEDIA_CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
             data_transfer_avail(p->dt), &need_more);
       if (!p->wgather)
          goto error;
+      rwebm_set_inert_callback(p->wgather, media_native_inert, p->dt);
 #ifdef MEDIA_HAVE_AUDIO
       if (p->atrack >= 0)
       {
@@ -2413,9 +2943,10 @@ bool MEDIA_CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
                | ((int64_t)at0->codec_private[11] << 8);
 #ifdef HAVE_RAAC
          if (p->atype == AUDIO_TYPE_AAC)
-            p->atrim = (at0->codec_delay_ns
-                  * (uint64_t)(at0->sample_rate ? at0->sample_rate
-                     : 48000) + 500000000) / 1000000000;
+            /* Gathered timestamps already subtract CodecDelay. AAC
+             * has no additional mandatory pre-skip like Opus; negative
+             * presentation samples are discarded by media_audio_read. */
+            p->atrim = 0;
 #endif
          p->atotal = -1;
       }
@@ -2448,6 +2979,7 @@ bool MEDIA_CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
                   &p->ach, &p->arate, NULL)
                && p->ach >= 1 && p->ach <= 2 && p->arate)
          {
+            media_audio_trim_reset(p);
             if (MEDIA_CORE_PREFIX(log_cb))
                MEDIA_CORE_PREFIX(log_cb)(RETRO_LOG_INFO,
                   "[media] audio: %s, %u Hz, %u ch.\n",
@@ -2465,6 +2997,8 @@ bool MEDIA_CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
             p->actx = NULL;
             data_transfer_arena_release(&p->aark);
             free(p->asizes);
+            free(p->atimes);
+            p->atimes = NULL;
             p->apkts  = NULL;
             p->asizes = NULL;
             p->atrack = -1;   /* the pump stops gathering it */
@@ -2525,7 +3059,7 @@ bool MEDIA_CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
    if (!p->webm_hw_required && !media_hw_refresh
          && !media_make_framebuffer(p))
       goto error;
-   p->silence_frames = (size_t)(MEDIA_AUDIO_RATE / p->fps) + 1;
+   p->silence_frames = (size_t)(media_audio_rate(p) / p->fps) + 1;
    p->frame_ns       = (int64_t)(1000000000.0 / p->fps + 0.5);
    /* pace from the first frame's timestamp, wherever the container
     * starts its clock */

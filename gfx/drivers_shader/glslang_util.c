@@ -611,61 +611,28 @@ bool glslang_read_shader_pragmas_cached(const char *path,
    }
 }
 
-#define GLSLANG_IDENT_CHAR(c) (   ((c) >= 'a' && (c) <= 'z') \
-                               || ((c) >= 'A' && (c) <= 'Z') \
-                               || ((c) >= '0' && (c) <= '9') \
-                               || (c) == '_')
-
-/* Whether @line holds @tok as a whole identifier. */
-static bool glslang_line_has_ident(const char *line,
-      const char *tok, size_t tok_len)
+void glslang_last_pass_init(const struct video_shader *shader,
+      void *cache, struct glslang_last_pass *state)
 {
-   const char *p = line;
-   while ((p = strstr(p, tok)))
-   {
-      if (   (p == line || !GLSLANG_IDENT_CHAR(p[-1]))
-          && !GLSLANG_IDENT_CHAR(p[tok_len]))
-         return true;
-      p++;
-   }
-   return false;
-}
-
-bool glslang_last_pass_needs_target(const struct video_shader *shader,
-      void *cache)
-{
-   size_t i, k;
-   unsigned last;
+   size_t k;
    const struct video_shader_pass *pass;
    struct shader_line_buf lines;
-   /* A pass reads the last pass's feedback by index or by name; the
-    * size semantics are matched too, so a pass that asks only for the
-    * size keeps the target it had. */
-   char tok[4][96];
-   size_t tok_len[4];
-   size_t num_tok    = 2;
-   char name[64];
-   void *own         = NULL;
-   bool found        = false;
-   bool needs        = true;
-
+   void *own = NULL;
+   bool scaled;
+   memset(state, 0, sizeof(*state));
    if (!shader || !shader->passes)
-      return false;
-
-   last = shader->passes - 1;
-   pass = &shader->pass[last];
-
-   if (!(pass->fbo.flags & FBO_SCALE_FLAG_VALID))
-      return false;
-   if (!GFX_FBO_SCALE_IS_VIEWPORT(&pass->fbo))
-      return true;
-
+      return;
+   state->index = shader->passes - 1;
+   pass = &shader->pass[state->index];
+   /* Without a scale the last pass draws at the viewport and takes no
+    * format, but may still read its own feedback. */
+   scaled = (pass->fbo.flags & FBO_SCALE_FLAG_VALID) != 0;
+   state->needs_target = true;
+   if (scaled && !GFX_FBO_SCALE_IS_VIEWPORT(&pass->fbo))
+      return;
    if (!cache && !(cache = own = glslang_include_cache_new()))
-      return true;
-
-   /* The preset's alias names the pass ahead of its '#pragma name'. */
-   strlcpy(name, pass->alias, sizeof(name));
-
+      return;
+   strlcpy(state->name, pass->alias, sizeof(state->name));
    if (!shader_line_buf_init(&lines))
       goto end;
    if (!glslang_read_shader_pragmas_cached(pass->source.path, &lines, cache))
@@ -673,67 +640,27 @@ bool glslang_last_pass_needs_target(const struct video_shader *shader,
       shader_line_buf_free(&lines);
       goto end;
    }
-   for (k = 0; k < lines.num_lines && !found; k++)
+   state->needs_target = false;
+   for (k = 0; k < lines.num_lines; k++)
    {
       const char *line = shader_line_buf_get(&lines, k);
       if (!line)
          continue;
-      if (!memcmp(line, "#pragma format ", sizeof("#pragma format ") - 1))
-         found = true;
-      if (     !name[0]
+      if (scaled && !memcmp(line, "#pragma format ", sizeof("#pragma format ") - 1))
+         state->needs_target = true;
+      if (!state->name[0]
             && !memcmp(line, "#pragma name ", sizeof("#pragma name ") - 1))
       {
-         const char *str = line + (sizeof("#pragma name ") - 1);
-         while (*str == ' ' || *str == '\t')
-            str++;
-         strlcpy(name, str, sizeof(name));
+         const char *name = line + sizeof("#pragma name ") - 1;
+         while (*name == ' ' || *name == '\t')
+            name++;
+         strlcpy(state->name, name, sizeof(state->name));
       }
    }
    shader_line_buf_free(&lines);
-   if (found)
-      goto end;
-
-   tok_len[0] = (size_t)snprintf(tok[0], sizeof(tok[0]),
-         "PassFeedback%u", last);
-   tok_len[1] = (size_t)snprintf(tok[1], sizeof(tok[1]),
-         "PassFeedbackSize%u", last);
-   if (name[0])
-   {
-      tok_len[2] = (size_t)snprintf(tok[2], sizeof(tok[2]),
-            "%sFeedback", name);
-      tok_len[3] = (size_t)snprintf(tok[3], sizeof(tok[3]),
-            "%sFeedbackSize", name);
-      num_tok    = 4;
-   }
-
-   for (i = 0; i < shader->passes; i++)
-   {
-      if (!shader_line_buf_init(&lines))
-         goto end;
-      if (!glslang_read_shader_file_cached(shader->pass[i].source.path,
-               &lines, true, false, cache))
-      {
-         shader_line_buf_free(&lines);
-         goto end;
-      }
-      for (k = 0; k < lines.num_lines && !found; k++)
-      {
-         size_t t;
-         const char *line = shader_line_buf_get(&lines, k);
-         if (!line || !strstr(line, "Feedback"))
-            continue;
-         for (t = 0; t < num_tok && !found; t++)
-            found = glslang_line_has_ident(line, tok[t], tok_len[t]);
-      }
-      shader_line_buf_free(&lines);
-      if (found)
-         goto end;
-   }
-
-   needs = false;
+   state->inspect_feedback = !state->needs_target;
 end:
    glslang_include_cache_free(own);
-   return needs;
 }
 
 static bool glslang_read_shader_file_internal(const char *path,
@@ -1257,4 +1184,114 @@ unsigned glslang_num_miplevels(unsigned width, unsigned height)
       return 0;
    /* One more level than the index of the highest set bit. */
    return compat_highbit_u32((uint32_t)size) + 1u;
+}
+
+/* Grow-buffer used to assemble stage source in C.  Returns false on
+ * allocation failure; the buffer is always left in a freeable state. */
+struct stage_source_buf
+{
+   char *data;
+   size_t len;
+   size_t cap;
+};
+
+static bool stage_source_append(struct stage_source_buf *buf,
+      const char *s, size_t s_len)
+{
+   if (buf->len + s_len + 1 > buf->cap)
+   {
+      char *grown;
+      size_t new_cap = buf->cap ? buf->cap : 4096;
+      while (buf->len + s_len + 1 > new_cap)
+         new_cap *= 2;
+      grown = (char*)realloc(buf->data, new_cap);
+      if (!grown)
+         return false;
+      buf->data = grown;
+      buf->cap  = new_cap;
+   }
+   memcpy(buf->data + buf->len, s, s_len);
+   buf->len            += s_len;
+   buf->data[buf->len]  = '\0';
+   return true;
+}
+
+static bool stage_source_append_line(struct stage_source_buf *buf,
+      const char *line)
+{
+   if (!stage_source_append(buf, line, strlen(line)))
+      return false;
+   return stage_source_append(buf, "\n", 1);
+}
+
+char *glslang_build_stage_source(
+      const struct shader_line_buf *lines, const char *stage)
+{
+   size_t i;
+   struct stage_source_buf buf;
+   bool active = true;
+
+   buf.data = NULL;
+   buf.len  = 0;
+   buf.cap  = 0;
+
+   if (!lines || lines->num_lines < 1)
+   {
+      if (!stage_source_append(&buf, "", 0))
+         return NULL;
+      return buf.data;
+   }
+
+   /* Reserve the full preprocessed length up front (lines->len counts
+    * every line plus separators), so assembly never reallocates - the
+    * same exact-fit reservation the std::string implementation made
+    * via str.reserve(lines->len). */
+   buf.data = (char*)malloc(lines->len + 2);
+   if (!buf.data)
+      return NULL;
+   buf.cap     = lines->len + 2;
+   buf.data[0] = '\0';
+
+   /* Version header (line 0). */
+   if (!stage_source_append_line(&buf, shader_line_buf_get(lines, 0)))
+      goto error;
+
+   for (i = 1; i < lines->num_lines; i++)
+   {
+      const char *line = shader_line_buf_get(lines, i);
+      if (!memcmp(line, "#pragma", sizeof("#pragma")-1))
+      {
+         if (!memcmp(line, "#pragma stage ", sizeof("#pragma stage ")-1))
+         {
+            if (stage && *stage)
+            {
+               char expected[128];
+               size_t _len = strlcpy_lit(expected, "#pragma stage ", sizeof(expected));
+               strlcpy(expected + _len, stage, sizeof(expected) - _len);
+               active = !strcmp(expected, line);
+            }
+         }
+         else if (
+                  !memcmp(line, "#pragma name ", sizeof("#pragma name ")-1)
+               || !memcmp(line, "#pragma format ", sizeof("#pragma format ")-1))
+         {
+            /* Ignore */
+         }
+         else if (active)
+         {
+            if (!stage_source_append_line(&buf, line))
+               goto error;
+         }
+      }
+      else if (active)
+      {
+         if (!stage_source_append_line(&buf, line))
+            goto error;
+      }
+   }
+   return buf.data;
+
+error:
+   free(buf.data);
+   return NULL;
 }

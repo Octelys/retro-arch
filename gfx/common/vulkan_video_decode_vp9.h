@@ -16,7 +16,7 @@ static int vvd_vp9_decode(void *dec, const uint8_t *packet, size_t length,
          || (unsigned)pic->header.w != d->coded.width
          || (unsigned)pic->header.h != d->coded.height
          || pic->header.profile != (int)d->vp9_profile.stdProfile
-         || pic->header.color_space < 0 || pic->header.color_space > 3
+         || pic->header.color_space < 0 || (pic->header.color_space > 3 && pic->header.color_space != 5)
          || (pic->header.bit_depth == 10) != (d->pixfmt == IMAGE_PIXFMT_P010)) return -1;
    ready = vvd_try_wait(d->tl, d->dcb_value[k]);
    if (ready) return ready;
@@ -61,7 +61,6 @@ static int vvd_vp9_decode(void *dec, const uint8_t *packet, size_t length,
 static bool vvd_vp9_open(void *user, const rvp9_hdr *header,
       unsigned slots, rvp9_hw_ops_t *ops)
 {
-   settings_t *settings = config_get_ptr();
    vvd_dec_t *d;
    VkVideoCapabilitiesKHR caps;
    VkVideoDecodeCapabilitiesKHR decode;
@@ -72,13 +71,12 @@ static bool vvd_vp9_open(void *user, const rvp9_hdr *header,
    memset(ops, 0, sizeof(*ops));
    if (!vvd.up || !header || slots < 10 || slots > VVD_MAX_SLOTS
          || !(vvd.codecs & VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR)
-         || (settings && settings->uints.video_hw_decode == VIDEO_HW_DECODE_OFF)
          || !((header->profile == 0 && header->bit_depth == 8)
             || (header->profile == 2 && header->bit_depth == 10))
          || header->subsampling_x != 1 || header->subsampling_y != 1
          || header->w <= 0 || header->h <= 0 || ((header->w | header->h) & 1)
          || header->frame_type || header->show_existing_frame
-         || header->color_space < 0 || header->color_space > 3) return false;
+         || header->color_space < 0 || (header->color_space > 3 && header->color_space != 5)) return false;
    vvd_grave_reap(false);
    for (lane = 0; lane < vvd.lanes; lane++)
       if (retro_atomic_cas_int(&vvd.lane_busy[lane], 0, 1)) break;

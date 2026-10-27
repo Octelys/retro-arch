@@ -484,6 +484,9 @@ typedef struct
    uint64_t free_samples_count;
 
    struct audio_record_source *record_source;
+#if defined(HAVE_RECORD_MEDIACODEC) || defined(RECORD_AUDIO_TAP_TEST)
+   struct record_audio_tap *record_tap;
+#endif
    struct string_list *devices_list;
    /* The driver whose device_list_new built devices_list, so that its
     * device_list_free is the one that releases it - not whichever
@@ -683,6 +686,9 @@ typedef struct
     * here rather than read from settings there; a changed setting
     * reaches it through the reinit that makes it real. */
    unsigned out_rate;
+   /* The latency, in ms, the threaded pipeline's ring was sized with;
+    * an input rate change resizes it with the same. */
+   unsigned pipe_latency;
    bool     core_multi;   /* the multi-channel entry was negotiated */
    /* Whether the ring carries float frames - the core negotiated float
     * output - or int16. Decided before any audio flows: at pipe init
@@ -722,6 +728,8 @@ typedef struct
     * pipe's target then, not just a frame. Consumer thread only after
     * init. */
    bool     pipe_priming;
+   bool     pipe_menu_active;
+   bool     pipe_menu_reset;
    /* Main thread: the publish waited for room since the last
     * audio_driver_publish_runloop(), which takes it into the snapshot */
    bool     writer_held;
@@ -809,6 +817,7 @@ typedef struct
     * frame the last feed left owing. */
    retro_time_t menu_feed_last;
    double menu_feed_frac;
+   bool menu_source_enabled;
 
    /* Rate-limit state for the DRC compute.
     *
@@ -1042,6 +1051,8 @@ typedef struct
     * it has acted on in pipe_fade_in_seen instead of clearing the mark,
     * so a mark published while it reads is never cleared unseen. */
    retro_atomic_size_t pipe_discard_to;
+   /* Later core publishes must survive the menu handover. */
+   retro_atomic_size_t pipe_menu_to;
    retro_atomic_int_t  pipe_discard_gen;
    int                 pipe_discard_seen;
    retro_atomic_size_t pipe_fade_in_at;
@@ -1240,6 +1251,9 @@ void audio_driver_pipeline_wake(void);
  **/
 void audio_driver_state_lock(void);
 void audio_driver_state_unlock(void);
+struct record_audio_tap;
+int audio_driver_record_tap_install(struct record_audio_tap *tap);
+bool audio_driver_record_tap_remove(struct record_audio_tap *tap);
 
 /* Bits of audio_driver_state_t::runloop_snapshot. */
 enum audio_runloop_snapshot_bits
@@ -1267,7 +1281,8 @@ enum audio_runloop_snapshot_bits
     * pipeline's publish waited for room in it: see
     * audio_driver_compute_rate_adjust() */
    AUDIO_SNAP_AUDIO_PACED   = (1 << 13),
-   AUDIO_SNAP_WRITER_HELD   = (1 << 14)
+   AUDIO_SNAP_WRITER_HELD   = (1 << 14),
+   AUDIO_SNAP_MENU_SOURCE   = (1 << 15)
 };
 
 /**
@@ -1324,13 +1339,42 @@ bool *audio_get_bool_ptr(enum audio_action action);
 #ifdef HAVE_AUDIOMIXER
 audio_mixer_stream_t *audio_driver_mixer_get_stream(unsigned i);
 
+/* Main-thread transport setup: snapshot initialized mixer output format.
+ * False with rate0/s16false when audio is unavailable. */
+bool audio_driver_mixer_prepare_format(unsigned *rate, bool *s16);
+
 bool audio_driver_mixer_add_stream(audio_mixer_stream_params_t *params);
+
+/* As add_stream, with a clock binding captured before the existing
+ * state lock is released. The static-pool voice stays addressable;
+ * compare its serial before using a later clock snapshot. Outputs
+ * are NULL/0 when no live voice was created. Ownership is unchanged. */
+bool audio_driver_mixer_add_stream_clocked(audio_mixer_stream_params_t *params,
+      audio_mixer_voice_t **voice, size_t *serial);
+
+/* Install a worker-prepared sound without reopening its decoder. Takes
+ * sound ownership on every outcome; params buffer/owner fields are ignored.
+ * Only playing states are accepted. Outputs are cleared on failure. Call
+ * on the main thread, as for add_stream_clocked. */
+bool audio_driver_mixer_add_prepared_stream(audio_mixer_stream_params_t *params,
+      audio_mixer_sound_t *sound, audio_mixer_voice_t **voice, size_t *serial);
+
+/* Session teardown: remove only the play captured at add_stream_clocked.
+ * Uses the existing stream-removal state lock, on the main thread. */
+void audio_driver_mixer_remove_stream_clocked(unsigned i,
+      audio_mixer_voice_t *voice, size_t serial);
 
 /* Compressed-byte read position of the stream in 'slot' (its
  * decoder's offset within the source buffer), or -1 when the slot
  * holds no live stream.  The windowed-source feeder's polling
  * input. */
 int64_t audio_driver_mixer_stream_byte_tell(unsigned i);
+
+/* Main-thread transport request; retains queued PCM and decoder state.
+ * The mixer applies it at the next block boundary without waiting. */
+void audio_driver_mixer_stream_set_repeat(unsigned i, bool repeat);
+void audio_driver_mixer_stream_set_paused(unsigned i, bool paused);
+
 
 /* Raise a windowed stream's resident prefix as its feeder slides the
  * window forward.  The mirror of audio_driver_mixer_stream_byte_tell. */
@@ -1386,6 +1430,9 @@ bool audio_compute_buffer_statistics(audio_statistics_t *stats);
 bool audio_driver_init_internal(void *data, bool audio_cb_inited);
 
 bool audio_driver_deinit(void);
+
+/* Retain mixer voices while replacing the core audio pipeline. */
+bool audio_driver_deinit_for_reinit(void);
 
 /* Rebuild audio_driver_st.devices_list from the driver that is, or
  * would be, in use. Does not require the driver to be initialised. */
@@ -1483,6 +1530,7 @@ extern audio_driver_t audio_tinyalsa;
 extern audio_driver_t audio_roar;
 extern audio_driver_t audio_openal;
 extern audio_driver_t audio_opensl;
+extern audio_driver_t audio_aaudio;
 extern audio_driver_t audio_jack;
 extern audio_driver_t audio_sdl1;
 extern audio_driver_t audio_sdl2;
@@ -1532,6 +1580,31 @@ audio_driver_state_t *audio_state_get_ptr(void);
  * reinit.
  **/
 void audio_driver_update_drc_threshold(audio_driver_state_t *audio_st);
+
+/**
+ * audio_driver_set_input_rate:
+ * @input              : the core's audio rate, as driver_adjust_system_rates
+ *                       derives it.
+ *
+ * Moves the running driver to a new input rate without reopening the
+ * device: a resampler for the new ratio, the threaded pipeline's pass
+ * and ring, and the rate control threshold. The consumer is parked
+ * while the state changes hands.
+ *
+ * Returns: false when the configuration needs the full reinit instead
+ * (a DSP filter, time stretch, a core audio callback or discrete extra
+ * channels); nothing is changed then.
+ **/
+bool audio_driver_set_input_rate(double input);
+
+/* Asked before a teardown: keep the device for the next init to take
+ * back, when that teardown is a content switch. A device the next init
+ * would open differently, or that nobody takes, is freed. Off with
+ * RETROARCH_AUDIO_KEEP=0 in the environment. */
+void audio_driver_keep_device(bool keep);
+
+/* Frees a kept device that was not taken back. */
+void audio_driver_drop_kept(void);
 
 const char *audio_driver_get_ident(void);
 
@@ -1595,6 +1668,10 @@ double audio_driver_get_sink_alt_ppm(void);
 bool audio_driver_get_device_clock_ppm(double *ppm);
 
 extern audio_driver_t *audio_drivers[];
+
+/* Takes a driver the platform turns out not to have out of
+ * audio_drivers[], before the configuration or the menu reads it. */
+void audio_driver_list_remove(const audio_driver_t *drv);
 
 RETRO_END_DECLS
 

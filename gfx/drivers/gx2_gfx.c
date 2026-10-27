@@ -56,8 +56,8 @@
 #include "gx2_shaders/tex.h"
 #include "gx2_shaders/sprite.h"
 #include "gx2_shaders/menu_shaders.h"
-#include "../../wiiu/system/memory.h"
-#include "../../wiiu/wiiu_dbg.h"
+#include "../../os/wiiu/system/memory.h"
+#include "../../os/wiiu/wiiu_dbg.h"
 
 #include "../font_driver.h"
 
@@ -2086,10 +2086,17 @@ static void gx2_update_uniform_block(wiiu_video_t *wiiu,
       if (string_is_equal(id, "SourceSize"))
       {
          GX2Surface *source   = (pass > 0) ? &wiiu->pass[pass - 1].texture.surface : &wiiu->texture.surface;
-         ((GX2_vec4 *)dst)->x = source->width;
-         ((GX2_vec4 *)dst)->y = source->height;
-         ((GX2_vec4 *)dst)->z = 1.0f / source->width;
-         ((GX2_vec4 *)dst)->w = 1.0f / source->height;
+         float w              = source->width;
+         float h              = source->height;
+         if (pass == 0 && wiiu->shader_preset->sim_source_dims)
+         {
+            w                 = VIDEO_SCALE_W(wiiu->shader_preset->sim_source_dims);
+            h                 = VIDEO_SCALE_H(wiiu->shader_preset->sim_source_dims);
+         }
+         ((GX2_vec4 *)dst)->x = w;
+         ((GX2_vec4 *)dst)->y = h;
+         ((GX2_vec4 *)dst)->z = 1.0f / w;
+         ((GX2_vec4 *)dst)->w = 1.0f / h;
          continue;
       }
 
@@ -2798,7 +2805,7 @@ static uint32_t gx2_get_flags(void *data)
    uint32_t flags = 0;
 
    BIT32_SET(flags, GFX_CTX_FLAGS_SCREENSHOTS_SUPPORTED);
-#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
    BIT32_SET(flags, GFX_CTX_FLAGS_SHADERS_SLANG);
 #endif
    /* A display per screen, one eye each */

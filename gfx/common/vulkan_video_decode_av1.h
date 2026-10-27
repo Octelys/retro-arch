@@ -14,7 +14,11 @@ static int vvd_av1_decode(void *decoder, const uint8_t *packet, size_t length,
    int ready;
    if (!sequence || !p ||
        memcmp(sequence, &d->av1_sequence, sizeof(*sequence)) ||
-       p->grain.params.apply || p->setup.size.width != d->coded.width ||
+       p->grain.params.apply ||
+#ifdef _WIN32
+       (vvd.av1_intrabc_broken && p->setup.allow_intrabc) ||
+#endif
+       p->setup.size.width != d->coded.width ||
        p->setup.size.upscaled_width != d->coded.width ||
        p->setup.size.height != d->coded.height)
       return -2;
@@ -96,10 +100,21 @@ static int vvd_av1_output(void *decoder, unsigned slot,
    return vvd_output(decoder, slot, frame);
 }
 
+/* Decode coded samples unchanged; importers use container source colour. */
+static bool vulkan_av1_color(const rav1_sequence_t *sequence)
+{
+   unsigned matrix = sequence->matrix_coefficients;
+   if (sequence->transfer_characteristics == 16 ||
+       sequence->transfer_characteristics == 18)
+      return (matrix == 1 || matrix == 2 || matrix == 9) &&
+         (sequence->color_primaries == 1 || sequence->color_primaries == 2 ||
+          sequence->color_primaries == 9);
+   return matrix == 1 || matrix == 2 || matrix == 5 || matrix == 6;
+}
+
 static bool vvd_av1_open(void *user, const rav1_sequence_t *sequence,
                          unsigned slots, rav1_hw_ops_t *ops)
 {
-   settings_t *settings = config_get_ptr();
    vulkan_av1_sequence_t mapped;
    vvd_dec_t *d;
    VkVideoCapabilitiesKHR caps;
@@ -114,16 +129,10 @@ static bool vvd_av1_open(void *user, const rav1_sequence_t *sequence,
    memset(ops, 0, sizeof(*ops));
    if (!vvd.up || slots < 9 || slots > VVD_MAX_SLOTS ||
        !(vvd.codecs & VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR) ||
-       (settings && settings->uints.video_hw_decode == VIDEO_HW_DECODE_OFF) ||
        !vulkan_av1_sequence(&mapped, sequence) ||
        sequence->film_grain_params_present ||
        ((sequence->max_width | sequence->max_height) & 1) ||
-       (sequence->matrix_coefficients != 1 &&
-        sequence->matrix_coefficients != 2 &&
-        sequence->matrix_coefficients != 5 &&
-        sequence->matrix_coefficients != 6) ||
-       sequence->transfer_characteristics == 16 ||
-       sequence->transfer_characteristics == 18)
+       !vulkan_av1_color(sequence))
       return false;
    vvd_grave_reap(false);
    for (lane = 0; lane < vvd.lanes; lane++)

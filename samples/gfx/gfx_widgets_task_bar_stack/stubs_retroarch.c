@@ -74,6 +74,11 @@
 #include "../../../configuration.h"
 #include "../../../msg_hash.h"
 
+#if defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__)
+bool stub_win32_modal_active;
+bool win32_message_modal_active(void) { return stub_win32_modal_active; }
+#endif
+
 /* --- singletons --- */
 static char s_video_state[1 << 16];
 video_driver_state_t *video_state_get_ptr(void)
@@ -138,6 +143,7 @@ bool font_driver_matches(const font_data_t *font,
  * send its batch out at the end of their frame. Nothing draws here. */
 static gfx_display_t stub_disp;
 gfx_display_t *disp_get_ptr(void) { return &stub_disp; }
+int menu_driver_media_startup_token(void) { return 0; }
 void gfx_display_flush_batch(gfx_display_t *p_disp) { (void)p_disp; }
 void gfx_display_blend_begin(gfx_display_ctx_driver_t *dispctx, void *data)
 { (void)dispctx; (void)data; }

@@ -64,10 +64,12 @@ typedef struct gfx_surface_player
    unsigned hw_slot;          /* the player's job a queued GPU frame is */
    bool rgba;
    bool threaded;             /* two slots, decoded on the worker */
+   bool hw_confirmed;         /* renderer accepted at least one GPU picture */
    bool hw_resent;            /* the frame in flight was sent again */
 } gfx_surface_player_t;
 
-/* Plays @stream (borrowed) into the surface *@surface names. */
+/* Plays @stream (borrowed) into the surface *@surface names. Main thread;
+ * snapshots the hardware-decode setting for this player's lifetime. */
 gfx_surface_player_t *gfx_surface_player_new(void *stream,
       enum image_type_enum type, int loop_count, void **surface,
       const gfx_surface_player_cbs_t *cb, unsigned flags);

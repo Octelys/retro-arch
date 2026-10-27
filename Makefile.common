@@ -246,8 +246,11 @@ OBJ += frontend/frontend_driver.o \
        ui/ui_companion_driver.o \
        camera/camera_driver.o \
        record/record_driver.o \
+       record/record_gpu_reinit.o \
        record/drivers/record_wav.o \
        record/drivers/record_nvenc.o \
+       record/drivers/record_metal.o \
+       record/drivers/record_mediacodec.o \
        command.o \
        msg_hash.o \
        intl/msg_hash_us.o \
@@ -340,6 +343,10 @@ OBJ += \
        gfx/gfx_surface.o \
        gfx/gfx_surface_player.o \
        gfx/gfx_thumbnail.o \
+       gfx/gfx_media_controls.o \
+       gfx/gfx_media_display.o \
+       gfx/gfx_media_player.o \
+       gfx/gfx_media_cpu.o \
        gfx/gfx_anim_preview.o \
        configuration.o \
        $(LIBRETRO_COMM_DIR)/dynamic/dylib.o \
@@ -524,7 +531,6 @@ OBJ += $(LIBRETRO_COMM_DIR)/formats/image_texture.o \
        $(LIBRETRO_COMM_DIR)/formats/image/image_yuv_blit.o
 
 ifeq ($(HAVE_IMAGEVIEWER), 1)
-   DEFINES += -DHAVE_IMAGEVIEWER
    OBJ += cores/libretro-imageviewer/image_core.o
 endif
 
@@ -668,8 +674,12 @@ endif
 
 ifeq ($(HAVE_BLUETOOTH), 1)
    OBJ += bluetooth/bluetooth_driver.o
-   OBJ += bluetooth/drivers/bluetoothctl.o
    OBJ += tasks/task_bluetooth.o
+   ifneq ($(findstring Win32,$(OS)),)
+      OBJ += bluetooth/drivers/windows_bt.o
+   else
+      OBJ += bluetooth/drivers/bluetoothctl.o
+   endif
    ifeq ($(HAVE_DBUS), 1)
       OBJ += bluetooth/drivers/bluez.o
    endif
@@ -1048,6 +1058,15 @@ endif
 ifeq ($(HAVE_MENU_COMMON), 1)
    OBJ += menu/menu_setting.o \
           menu/menu_driver.o \
+          menu/menu_media_controls.o \
+          gfx/gfx_media_subtitle.o \
+          tasks/task_subtitle.o \
+          $(LIBRETRO_COMM_DIR)/formats/subtitle/rsubtitle_srt.o \
+          $(LIBRETRO_COMM_DIR)/formats/subtitle/rsubtitle_vtt.o \
+          $(LIBRETRO_COMM_DIR)/formats/subtitle/rsubtitle_vtt_css.o \
+          $(LIBRETRO_COMM_DIR)/formats/subtitle/rsubtitle_vtt_css_tree.o \
+          $(LIBRETRO_COMM_DIR)/formats/subtitle/rsubtitle_vtt_selector.o \
+          menu/menu_media_browser.o \
           menu/menu_str.o \
           menu/cbs/menu_cbs_ok.o \
           menu/cbs/menu_cbs_cancel.o \
@@ -1131,6 +1150,16 @@ ifeq ($(HAVE_THREADS), 1)
    DEFINES += -DHAVE_THREADS
    ifeq ($(findstring Haiku,$(OS)),)
       LIBS += $(THREADS_LIBS)
+   endif
+else ifeq ($(OS), Win32)
+   ifneq ($(filter 1,$(HAVE_DSOUND) $(HAVE_XAUDIO) $(HAVE_WAVEOUT)),)
+      OBJ += $(LIBRETRO_COMM_DIR)/rthreads/rthreads.o \
+             $(LIBRETRO_COMM_DIR)/rthreads/retro_eventcount.o
+   endif
+else ifeq ($(OS), Darwin)
+   ifneq ($(filter 1,$(HAVE_COCOA) $(HAVE_COREAUDIO)),)
+      OBJ += $(LIBRETRO_COMM_DIR)/rthreads/rthreads.o \
+             $(LIBRETRO_COMM_DIR)/rthreads/retro_eventcount.o
    endif
 endif
 
@@ -1397,7 +1426,12 @@ endif
 ifeq ($(HAVE_WINUSB), 1)
    HAVE_HID=1
    DEFINES += -DHAVE_WINUSB
-   OBJ += input/drivers_hid/winusb_hid.o
+   OBJ += input/drivers_hid/winusb_hid.o \
+          input/drivers_hid/winusb_bind.o
+   ifeq ($(HAVE_WGI), 1)
+      DEFINES += -DHAVE_WGI
+      OBJ += input/drivers_hid/winusb_wgi.o
+   endif
 endif
 
 ifeq ($(HAVE_IOHIDMANAGER), 1)
@@ -1415,6 +1449,9 @@ ifeq ($(HAVE_HID), 1)
           input/connect/connect_psxadapter.o \
           input/connect/connect_ps3.o \
           input/connect/connect_ps4.o \
+          input/connect/connect_ps5.o \
+          input/connect/connect_switch_pro.o \
+          input/connect/connect_switch2_pro.o \
           input/connect/connect_ps4_hori_mini.o \
           input/connect/connect_wii.o \
           input/connect/connect_retrode.o \
@@ -1423,7 +1460,10 @@ ifeq ($(HAVE_HID), 1)
           input/connect/connect_wiiupro.o \
 	  input/connect/connect_kade.o \
 	  input/connect/connect_zerodelay_dragonrise.o \
-          input/connect/connect_wiiugca.o
+	  input/connect/connect_8bitdo.o \
+	  input/connect/connect_gamecube_pc.o \
+          input/connect/connect_wiiugca.o \
+          input/connect/connect_xid.o
 endif
 
 ifeq ($(HAVE_PARPORT), 1)
@@ -1490,7 +1530,8 @@ ifeq ($(HAVE_KMS), 1)
    HAVE_AND_WILL_USE_DRM = 1
    OBJ += gfx/drivers_context/drm_ctx.o \
 		  gfx/display_servers/dispserv_kms.o \
-		  gfx/common/drm_hdr.o
+		  gfx/common/drm_hdr.o \
+		  gfx/common/egl_gbm_frames.o
 
 ifeq ($(HAVE_ODROIDGO2), 1)
    OBJ += gfx/drivers_context/drm_go2_ctx.o
@@ -1643,13 +1684,29 @@ endif
 
 ifeq ($(HAVE_METAL), 1)
    DEFINES += -DHAVE_METAL
-   LIBS += -framework Metal -framework MetalKit -framework QuartzCore
+   LIBS += -framework Metal -framework MetalKit -framework QuartzCore -framework CoreVideo
+   ifneq ($(findstring 1, $(HAVE_RMP4) $(HAVE_RWEBM)),)
+      LIBS += -framework CoreMedia -framework VideoToolbox
+   endif
    # metal.m builds under both ARC and MRC (see the M_OBJC_* ownership
    # macros at the top of the file). The top-level Makefile still builds
    # it with a per-file -fobjc-arc override â€” ARC is the preferred mode
    # for the standalone object â€” but the griffin_objc.m unity TU may
    # compile it either way depending on the Xcode configuration.
    OBJ += gfx/drivers/metal.o
+   ifeq ($(HAVE_AVF), 1)
+      OBJ += record/record_gpu_queue.o \
+             record/record_audio_queue.o \
+             record/record_gpu_worker_vt.o \
+             record/record_avfoundation_worker.o \
+             record/record_avfoundation_session.o \
+             record/record_gpu_capture_metal.o \
+             record/record_mux_avfoundation.o \
+             record/record_gpu_session_metal.o \
+             record/record_gpu_dispatch_metal.o \
+             $(LIBRETRO_COMM_DIR)/formats/h265/rh265_sps_crop.o
+      LIBS += -framework CoreMedia -framework VideoToolbox -framework AudioToolbox
+   endif
 endif
 
 ifeq ($(HAVE_MFI), 1)
@@ -1766,8 +1823,6 @@ endif
 ifeq ($(HAVE_VULKAN), 1)
    ifneq ($(findstring Win32,$(OS)),)
       OBJ += gfx/drivers_context/w_vk_ctx.o
-      # Trivial temporary workaround for MinGW and glslang.
-      CXXFLAGS += -fpermissive
    endif
 
    CXXFLAGS += -Wno-switch -Wno-sign-compare -fno-strict-aliasing -Wno-reorder -Wno-parentheses
@@ -1776,9 +1831,48 @@ ifeq ($(HAVE_VULKAN), 1)
           gfx/common/vulkan_common.o \
           $(LIBRETRO_COMM_DIR)/vulkan/vulkan_symbol_wrapper.o
 
+   ifeq ($(ANDROID)$(HAVE_THREADS), 11)
+      OBJ += record/record_android_capture_device.o
+   endif
+
    # H.264/HEVC previews decoded on the GPU
-   ifeq ($(HAVE_RMP4), 1)
+   ifneq ($(findstring 1, $(HAVE_RMP4) $(HAVE_RWEBM)),)
       OBJ += gfx/common/vulkan_video_decode.o
+   endif
+
+   ifneq ($(filter 1,$(HAVE_RMP4) $(HAVE_RVP9) $(HAVE_RAV1) $(HAVE_RECORD_MEDIACODEC)),)
+      ifeq ($(ANDROID), 1)
+         OBJ += gfx/common/vulkan_android_device.o \
+                gfx/common/android_image_queue.o \
+                gfx/common/android_frame.o \
+                gfx/common/vulkan_android_image.o \
+                gfx/common/vulkan_android_sync.o \
+                gfx/common/vulkan_android_pipeline.o \
+                gfx/common/vulkan_android_submit.o \
+                gfx/common/vulkan_android_queue.o \
+                gfx/common/vulkan_android_cache_entry.o \
+                gfx/common/vulkan_android_cache.o
+         ifeq ($(HAVE_THREADS), 1)
+            OBJ += gfx/common/mediacodec_inventory.o \
+                   gfx/common/android_image_ndk.o \
+                   gfx/common/mediacodec_session.o \
+                   gfx/common/mediacodec_color.o \
+                   gfx/common/mediacodec_frame_export.o
+            ifeq ($(HAVE_RMP4), 1)
+               OBJ += gfx/common/mediacodec_hevc_packet.o \
+                      gfx/common/mediacodec_hevc_decoder.o \
+                      gfx/common/mediacodec_hevc_backend.o
+            endif
+            ifeq ($(HAVE_RVP9), 1)
+               OBJ += gfx/common/mediacodec_vp9_decoder.o \
+                      gfx/common/mediacodec_vp9_backend.o
+            endif
+            ifeq ($(HAVE_RAV1), 1)
+               OBJ += gfx/common/mediacodec_av1_decoder.o \
+                      gfx/common/mediacodec_av1_backend.o
+            endif
+         endif
+      endif
    endif
 
    ifeq ($(HAVE_SLANG), 1)
@@ -1809,6 +1903,13 @@ ifeq ($(HAVE_VULKAN), 1)
                  -Xlinker -rpath -Xlinker @executable_path/../Frameworks/MoltenVK.framework
       LIBS    += -framework Metal -framework QuartzCore
    endif
+endif
+
+# SPIR-V the Vulkan driver and the glcore driver with slang share
+ifeq ($(HAVE_VULKAN), 1)
+   OBJ += gfx/common/spirv_shaders.o
+else ifeq ($(HAVE_OPENGL_CORE)$(HAVE_SLANG), 11)
+   OBJ += gfx/common/spirv_shaders.o
 endif
 
 ifeq ($(HAVE_OPENGL_CORE), 1)
@@ -1908,7 +2009,7 @@ endif
 # H.264 previews decoded on the GPU, as rh264's backend; D3D12 imports
 # its frames as well
 ifneq ($(findstring 1, $(HAVE_D3D11) $(HAVE_D3D12)),)
-   ifeq ($(HAVE_RMP4), 1)
+   ifneq ($(findstring 1, $(HAVE_RMP4) $(HAVE_RWEBM)),)
       OBJ += gfx/common/d3d11_video_decode.o
    endif
 endif
@@ -1943,6 +2044,42 @@ ifeq ($(HAVE_D3D_COMMON), 1)
    OBJ     += gfx/common/d3d_common.o
 endif
 
+# Driver Pacing through NVAPI: the Direct3D drivers', and Vulkan's
+# when it presents through DXGI
+ifneq ($(findstring Win32,$(OS)),)
+   ifneq ($(findstring 1,$(HAVE_D3D_COMMON) $(HAVE_VULKAN)),)
+      OBJ += gfx/common/d3d_driver_pacing.o \
+             $(LIBRETRO_COMM_DIR)/gfx/nvidia/nvapi_loader.o
+   endif
+endif
+
+# Temporal Upscaler: DLSS Super Resolution through NGX, FSR through the
+# FidelityFX API and XeSS, each loaded at run time, for the Vulkan and
+# Direct3D 12 drivers
+ifneq ($(findstring 1,$(HAVE_VULKAN) $(HAVE_D3D12)),)
+   ifneq ($(findstring Win32,$(OS))$(findstring Linux,$(OS)),)
+      DEFINES += -DHAVE_TEMPORAL_UPSCALER
+      OBJ += gfx/video_upscaler.o \
+             gfx/common/ffx_common.o \
+             gfx/common/xess_common.o \
+             $(LIBRETRO_COMM_DIR)/gfx/nvidia/ngx_loader.o \
+             $(LIBRETRO_COMM_DIR)/gfx/amd/ffx_loader.o \
+             $(LIBRETRO_COMM_DIR)/gfx/intel/xess_loader.o
+      ifeq ($(HAVE_VULKAN), 1)
+         OBJ += gfx/common/vulkan_upscaler.o \
+                gfx/common/vulkan_ngx.o \
+                gfx/common/vulkan_ffx.o \
+                gfx/common/vulkan_xess.o
+      endif
+      ifeq ($(HAVE_D3D12), 1)
+         OBJ += gfx/common/d3d12_upscaler.o \
+                gfx/common/d3d12_ngx.o \
+                gfx/common/d3d12_ffx.o \
+                gfx/common/d3d12_xess.o
+      endif
+   endif
+endif
+
 ifeq ($(HAVE_CG), 1)
    DEFINES += -DHAVE_CG
    OBJ += gfx/drivers_shader/shader_gl_cg.o
@@ -1965,10 +2102,23 @@ ifeq ($(HAVE_SLANG),1)
    OBJ += gfx/drivers_shader/glslang_util.o
    OBJ += gfx/drivers_shader/slang_cache.o
    OBJ += gfx/drivers_shader/slang_rect.o
+   OBJ += gfx/drivers_shader/slang_blob.o
+endif
+
+ifeq ($(HAVE_RSLC),1)
+   DEFINES += -DHAVE_RSLC
+   OBJ += $(LIBRETRO_COMM_DIR)/gfx/shaders/rslc_front.o \
+          $(LIBRETRO_COMM_DIR)/gfx/shaders/rslc_ir.o \
+          $(LIBRETRO_COMM_DIR)/gfx/shaders/rslc_emit.o
 endif
 
 ifeq ($(HAVE_SHADERS_COMMON), 1)
    OBJ += gfx/video_shader_parse.o
+endif
+
+ifeq ($(HAVE_VIDEO_WINDOWS), 1)
+   DEFINES += -DHAVE_VIDEO_WINDOWS
+   OBJ += gfx/video_windows.o
 endif
 
 ifeq ($(HAVE_OPENXR), 1)
@@ -2036,39 +2186,13 @@ ifeq ($(HAVE_OPENXR), 1)
    $(addprefix $(OBJDIR)/,$(OPENXR_SOURCES:.cpp=.o)): CXXFLAGS += -std=gnu++17 -fno-exceptions
 endif
 
-ifeq ($(HAVE_BUILTINGLSLANG), 1)
+# glslang and SPIRV-Cross are the system's, and only when configure
+# was asked for them (--enable-glslang --enable-spirv_cross); rslc
+# compiles slang without them.
+ifeq ($(HAVE_GLSLANG), 1)
    NEED_CXX_LINKER = 1
-   HAVE_GLSLANG_COMMON = 1
-
-   ifneq ($(findstring Win32,$(OS)),)
-      GLSLANG_PLATFORM := Windows
-   else
-      GLSLANG_PLATFORM := Unix
-   endif
-
-   DEFINES += -DHAVE_BUILTINGLSLANG
-
-   INCLUDE_DIRS += \
-      -I$(DEPS_DIR)/glslang/glslang/glslang/OSDependent/$(GLSLANG_PLATFORM) \
-      -I$(DEPS_DIR)/glslang/glslang/OGLCompilersDLL \
-      -I$(DEPS_DIR)/glslang/glslang/glslang/MachineIndependent \
-      -I$(DEPS_DIR)/glslang/glslang/glslang/Public \
-      -I$(DEPS_DIR)/glslang/glslang/SPIRV
-
-   GLSLANG_SOURCES := \
-      gfx/drivers_shader/glslang.cpp \
-		$(DEPS_DIR)/glslang/glslang/SPIRV/GlslangToSpv.cpp \
-		$(DEPS_DIR)/glslang/glslang/SPIRV/InReadableOrder.cpp \
-		$(DEPS_DIR)/glslang/glslang/SPIRV/Logger.cpp \
-		$(DEPS_DIR)/glslang/glslang/SPIRV/SpvBuilder.cpp \
-      $(wildcard $(DEPS_DIR)/glslang/glslang/glslang/GenericCodeGen/*.cpp) \
-      $(wildcard $(DEPS_DIR)/glslang/glslang/OGLCompilersDLL/*.cpp) \
-      $(wildcard $(DEPS_DIR)/glslang/glslang/glslang/MachineIndependent/*.cpp) \
-      $(wildcard $(DEPS_DIR)/glslang/glslang/glslang/MachineIndependent/preprocessor/*.cpp) \
-      $(DEPS_DIR)/glslang/glslang/glslang/OSDependent/$(GLSLANG_PLATFORM)/ossource.cpp
-else ifeq ($(HAVE_GLSLANG),1)
-   HAVE_GLSLANG_COMMON = 1
-   GLSLANG_SOURCES := gfx/drivers_shader/glslang.cpp
+   DEFINES += -DHAVE_GLSLANG
+   OBJ += gfx/drivers_shader/glslang.o
 
    # The order of these libs are somewhat specific
    LIBS += $(GLSLANG_LIBS) \
@@ -2081,45 +2205,12 @@ else ifeq ($(HAVE_GLSLANG),1)
            $(GLSLANG_SPIRV_TOOLS_LIBS)
 endif
 
-ifeq ($(HAVE_GLSLANG_COMMON), 1)
-   DEFINES += -DHAVE_GLSLANG
-   OBJ += $(GLSLANG_SOURCES_C:.c=.o)
-   OBJ += $(GLSLANG_SOURCES:.cpp=.o)
-endif
-
 ifeq ($(HAVE_SPIRV_CROSS), 1)
    DEFINES += -DHAVE_SPIRV_CROSS
-# Default to the vendored (builtin) SPIRV-Cross unless it was explicitly
-# turned off via 'configure --disable-builtinspirv_cross', which writes
-# HAVE_BUILTINSPIRV_CROSS=0 to config.mk. An unset value (every platform
-# Makefile that sets HAVE_SPIRV_CROSS=1 directly, e.g. Makefile.wiiu) is
-# treated as builtin, so existing builds are unaffected. Note: griffin
-# console builds pull the vendored sources in via griffin_cpp.cpp guarded
-# by -DHAVE_SPIRV_CROSS and never reach this block.
-ifneq ($(HAVE_BUILTINSPIRV_CROSS), 0)
-   DEFINES += -DHAVE_BUILTINSPIRV_CROSS
-   INCLUDE_DIRS += -I$(DEPS_DIR)/SPIRV-Cross
-   OBJ += $(DEPS_DIR)/SPIRV-Cross/spirv_cross.o
-   OBJ += $(DEPS_DIR)/SPIRV-Cross/spirv_cfg.o
-   OBJ += $(DEPS_DIR)/SPIRV-Cross/spirv_glsl.o
-   OBJ += $(DEPS_DIR)/SPIRV-Cross/spirv_hlsl.o
-   OBJ += $(DEPS_DIR)/SPIRV-Cross/spirv_msl.o
-   OBJ += $(DEPS_DIR)/SPIRV-Cross/spirv_parser.o
-   OBJ += $(DEPS_DIR)/SPIRV-Cross/spirv_cross_parsed_ir.o
-   OBJ += $(DEPS_DIR)/SPIRV-Cross/spirv_cross_c.o
-   # The C API translation unit compiles its backend wrappers only
-   # when these are defined truthy.
-   DEFINES += -DSPIRV_CROSS_C_API_GLSL=1
-   DEFINES += -DSPIRV_CROSS_C_API_HLSL=1
-   DEFINES += -DSPIRV_CROSS_C_API_MSL=1
-   DEFINES += -DSPIRV_CROSS_C_API_CPP=0
-   DEFINES += -DSPIRV_CROSS_C_API_REFLECT=0
-else
    # slang_process.c is C: the header path must reach the C compiler too.
    CFLAGS   += $(SPIRV_CROSS_CFLAGS)
    CXXFLAGS += $(SPIRV_CROSS_CFLAGS)
    LIBS     += $(SPIRV_CROSS_LIBS)
-endif
 endif
 
 ifeq ($(WANT_WGL), 1)
@@ -2161,6 +2252,17 @@ ifeq ($(HAVE_RRAR),1)
    OBJ += $(LIBRETRO_COMM_DIR)/file/archive_file_rar.o \
           $(LIBRETRO_COMM_DIR)/formats/rar/rrar_archive.o \
           $(LIBRETRO_COMM_DIR)/formats/rar/rrar_ppmd7.o
+else ifeq ($(HAVE_7ZIP),1)
+   # 7z's PPMd shares the RAR reader's model.
+   OBJ += $(LIBRETRO_COMM_DIR)/formats/rar/rrar_ppmd7.o
+endif
+
+# The built-in bzip2 decoder: one C file, no dependency.
+HAVE_RBZIP2 ?= 1
+ifeq ($(HAVE_RBZIP2),1)
+   DEFINES += -DHAVE_RBZIP2
+   OBJ += $(LIBRETRO_COMM_DIR)/encodings/encoding_rbzip2.o \
+          $(LIBRETRO_COMM_DIR)/file/archive_file_bz2.o
 endif
 
 # The built-in Zstandard codec: one C file, no dependency.
@@ -2423,6 +2525,13 @@ ifeq ($(HAVE_RWEBM), 1)
    OBJ += $(LIBRETRO_COMM_DIR)/formats/webm/rwebm.o \
           $(LIBRETRO_COMM_DIR)/formats/webm/rwebm_video.o \
           $(LIBRETRO_COMM_DIR)/formats/webm/rwebm_audio.o
+ifneq ($(HAVE_RMP4), 1)
+   OBJ += $(LIBRETRO_COMM_DIR)/formats/h264/rh264.o \
+          $(LIBRETRO_COMM_DIR)/formats/h265/rh265.o
+ifneq ($(HAVE_RVP9), 1)
+   OBJ += $(LIBRETRO_COMM_DIR)/formats/image/image_hdr_blit.o
+endif
+endif
    # The row-band splitter the video blits run through; the mp4 block
    # adds it when building without webm.
    OBJ += $(LIBRETRO_COMM_DIR)/formats/image/image_blit_bands.o
@@ -2687,8 +2796,8 @@ ifeq ($(HAVE_NETWORKING), 1)
       INCLUDE_DIRS += -Ideps/rcheevos/include
 
       # rc_compat carries native recursive mutexes for the consoles
-      # that build threaded (GEKKO, 3DS, WiiU, Vita), so only a
-      # thread-less build compiles the locks out.
+      # that build threaded, so only a thread-less build compiles
+      # the locks out.
       ifneq ($(HAVE_THREADS), 1)
          DEFINES += -DRC_NO_THREADS
       endif
@@ -2715,7 +2824,6 @@ ifeq ($(HAVE_NETWORKING), 1)
              deps/rcheevos/src/rcheevos/runtime_progress.o \
              deps/rcheevos/src/rcheevos/trigger.o \
              deps/rcheevos/src/rcheevos/value.o \
-             deps/rcheevos/src/rhash/aes.o \
              deps/rcheevos/src/rhash/cdreader.o \
              deps/rcheevos/src/rhash/hash.o \
              deps/rcheevos/src/rhash/hash_disc.o \
@@ -2727,11 +2835,34 @@ ifeq ($(HAVE_NETWORKING), 1)
              deps/rcheevos/src/rapi/rc_api_runtime.o \
              deps/rcheevos/src/rapi/rc_api_user.o \
 
-      # RVZ/WIA disc image support for RetroAchievements
+      # RVZ disc images for RetroAchievements: formats/rvz, which takes
+      # Zstandard for the groups and AES to encrypt the Wii partitions
+      # again. A build without the crypto library gets its AES alone,
+      # crypto.o without the rest of the library or HAVE_CRYPTO.
       HAVE_CHEEVOS_RVZ ?= $(if $(filter 1,$(HAVE_RZSTD)),1,0)
       ifeq ($(HAVE_CHEEVOS_RVZ), 1)
          DEFINES += -DHAVE_CHEEVOS_RVZ
-         OBJ += cheevos/cheevos_rvz.o
+         OBJ += $(LIBRETRO_COMM_DIR)/formats/rvz/rvz.o
+         # bzip2 groups, decoded as the archive layer does
+         ifneq ($(HAVE_RBZIP2), 1)
+            OBJ += $(LIBRETRO_COMM_DIR)/encodings/encoding_rbzip2.o
+         endif
+         ifneq ($(HAVE_CRYPTO), 1)
+            OBJ += $(LIBRETRO_COMM_DIR)/crypto/crypto.o
+         endif
+         # LZMA and LZMA2 groups, decoded as the 7z backend does
+         ifneq ($(HAVE_7ZIP), 1)
+            OBJ += $(LIBRETRO_COMM_DIR)/formats/7z/r7z_lzma_stream.o \
+                   $(LIBRETRO_COMM_DIR)/formats/7z/r7z_lzma2.o
+         endif
+      endif
+
+      # The hashes' AES (3DS titles) is the crypto library's wherever
+      # crypto.o is built, rcheevos' own elsewhere.
+      ifneq ($(filter 1,$(HAVE_CRYPTO) $(HAVE_CHEEVOS_RVZ)),)
+         OBJ += cheevos/cheevos_aes.o
+      else
+         OBJ += deps/rcheevos/src/rhash/aes.o
       endif
 
       ifeq ($(HAVE_LUA), 1)
@@ -3030,11 +3161,10 @@ ifeq ($(HAVE_RETRONFS), 1)
               $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation_nfs.o
 endif
 
-# The background prefetcher the network backends read through; once,
-# whichever of them are built.
-ifneq (,$(filter 1,$(HAVE_RETRONFS) $(HAVE_RETROSMB) $(HAVE_SMBCLIENT)))
-   OBJ += $(LIBRETRO_COMM_DIR)/vfs/vfs_prefetch.o
-endif
+# The background prefetcher the network backends read through, built
+# always: statically linked cores read ahead through it too. Without
+# HAVE_THREADS it is stubs.
+OBJ += $(LIBRETRO_COMM_DIR)/vfs/vfs_prefetch.o
 
 # The built-in SMB2/3 client (libretro-common/net/net_smb2.c) stands in
 # for libsmb2: the same HAVE_SMBCLIENT surface for the menu, VFS and
@@ -3235,4 +3365,27 @@ ifeq ($(HAVE_WEBSOCKET_SERVER), 1)
          LIBS += -lwebsockets
       endif
    endif
+endif
+
+ifeq ($(HAVE_RECORD_MEDIACODEC), 1)
+   ifneq ($(ANDROID)$(HAVE_VULKAN)$(HAVE_THREADS)$(HAVE_CONFIGFILE), 1111)
+      $(error MediaCodec recording requires Android, Vulkan, threads and config files)
+   endif
+   DEFINES += -DHAVE_RECORD_MEDIACODEC
+   MEDIA_RECORD_OBJ := record/record_mediacodec_encoder.o \
+      record/record_audio_tap.o \
+      record/record_mux_mediacodec.o record/record_mediacodec_worker.o \
+      record/record_aac_probe.o \
+      record/record_mp4_audio_edit.o record/record_mediacodec_file_edit.o \
+      record/record_mediacodec_surface.o record/record_mediacodec_file.o \
+      record/record_session_mediacodec.o record/record_dispatch_mediacodec.o \
+      record/record_gpu_dispatch_mediacodec.o record/record_mediacodec_gpu_worker.o \
+      record/record_android_capture_config.o record/record_android_capture_request.o \
+      record/record_android_capture_images.o record/record_android_capture_submit.o \
+      record/record_android_capture_pipe.o record/record_android_capture_pool.o \
+      record/record_android_capture_ops.o record/record_android_capture_egl.o \
+      record/record_android_capture_gl.o record/record_android_capture_draw.o \
+      record/record_gpu_queue.o record/record_audio_queue.o
+   MEDIA_RECORD_OBJ := $(filter-out $(OBJ),$(MEDIA_RECORD_OBJ))
+   OBJ += $(MEDIA_RECORD_OBJ)
 endif

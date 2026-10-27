@@ -436,7 +436,17 @@ enum display_flags
     * itself: the views are laid out flat, whatever the stereo mode. */
    GFX_CTX_FLAGS_VIDEO_VIEWS_OWN_EYES,
    /* Set while such a driver shows both eyes. */
-   GFX_CTX_FLAGS_VIDEO_VIEWS_STEREO
+   GFX_CTX_FLAGS_VIDEO_VIEWS_STEREO,
+   /* This context cannot give a hardware core a context of its own
+    * that shares objects with the driver's: the platform has one GL
+    * context per process (the Switch's nvservices), or the share
+    * context could not be created. The threaded wrapper's ring then
+    * hands the driver's one context between the two threads instead
+    * of giving the core a shared one. */
+   GFX_CTX_FLAGS_NO_SHARED_CONTEXT,
+   /* Set by a video driver that presents secondary screens in windows
+    * of their own through its context's gfx_ctx_window_driver_t. */
+   GFX_CTX_FLAGS_VIDEO_WINDOWS
 };
 
 enum shader_uniform_type

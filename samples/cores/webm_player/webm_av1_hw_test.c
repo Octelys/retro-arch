@@ -9,6 +9,7 @@ static unsigned taken, stopped, ticks, ready, sink_busy, decode_busy,
 static video_hw_frame_t held, retry;
 static const char *fixture_path;
 static unsigned container;
+static unsigned first_display;
 static uint64_t pcm_frames, pcm_nonzero;
 static uint32_t pcm_hash;
 #define CHECK(c)                                                               \
@@ -111,7 +112,9 @@ static void close_backend(rav1_hw_ops_t *ops)
    closed++;
    release((mock_t *)ops->decoder);
 }
-static const rav1_hw_backend_t backend = {NULL, open_backend, close_backend};
+static const rav1_hw_backend_t backend = {
+   NULL, open_backend, close_backend, false, NULL, NULL
+};
 
 static bool sink(void *user, const video_hw_frame_t *frame)
 {
@@ -132,6 +135,8 @@ static bool sink(void *user, const video_hw_frame_t *frame)
    if (held.image)
       video_hw_frame_abandon(&held);
    held = *frame;
+   if (!first_display)
+      first_display = (unsigned)media_player.vshown;
    taken++;
    return true;
 }
@@ -258,6 +263,7 @@ static void test_container(void)
    }
    rav1_set_hw_backend(&backend);
    ready = 1;
+   first_display = 0;
    decode_busy = output_busy = sink_busy = 2;
    for (i = 0; i < 32 && !stopped; i++)
    {
@@ -268,6 +274,8 @@ static void test_container(void)
          CHECK(accepted == decoded);
    }
    CHECK(stopped && taken && ticks && !media_player.hw_frame.image);
+   if (!container)
+      CHECK(first_display == 1);
    unload();
    before = taken;
    if (!load())
@@ -318,6 +326,20 @@ static void test_container(void)
       CHECK(media_player.hw_video && media_player.vshown == 1);
       unload();
    }
+   if (!load())
+      goto done;
+   sink_busy = 100;
+   retro_run();
+   CHECK(media_player.hw_video && media_player.hw_frame.image);
+   before = abandoned;
+   ready = 0;
+   retro_run();
+   CHECK(stopped && !media_player.hw_video && !media_player.hw_frame.image);
+   CHECK(abandoned > before && !media_player.fb);
+   memset(&retry, 0, sizeof(retry));
+   unload();
+   ready = 1;
+   sink_busy = 0;
    refuse = 1;
    if (!load())
       goto done;

@@ -558,7 +558,7 @@ def expected_status(driver, settings):
 
 
 def wait_for_views(p, d, timeout=60):
-    """Wait for a Wine launch to reach the core before timing the case."""
+    """Wait for initialization to reach the core before timing the case."""
     deadline = time.monotonic() + timeout
     while p.poll() is None:
         for name in ('run.log', 'retroarch.log'):
@@ -566,10 +566,30 @@ def wait_for_views(p, d, timeout=60):
             if os.path.exists(path):
                 with open(path, errors='replace') as f:
                     if STATUS_RE.search(f.read()):
-                        return
+                        return True
         if time.monotonic() >= deadline:
-            return
+            return False
         time.sleep(0.1)
+
+
+
+def startup_stack(p, d):
+    """Keep the native initialization fault site before terminating a case."""
+    if WINE or not XVFB or os.name != 'posix' or p.poll() is not None:
+        return
+    debugger = shutil.which('gdb')
+    if not debugger:
+        return
+    command = [debugger, '-batch', '-ex', 'set pagination off',
+               '-ex', 'thread apply all bt', '-p', str(p.pid)]
+    if os.environ.get('GITHUB_ACTIONS') == 'true' and os.geteuid() != 0:
+        command = ['sudo', '-n'] + command
+    with open(os.path.join(d, 'startup-stack.log'), 'w') as log:
+        try:
+            subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
+                           timeout=15)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            log.write(str(error) + '\n')
 
 
 def last_status(d):
@@ -638,6 +658,9 @@ def isolated_env():
     env = {k: v for k, v in os.environ.items() if k not in DESKTOP_ENV}
     env['XDG_RUNTIME_DIR'] = tempfile.mkdtemp(
         prefix='ra-e2e-', dir=os.environ.get('RA_E2E_RUNTIME_BASE', '/tmp'))
+    # Unset means autolaunch, not no session bus.
+    env['DBUS_SESSION_BUS_ADDRESS'] = 'unix:path=' + os.path.join(
+        env['XDG_RUNTIME_DIR'], 'no-session-bus')
     return env
 
 
@@ -707,13 +730,79 @@ def free_display():
 WM_DRIVERS = ('sdl',)
 
 
+def wm_ready_probe(timeout=10):
+    """Require the WM to manage a new client, not just publish its identity."""
+    x11 = ctypes.CDLL('libX11.so.6')
+    pointer, window_type = ctypes.c_void_p, ctypes.c_ulong
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XOpenDisplay.restype = pointer
+    x11.XDefaultRootWindow.argtypes = [pointer]
+    x11.XDefaultRootWindow.restype = window_type
+    x11.XCreateSimpleWindow.argtypes = [
+        pointer, window_type, ctypes.c_int, ctypes.c_int,
+        ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, window_type, window_type]
+    x11.XCreateSimpleWindow.restype = window_type
+    for name in ('XMapWindow', 'XDestroyWindow'):
+        getattr(x11, name).argtypes = [pointer, window_type]
+    for name in ('XFlush', 'XCloseDisplay'):
+        getattr(x11, name).argtypes = [pointer]
+    display = x11.XOpenDisplay(os.environ['DISPLAY'].encode())
+    if not display:
+        return 1
+    window = x11.XCreateSimpleWindow(
+        display, x11.XDefaultRootWindow(display), 0, 0, 32, 32, 0, 0, 0)
+    try:
+        x11.XMapWindow(display, window)
+        x11.XFlush(display)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = subprocess.run(
+                ['xprop', '-id', hex(window), 'WM_STATE'],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=3, text=True)
+            if state.returncode == 0 and 'window state: Normal' in state.stdout:
+                return 0
+            time.sleep(0.02)
+        return 1
+    finally:
+        x11.XDestroyWindow(display, window)
+        x11.XCloseDisplay(display)
+
+
 def wm_start(env):
     """openbox on env's display."""
     p = subprocess.Popen(['openbox'], stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, env=env,
                          start_new_session=True)
-    time.sleep(0.5)
-    return p
+    deadline = time.monotonic() + 30
+    try:
+        while p.poll() is None and time.monotonic() < deadline:
+            # A probe that is slow to answer on a loaded runner, with
+            # the other cases' servers and players beside it, is not an
+            # answer: ask again until the deadline.
+            try:
+                probe = subprocess.run(
+                    ['xprop', '-root', '_NET_SUPPORTING_WM_CHECK'], env=env,
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    timeout=5, text=True)
+            except subprocess.TimeoutExpired:
+                continue
+            if probe.returncode == 0 and 'window id #' in probe.stdout:
+                ready = subprocess.run(
+                    [sys.executable, os.path.abspath(__file__), '--wm-ready'],
+                    env=env, timeout=max(0.1, deadline - time.monotonic()))
+                if ready.returncode == 0 and p.poll() is None:
+                    return p
+            time.sleep(0.05)
+        raise RuntimeError('openbox did not become ready on ' + env['DISPLAY'])
+    except BaseException:
+        p.terminate()
+        try:
+            p.wait(5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+        raise
 
 
 def release_display(display):
@@ -731,10 +820,20 @@ def xvfb_start(env):
                          stderr=subprocess.DEVNULL, env=env,
                          start_new_session=True)
     deadline = time.time() + 10
-    while (time.time() < deadline
+    while (p.poll() is None and time.time() < deadline
            and not os.path.exists('/tmp/.X11-unix/X%d' % n)):
         time.sleep(0.1)
     time.sleep(0.5)
+    if p.poll() is not None or not os.path.exists('/tmp/.X11-unix/X%d' % n):
+        if p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+        release_display(':%d' % n)
+        raise RuntimeError('Xvfb did not become ready on :%d' % n)
     return p, ':%d' % n
 
 
@@ -902,7 +1001,17 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
     if XVFB:
         xvfb, env['DISPLAY'] = xvfb_start(env)
         if driver in WM_DRIVERS:
-            wm = wm_start(env)
+            # sdl12-compat otherwise creates a GL renderer on Xvfb.
+            env['SDL_RENDER_DRIVER'] = 'software'
+            env['SDL_FRAMEBUFFER_ACCELERATION'] = '0'
+            try:
+                wm = wm_start(env)
+            except Exception:
+                xvfb.terminate()
+                xvfb.wait(5)
+                release_display(env['DISPLAY'])
+                shutil.rmtree(env['XDG_RUNTIME_DIR'], ignore_errors=True)
+                raise
         cmd = cmd[cmd.index('--') + 1:]
     if WINE:
         env['WINEPREFIX'] = wine_prefix()
@@ -919,8 +1028,8 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
                          env=env, start_new_session=True)
     shot = None
     try:
-        if WINE:
-            wait_for_views(p, d)
+        if not wait_for_views(p, d):
+            startup_stack(p, d)
         if gpu is None:
             wait_settled(p, d, expected_status(driver, settings))
         settle = time.time() + 5
@@ -1571,6 +1680,8 @@ def driver_jobs(retroarch, root, driver):
 
 
 def main():
+    if len(sys.argv) == 2 and sys.argv[1] == '--wm-ready':
+        return wm_ready_probe()
     if sys.argv[1:2] == ['--pointer']:
         return pointer_helper(sys.argv[2])
     if len(sys.argv) < 4:

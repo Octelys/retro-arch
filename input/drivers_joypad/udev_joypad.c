@@ -24,6 +24,7 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <poll.h>
 #include <libudev.h>
 #if defined(__linux__)
@@ -44,6 +45,9 @@
 #include "../input_driver.h"
 #include "../common/linux_not_joystick.h"
 #include "../common/output_writer.h"
+#include "../common/linux_pad_members.h"
+#include "../common/input_ignore_devices.h"
+#include "../common/linux_pad_leds.h"
 
 #include "../../configuration.h"
 #include "../../config.def.h"
@@ -91,7 +95,10 @@ struct udev_joypad
     * identification strings, the keycode maps and the sensor state -
     * touched at hotplug and on the rare sensor read - trail behind. */
    int fd;
-   uint64_t buttons;
+   /* the buttons, the hats' directions and the first axes as the reads
+    * answer them, kept with each event: lent to the frontend's readers
+    * between two polls, nothing copied */
+   input_pad_view_t view;
    int8_t hats[NUM_HATS][2];
    int16_t axes[NUM_AXES];
    /* Deal with analog triggers that report -32767 to 32767 */
@@ -116,6 +123,13 @@ struct udev_joypad
 
    char ident[NAME_MAX_LENGTH];
    char phys[NAME_MAX_LENGTH];
+   /* the pad's HID device, which its other nodes share */
+   char hid_syspath[256];
+   /* the device its lights are under: the HID device, or an Xbox 360
+    * pad's USB device (xpad) */
+   char led_scope[256];
+   uint8_t led_count;   /* lights found for the writer */
+   uint8_t led_tries;   /* looks for them while there are none */
 
    /* Sensor (IMU) support: sibling evdev node for accelerometer/gyroscope */
    int sensor_fd;
@@ -135,6 +149,14 @@ struct udev_joypad
    bool usb;
    uint8_t pressure_axis;
    int pressure_fd;
+
+   /* A DualShock 4's or DualSense's touchpad: a sibling evdev node of
+    * its own, its first two multitouch slots read into the view */
+   int touch_fd;
+   char *touch_path;
+   int32_t touch_min[2];
+   int32_t touch_span[2];
+   uint8_t touch_slot;
 };
 
 struct joypad_udev_entry
@@ -336,8 +358,8 @@ static void udev_rumble_write(unsigned p)
                   effect, p);
             continue;
          }
-         o->due[effect] = strength
-            ? udev_rumble_now() + UDEV_RUMBLE_REFRESH_MS : 0;
+         /* from the pass's own clock, read before anything went */
+         o->due[effect] = strength ? now + UDEV_RUMBLE_REFRESH_MS : 0;
       }
       o->playing[effect] = strength;
       if (!strength)
@@ -347,6 +369,10 @@ static void udev_rumble_write(unsigned p)
 
 /* On the writer's thread, after each wake; at the last, what it wrote
  * to is its own to close. */
+static void udev_led_write(unsigned p);
+static void udev_led_close_all(void);
+static void udev_led_init(void);
+
 static void udev_rumble_writer_cb(void *userdata, bool last)
 {
    unsigned p;
@@ -354,9 +380,13 @@ static void udev_rumble_writer_cb(void *userdata, bool last)
    if (!last)
    {
       for (p = 0; p < MAX_USERS; p++)
+      {
          udev_rumble_write(p);
+         udev_led_write(p);
+      }
       return;
    }
+   udev_led_close_all();
    for (p = 0; p < MAX_USERS; p++)
    {
       if (udev_rumble_out[p].fd >= 0)
@@ -457,15 +487,24 @@ static void udev_rumble_start(void)
       retro_atomic_store_release_int(&udev_rumble_want_gain[p], -1);
       retro_atomic_store_release_int(&udev_rumble_want[p], 0);
    }
+   udev_led_init();
    udev_rumble_writer = input_output_writer_new_timed(udev_rumble_writer_cb,
          udev_rumble_timeout, NULL);
 }
 
+static void udev_led_detach(unsigned p);
+
 static void udev_rumble_stop(void)
 {
    unsigned p;
+   bool writer = udev_rumble_writer != NULL;
    input_output_writer_free(udev_rumble_writer);
    udev_rumble_writer = NULL;
+   /* the writer's last call closed its lights */
+   if (!writer)
+      udev_led_close_all();
+   for (p = 0; p < MAX_USERS; p++)
+      udev_led_detach(p);
    udev_rumble_next   = 0;
    for (p = 0; p < MAX_USERS; p++)
    {
@@ -476,6 +515,276 @@ static void udev_rumble_stop(void)
          close(udev_rumble_out[p].fd);
       udev_rumble_out[p].fd = -1;
    }
+}
+
+
+/* Player lights, through the pad's LED class devices (linux_pad_leds.h).
+ *
+ * Writing one can wait on the pad: a Switch pad's is a request it
+ * answers. So the lights are written by the rumble writer, as rumble
+ * is. When a pad arrives its lights are found and opened here, and
+ * each descriptor is left in a slot for the writer, packed with which
+ * light it is; the player wanted is an atomic of its own. A pad that
+ * goes empties its slots and raises the rumble generation, at which
+ * the writer closes what it holds. The player wanted is kept by port
+ * slot, pad or not: the frontend tells every slot, so a pad that
+ * arrives is lit as it starts.
+ *
+ * The files are root's unless a udev rule gives them to the user; a
+ * pad whose lights cannot be opened is left as it is. */
+#define UDEV_LEDS_MAX           8
+/* a light bar's multi_intensity, which goes with its brightness */
+#define UDEV_LED_RGB_INTENSITY  15
+#define UDEV_LED_PACK(fd, led, n) (((fd) << 8) | ((led) << 4) | (n))
+
+struct udev_led_out
+{
+   int     gen;                 /* the pad generation it is for */
+   int     applied;             /* the player written, -2 for none */
+   bool    lit;                 /* lights this driver lit */
+   bool    has_players;
+   uint8_t count;
+   uint8_t led[UDEV_LEDS_MAX];
+   uint8_t n[UDEV_LEDS_MAX];
+   int     fd[UDEV_LEDS_MAX];
+};
+
+static struct udev_led_out udev_led_out[MAX_USERS];
+/* where the lights are listed; a test's directory in its place */
+static const char *udev_led_dir = "/sys/class/leds";
+static retro_atomic_int_t udev_led_slot[MAX_USERS][UDEV_LEDS_MAX];
+static retro_atomic_int_t udev_led_want[MAX_USERS];
+
+static void udev_led_out_reset(struct udev_led_out *o, int gen)
+{
+   unsigned i;
+   for (i = 0; i < o->count; i++)
+      close(o->fd[i]);
+   memset(o, 0, sizeof(*o));
+   o->gen     = gen;
+   o->applied = -2;
+}
+
+static void udev_led_write_one(int fd, const char *text)
+{
+   ssize_t len = (ssize_t)strlen(text);
+   if (lseek(fd, 0, SEEK_SET) < 0 || write(fd, text, len) != len)
+      RARCH_DBG("[udev] A player light was not written: %s.\n",
+            strerror(errno));
+}
+
+/* On the writer's thread; on the frontend's only when there is none */
+static void udev_led_write(unsigned p)
+{
+   unsigned i;
+   int want;
+   struct udev_led_out *o = &udev_led_out[p];
+   int gen                = retro_atomic_load_acquire_int(&udev_rumble_gen[p]);
+
+   if (gen != o->gen)
+      udev_led_out_reset(o, gen);
+   for (i = 0; i < UDEV_LEDS_MAX && o->count < UDEV_LEDS_MAX; i++)
+   {
+      int v = retro_atomic_exchange_int(&udev_led_slot[p][i], -1);
+      if (v < 0)
+         continue;
+      o->fd[o->count]  = v >> 8;
+      o->led[o->count] = (uint8_t)((v >> 4) & 15);
+      o->n[o->count]   = (uint8_t)(v & 15);
+      if (     o->led[o->count] == LINUX_PAD_LED_DS_PLAYER
+            || o->led[o->count] == LINUX_PAD_LED_SW_PLAYER
+            || o->led[o->count] == LINUX_PAD_LED_PS3_PLAYER)
+         o->has_players = true;
+      o->count++;
+      o->applied = -2;
+   }
+   want = retro_atomic_load_acquire_int(&udev_led_want[p]);
+   if (!o->count || want == o->applied)
+      return;
+   o->applied = want;
+   /* lights it never lit are left alone */
+   if (want < 1 && !o->lit)
+      return;
+   for (i = 0; i < o->count; i++)
+   {
+      char text[16];
+      uint8_t rgb[3];
+      enum linux_pad_led led = (enum linux_pad_led)o->led[i];
+      int value;
+      if (led == UDEV_LED_RGB_INTENSITY)
+         continue;
+      value = linux_pad_led_value(led, o->n[i], want, o->has_players, rgb);
+      if (value < 0)
+         continue;
+      if (led == LINUX_PAD_LED_RGB)
+      {
+         unsigned j;
+         /* its colour first, then how bright */
+         for (j = 0; j < o->count; j++)
+            if (o->led[j] == UDEV_LED_RGB_INTENSITY)
+            {
+               snprintf(text, sizeof(text), "%u %u %u\n",
+                     rgb[0], rgb[1], rgb[2]);
+               udev_led_write_one(o->fd[j], text);
+            }
+      }
+      snprintf(text, sizeof(text), "%d\n", value);
+      udev_led_write_one(o->fd[i], text);
+   }
+   o->lit = want >= 1;
+}
+
+static void udev_led_close_all(void)
+{
+   unsigned p;
+   for (p = 0; p < MAX_USERS; p++)
+      udev_led_out_reset(&udev_led_out[p], udev_led_out[p].gen);
+}
+
+static void udev_led_init(void)
+{
+   unsigned p, i;
+   for (p = 0; p < MAX_USERS; p++)
+   {
+      memset(&udev_led_out[p], 0, sizeof(udev_led_out[p]));
+      udev_led_out[p].gen     = retro_atomic_load_acquire_int(&udev_rumble_gen[p]);
+      udev_led_out[p].applied = -2;
+      retro_atomic_store_release_int(&udev_led_want[p], 0);
+      for (i = 0; i < UDEV_LEDS_MAX; i++)
+         retro_atomic_store_release_int(&udev_led_slot[p][i], -1);
+   }
+}
+
+/* The lights left for the writer in slot @p, taken back */
+static void udev_led_detach(unsigned p)
+{
+   unsigned i;
+   for (i = 0; i < UDEV_LEDS_MAX; i++)
+   {
+      int v = retro_atomic_exchange_int(&udev_led_slot[p][i], -1);
+      if (v >= 0)
+         close(v >> 8);
+   }
+}
+
+static void udev_led_leave(unsigned p, unsigned *at, int fd,
+      unsigned led, unsigned n)
+{
+   int old;
+   if (*at >= UDEV_LEDS_MAX)
+   {
+      close(fd);
+      return;
+   }
+   old = retro_atomic_exchange_int(&udev_led_slot[p][(*at)++],
+         UDEV_LED_PACK(fd, led, n));
+   if (old >= 0)
+      close(old >> 8);
+}
+
+/* Whether the light @name is under @scope, a /sys/devices path: its
+ * link in /sys/class/leds is "../../devices/..." */
+static bool udev_led_under(const char *scope, size_t scope_len,
+      const char *name)
+{
+   char file[512], link[512];
+   ssize_t len;
+   if (scope_len < 6 || strncmp(scope, "/sys/", 5))
+      return false;
+   snprintf(file, sizeof(file), "%s/%s", udev_led_dir, name);
+   if ((len = readlink(file, link, sizeof(link) - 1)) < 6)
+      return false;
+   link[len] = '\0';
+   return   !strncmp(link, "../../", 6)
+         && (size_t)len > scope_len + 1
+         && !strncmp(link + 5, scope + 4, scope_len - 4)
+         && link[5 + scope_len - 4] == '/';
+}
+
+/* The lights under the pad in slot @p, opened and left for the writer.
+ * Read where a pad arrives, and a few times after while it has none: a
+ * driver can add a pad's lights just after its input nodes. */
+static void udev_led_attach(unsigned p)
+{
+   DIR *dir;
+   struct dirent *e;
+   unsigned at             = 0;
+   unsigned xpads          = 0;
+   bool denied             = false;
+   struct udev_joypad *pad = &udev_pads[p];
+   size_t scope_len        = strlen(pad->led_scope);
+
+   pad->led_tries++;
+   if (!scope_len || !(dir = opendir(udev_led_dir)))
+      return;
+   /* xpad puts a wireless receiver's four pads' rings under its one USB
+    * device, and which is whose is not told: none is taken then */
+   while ((e = readdir(dir)))
+   {
+      unsigned n;
+      if (     linux_pad_led_of(e->d_name, &n) == LINUX_PAD_LED_XPAD
+            && udev_led_under(pad->led_scope, scope_len, e->d_name))
+         xpads++;
+   }
+   rewinddir(dir);
+   while ((e = readdir(dir)))
+   {
+      char file[512];
+      unsigned n;
+      int fd;
+      enum linux_pad_led led = linux_pad_led_of(e->d_name, &n);
+
+      if (     led == LINUX_PAD_LED_NONE
+            || (led == LINUX_PAD_LED_XPAD && xpads > 1)
+            || !udev_led_under(pad->led_scope, scope_len, e->d_name))
+         continue;
+      snprintf(file, sizeof(file), "%s/%s/brightness", udev_led_dir,
+            e->d_name);
+      if ((fd = open(file, O_WRONLY | O_CLOEXEC)) < 0)
+      {
+         denied = denied || errno == EACCES || errno == EPERM;
+         continue;
+      }
+      udev_led_leave(p, &at, fd, led, n);
+      if (led == LINUX_PAD_LED_RGB)
+      {
+         snprintf(file, sizeof(file), "%s/%s/multi_intensity",
+               udev_led_dir, e->d_name);
+         if ((fd = open(file, O_WRONLY | O_CLOEXEC)) >= 0)
+            udev_led_leave(p, &at, fd, UDEV_LED_RGB_INTENSITY, 0);
+      }
+   }
+   closedir(dir);
+
+   pad->led_count = (uint8_t)at;
+   if (at)
+   {
+      RARCH_LOG("[udev] Pad #%u: %u light(s) for its player.\n", p, at);
+      if (udev_rumble_writer)
+         input_output_writer_wake(udev_rumble_writer);
+      else
+         udev_led_write(p);
+   }
+   else if (denied)
+   {
+      pad->led_tries = 255;
+      RARCH_LOG("[udev] Pad #%u: its player lights are not writable;"
+            " pkg/linux/70-retroarch-player-lights.rules makes them so.\n", p);
+   }
+}
+
+/* The player pad @pad's lights are to show; 0 none */
+static void udev_joypad_set_player(unsigned pad, unsigned player)
+{
+   if (pad >= MAX_USERS)
+      return;
+   if (retro_atomic_load_acquire_int(&udev_led_want[pad]) == (int)player)
+      return;
+   retro_atomic_store_release_int(&udev_led_want[pad], (int)player);
+   if (udev_rumble_writer)
+      input_output_writer_wake(udev_rumble_writer);
+   else
+      udev_led_write(pad);
 }
 
 static INLINE int16_t udev_compute_axis(const struct input_absinfo *info, int value)
@@ -637,162 +946,98 @@ static void udev_open_sensor_node(struct udev_joypad *pad,
          pad->sensor_has_gyro  ? "yes" : "no");
 }
 
-static void udev_find_sensor_sibling(struct udev_device *gamepad_dev,
-      unsigned p)
+/* An event of the touchpad's node into the pad's view */
+static void udev_touch_event(struct udev_joypad *pad,
+      uint16_t type, uint16_t code, int32_t value)
 {
-   struct udev_enumerate *enumerate  = NULL;
-   struct udev_list_entry *devs      = NULL;
-   struct udev_list_entry *item      = NULL;
-   struct udev_device *hid_parent    = NULL;
-   const char *parent_syspath        = NULL;
-   struct udev_joypad *pad           = &udev_pads[p];
+   input_pad_view_t *view = &pad->view;
+   unsigned slot          = pad->touch_slot;
 
-   hid_parent = udev_device_get_parent_with_subsystem_devtype(
-         gamepad_dev, "hid", NULL);
-   if (!hid_parent)
+   if (type == EV_KEY)
    {
-      RARCH_DBG("[udev] Pad #%u: no HID parent found for sensor search.\n", p);
+      if (code == BTN_LEFT)
+         view->touch_down = (uint8_t)(value
+               ? (view->touch_down |  INPUT_PAD_TOUCH_PRESS)
+               : (view->touch_down & ~INPUT_PAD_TOUCH_PRESS));
       return;
    }
-
-   parent_syspath = udev_device_get_syspath(hid_parent);
-   if (!parent_syspath)
+   if (type != EV_ABS)
       return;
-
-   RARCH_DBG("[udev] Pad #%u: searching for sensor sibling under %s\n",
-         p, parent_syspath);
-
-   enumerate = udev_enumerate_new(udev_joypad_fd);
-   if (!enumerate)
-      return;
-
-   udev_enumerate_add_match_property(enumerate,
-         "ID_INPUT_ACCELEROMETER", "1");
-   udev_enumerate_add_match_subsystem(enumerate, "input");
-   udev_enumerate_scan_devices(enumerate);
-   devs = udev_enumerate_get_list_entry(enumerate);
-
-   if (!devs)
-      RARCH_DBG("[udev] Pad #%u: no ID_INPUT_ACCELEROMETER devices found.\n", p);
-
-   udev_list_entry_foreach(item, devs)
+   if (code == ABS_MT_SLOT)
    {
-      const char *name = udev_list_entry_get_name(item);
-      struct udev_device *dev = udev_device_new_from_syspath(
-            udev_joypad_fd, name);
-      const char *devnode;
-      struct udev_device *candidate_parent;
-      const char *candidate_syspath;
-
-      if (!dev)
-         continue;
-
-      devnode = udev_device_get_devnode(dev);
-      if (!devnode)
-      {
-         udev_device_unref(dev);
-         continue;
-      }
-
-      candidate_parent = udev_device_get_parent_with_subsystem_devtype(
-            dev, "hid", NULL);
-      if (!candidate_parent)
-      {
-         udev_device_unref(dev);
-         continue;
-      }
-
-      candidate_syspath = udev_device_get_syspath(candidate_parent);
-      if (  !candidate_syspath
-         || !string_is_equal(parent_syspath, candidate_syspath))
-      {
-         udev_device_unref(dev);
-         continue;
-      }
-
-      /* Found sibling sensor node */
-      udev_open_sensor_node(pad, devnode, p);
-      udev_device_unref(dev);
-      break;
+      pad->touch_slot = (uint8_t)(value < 0 ? 0xff : value > 0xfe ? 0xfe : value);
+      return;
    }
-
-   udev_enumerate_unref(enumerate);
-
-   /* Fallback for devices like hid-wiimote whose accelerometer input node
-    * is not tagged with ID_INPUT_ACCELEROMETER=1 by udev */
-   if (pad->sensor_fd >= 0)
-      return; /* primary scan already found it */
-
-   RARCH_DBG("[udev] Pad #%u: no ID_INPUT_ACCELEROMETER device found, "
-         "trying fallback scan under %s\n", p, parent_syspath);
-
-   enumerate = udev_enumerate_new(udev_joypad_fd);
-   if (!enumerate)
+   if (slot >= INPUT_PAD_VIEW_TOUCHES)
       return;
-
-   udev_enumerate_add_match_subsystem(enumerate, "input");
-   udev_enumerate_scan_devices(enumerate);
-   devs = udev_enumerate_get_list_entry(enumerate);
-
-   udev_list_entry_foreach(item, devs)
+   switch (code)
    {
-      const char *name         = udev_list_entry_get_name(item);
-      struct udev_device *dev;
-      const char *devnode;
-      struct udev_device *candidate_parent;
-      const char *candidate_syspath;
-
-      /* Only look at eventNN nodes, not jsNN or the input parent itself */
-      if (!strstr(name, "/event"))
-         continue;
-
-      dev = udev_device_new_from_syspath(udev_joypad_fd, name);
-      if (!dev)
-         continue;
-
-      devnode = udev_device_get_devnode(dev);
-      if (!devnode)
-      {
-         udev_device_unref(dev);
-         continue;
-      }
-
-      /* Must share the same HID parent as the joypad */
-      candidate_parent = udev_device_get_parent_with_subsystem_devtype(
-            dev, "hid", NULL);
-      if (!candidate_parent)
-      {
-         udev_device_unref(dev);
-         continue;
-      }
-
-      candidate_syspath = udev_device_get_syspath(candidate_parent);
-      if (  !candidate_syspath
-         || !string_is_equal(parent_syspath, candidate_syspath))
-      {
-         udev_device_unref(dev);
-         continue;
-      }
-
-      /* Skip the joypad's own event node */
-      {
-         struct stat st;
-         if (stat(devnode, &st) == 0 && st.st_rdev == pad->device)
+      case ABS_MT_TRACKING_ID:
+         if (value < 0)
+            view->touch_down &= (uint8_t)~(1u << slot);
+         else
+            view->touch_down |= (uint8_t)(1u << slot);
+         break;
+      case ABS_MT_POSITION_X:
+      case ABS_MT_POSITION_Y:
          {
-            udev_device_unref(dev);
-            continue;
+            unsigned a  = (code == ABS_MT_POSITION_Y);
+            int32_t pos = pad->touch_span[a]
+               ? (int32_t)(((int64_t)(value - pad->touch_min[a]) * 0xfffe)
+                     / pad->touch_span[a]) - 0x7fff
+               : 0;
+            if (pos < -0x7fff)
+               pos = -0x7fff;
+            else if (pos > 0x7fff)
+               pos = 0x7fff;
+            view->touch[slot] = a
+               ? ((view->touch[slot] & 0xffff) | ((uint32_t)(uint16_t)(int16_t)pos << 16))
+               : ((view->touch[slot] & 0xffff0000u) | (uint16_t)(int16_t)pos);
          }
-      }
-
-      /* udev_open_sensor_node rejects nodes with no usable ABS axes */
-      udev_open_sensor_node(pad, devnode, p);
-      udev_device_unref(dev);
-
-      if (pad->sensor_fd >= 0)
+         break;
+      default:
          break;
    }
+}
 
-   udev_enumerate_unref(enumerate);
+static void udev_open_touch_node(struct udev_joypad *pad, const char *path,
+      unsigned p)
+{
+   struct input_absinfo info;
+   int fd;
+   unsigned a;
+
+   if ((fd = open(path, O_RDONLY | O_NONBLOCK)) < 0)
+      return;
+   for (a = 0; a < 2; a++)
+   {
+      if (ioctl(fd, EVIOCGABS(a ? ABS_MT_POSITION_Y : ABS_MT_POSITION_X), &info) < 0
+            || info.maximum <= info.minimum)
+      {
+         close(fd);
+         return;
+      }
+      pad->touch_min[a]  = info.minimum;
+      pad->touch_span[a] = info.maximum - info.minimum;
+   }
+   pad->touch_fd          = fd;
+   pad->touch_path        = strdup(path);
+   pad->touch_slot        = 0;
+   pad->view.touch_down   = 0;
+   pad->view.touchpad     = true;
+   RARCH_LOG("[udev] Pad #%u: touchpad at %s.\n", p, path);
+}
+
+static void udev_close_touch_node(struct udev_joypad *pad)
+{
+   if (pad->touch_fd >= 0)
+      close(pad->touch_fd);
+   if (pad->touch_path)
+      free(pad->touch_path);
+   pad->touch_fd        = -1;
+   pad->touch_path      = NULL;
+   pad->view.touchpad   = false;
+   pad->view.touch_down = 0;
 }
 
 /* The DualShock 3's input report bytes with the pressure of cross,
@@ -801,6 +1046,34 @@ static void udev_find_sensor_sibling(struct udev_device *gamepad_dev,
 static const uint8_t udev_ds3_pressure_byte[UDEV_DS3_PRESSURES] = {
    24, 23, 25, 22, 20, 21, 14, 16, 17, 15
 };
+
+/* Axis @i's value in the lent state, as axis() answers it. */
+static void udev_joypad_view_axis(struct udev_joypad *pad, unsigned i)
+{
+   int16_t val;
+   if (i >= INPUT_PAD_VIEW_AXES)
+      return;
+   val = pad->axes[i];
+   /* Deal with analog triggers that report -32767 to 32767 */
+   if (pad->neg_trigger[i])
+      val = (val + 0x7fff) / 2;
+   pad->view.axes[i] = val;
+}
+
+/* Hat @h's four directions in the lent state, as button() answers
+ * them: up, down, left, right from the low bit. */
+static void udev_joypad_view_hat(struct udev_joypad *pad, unsigned h)
+{
+   unsigned bits = 0;
+   if (h >= INPUT_PAD_VIEW_HATS)
+      return;
+   if (pad->hats[h][1] < 0) bits |= 1;
+   if (pad->hats[h][1] > 0) bits |= 2;
+   if (pad->hats[h][0] < 0) bits |= 4;
+   if (pad->hats[h][0] > 0) bits |= 8;
+   pad->view.hats = (uint16_t)((pad->view.hats & ~(0xf << (h * 4)))
+         | (bits << (h * 4)));
+}
 
 static void udev_pressure_attach(struct udev_joypad *pad, int fd,
       unsigned *axes)
@@ -836,6 +1109,7 @@ static void udev_pressure_read(struct udev_joypad *pad)
       {
          unsigned b = report[newest][udev_ds3_pressure_byte[n]];
          pad->axes[pad->pressure_axis + n] = (int16_t)((b << 7) | (b >> 1));
+         udev_joypad_view_axis(pad, pad->pressure_axis + n);
       }
    }
    /* gone, or no longer ours: the buttons go on without */
@@ -844,62 +1118,109 @@ static void udev_pressure_read(struct udev_joypad *pad)
       close(pad->pressure_fd);
       pad->pressure = false;
       for (n = 0; n < UDEV_DS3_PRESSURES; n++)
+      {
          pad->axes[pad->pressure_axis + n] = 0;
+         udev_joypad_view_axis(pad, pad->pressure_axis + n);
+      }
    }
 }
 
-/* The hidraw node of the pad's HID device, for a DualShock 3. */
-static void udev_find_pressure_sibling(struct udev_device *gamepad_dev,
-      unsigned p, unsigned *axes)
+/* The pad's other nodes, under its HID device: listed once, and given
+ * their roles (linux_pad_members.h). */
+typedef struct udev_pad_nodes
 {
-   struct udev_enumerate *enumerate = NULL;
-   struct udev_list_entry *item     = NULL;
-   struct udev_device *hid_parent;
-   const char *parent_syspath;
-   struct udev_joypad *pad          = &udev_pads[p];
+   linux_pad_node_t    node[LINUX_PAD_MEMBERS_MAX];
+   char                path[LINUX_PAD_MEMBERS_MAX][64];
+   linux_pad_members_t members;
+} udev_pad_nodes_t;
 
-   if (     pad->vid != 0x054c || pad->pid != 0x0268
-         || *axes + UDEV_DS3_PRESSURES > NUM_AXES
-         || !(hid_parent = udev_device_get_parent_with_subsystem_devtype(
-               gamepad_dev, "hid", NULL))
-         || !(parent_syspath = udev_device_get_syspath(hid_parent))
-         || !(enumerate = udev_enumerate_new(udev_joypad_fd)))
-      return;
+static void udev_find_members(struct udev_device *gamepad_dev,
+      struct udev_joypad *pad, uint64_t own, udev_pad_nodes_t *n)
+{
+   size_t count = 0;
+   struct udev_enumerate *enumerate;
+   struct udev_list_entry *item;
+   struct udev_device *hid_parent = udev_device_get_parent_with_subsystem_devtype(
+         gamepad_dev, "hid", NULL);
+   /* a DualShock 3's pressures are in its reports alone */
+   bool want_reports = pad->vid == 0x054c && pad->pid == 0x0268;
+   const char *syspath = hid_parent ? udev_device_get_syspath(hid_parent) : NULL;
 
-   udev_enumerate_add_match_subsystem(enumerate, "hidraw");
-   udev_enumerate_scan_devices(enumerate);
-   udev_list_entry_foreach(item, udev_enumerate_get_list_entry(enumerate))
+   pad->hid_syspath[0] = '\0';
+   if (syspath)
+      strlcpy(pad->hid_syspath, syspath, sizeof(pad->hid_syspath));
+   if (hid_parent && (enumerate = udev_enumerate_new(udev_joypad_fd)))
    {
-      struct udev_device *dev = udev_device_new_from_syspath(
-            udev_joypad_fd, udev_list_entry_get_name(item));
-      struct udev_device *parent;
-      const char *devnode;
-
-      if (!dev)
-         continue;
-      parent  = udev_device_get_parent_with_subsystem_devtype(
-            dev, "hid", NULL);
-      devnode = udev_device_get_devnode(dev);
-      if (     devnode && parent
-            && string_is_equal(udev_device_get_syspath(parent),
-               parent_syspath))
+      udev_enumerate_add_match_parent(enumerate, hid_parent);
+      udev_enumerate_add_match_subsystem(enumerate, "input");
+      udev_enumerate_add_match_subsystem(enumerate, "hidraw");
+      udev_enumerate_scan_devices(enumerate);
+      udev_list_entry_foreach(item, udev_enumerate_get_list_entry(enumerate))
       {
-         int fd = open(devnode, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-         if (fd >= 0)
+         struct udev_device *dev;
+         const char *devnode, *subsystem, *sysname, *tag;
+         linux_pad_node_t *node;
+         if (count >= LINUX_PAD_MEMBERS_MAX)
+            break;
+         if (!(dev = udev_device_new_from_syspath(udev_joypad_fd,
+                     udev_list_entry_get_name(item))))
+            continue;
+         devnode   = udev_device_get_devnode(dev);
+         subsystem = udev_device_get_subsystem(dev);
+         sysname   = udev_device_get_sysname(dev);
+         node      = &n->node[count];
+         node->hidraw = subsystem && string_is_equal(subsystem, "hidraw");
+         node->event  = subsystem && string_is_equal(subsystem, "input")
+            && sysname && string_starts_with_size(sysname, "event",
+                  STRLEN_CONST("event"));
+         if (devnode && (node->hidraw || node->event)
+               && strlen(devnode) < sizeof(n->path[0]))
          {
-            udev_pressure_attach(pad, fd, axes);
-            RARCH_LOG("[udev] Pad #%u: button pressures from %s.\n",
-                  p, devnode);
+            node->rdev     = (uint64_t)udev_device_get_devnum(dev);
+            tag            = udev_device_get_property_value(dev,
+                  "ID_INPUT_ACCELEROMETER");
+            node->accel    = tag && string_is_equal(tag, "1");
+            tag            = udev_device_get_property_value(dev,
+                  "ID_INPUT_TOUCHPAD");
+            node->touchpad = tag && string_is_equal(tag, "1");
+            strlcpy(n->path[count], devnode, sizeof(n->path[0]));
+            count++;
          }
-         else
-            RARCH_LOG("[udev] Pad #%u: no button pressures, %s cannot be"
-                  " read (%s).\n", p, devnode, strerror(errno));
          udev_device_unref(dev);
-         break;
       }
-      udev_device_unref(dev);
+      udev_enumerate_unref(enumerate);
    }
-   udev_enumerate_unref(enumerate);
+   linux_pad_members_choose(n->node, count, own, want_reports, &n->members);
+}
+
+/* The DualShock 3's pressures, from its hidraw node */
+static void udev_open_reports(struct udev_joypad *pad,
+      const udev_pad_nodes_t *n, unsigned p, unsigned *axes)
+{
+   const char *devnode;
+   int fd;
+   if (n->members.reports < 0 || *axes + UDEV_DS3_PRESSURES > NUM_AXES)
+      return;
+   devnode = n->path[n->members.reports];
+   if ((fd = open(devnode, O_RDONLY | O_NONBLOCK | O_CLOEXEC)) >= 0)
+   {
+      udev_pressure_attach(pad, fd, axes);
+      RARCH_LOG("[udev] Pad #%u: button pressures from %s.\n", p, devnode);
+   }
+   else
+      RARCH_LOG("[udev] Pad #%u: no button pressures, %s cannot be"
+            " read (%s).\n", p, devnode, strerror(errno));
+}
+
+/* The motion sensors - the first node with axes - and the touchpad */
+static void udev_open_members(struct udev_joypad *pad,
+      const udev_pad_nodes_t *n, unsigned p)
+{
+   unsigned i;
+   for (i = 0; n->members.sensors[i] >= 0 && pad->sensor_fd < 0; i++)
+      udev_open_sensor_node(pad, n->path[n->members.sensors[i]], p);
+   if (n->members.touchpad >= 0)
+      udev_open_touch_node(pad, n->path[n->members.touchpad], p);
 }
 
 static int udev_add_pad(struct udev_device *dev, unsigned p, int fd, const char *path)
@@ -912,6 +1233,7 @@ static int udev_add_pad(struct udev_device *dev, unsigned p, int fd, const char 
    unsigned axes                        = 0;
    struct udev_device *parent           = NULL;
    struct udev_joypad *pad              = (struct udev_joypad*)&udev_pads[p];
+   udev_pad_nodes_t nodes;
    struct input_id inputid              = {0};
    unsigned long keybit[NBITS(KEY_MAX)] = {0};
    unsigned long absbit[NBITS(ABS_MAX)] = {0};
@@ -942,6 +1264,16 @@ static int udev_add_pad(struct udev_device *dev, unsigned p, int fd, const char 
    {
       RARCH_LOG("[udev] Ignoring \"%s\" (%04x:%04x, %s): tagged as a"
             " joystick, but it is not one.\n",
+            pad->ident, pad->vid, pad->pid, path);
+      pad->ident[0] = '\0';
+      pad->vid      = pad->pid = 0;
+      return -2;
+   }
+   /* Another program reads it and stands in for it (Steam Input) */
+   if (input_device_ignored((uint16_t)pad->vid, (uint16_t)pad->pid))
+   {
+      RARCH_LOG("[udev] Ignoring \"%s\" (%04x:%04x, %s): listed in"
+            " SDL_GAMECONTROLLER_IGNORE_DEVICES.\n",
             pad->ident, pad->vid, pad->pid, path);
       pad->ident[0] = '\0';
       pad->vid      = pad->pid = 0;
@@ -1007,19 +1339,37 @@ static int udev_add_pad(struct udev_device *dev, unsigned p, int fd, const char 
             if (     (i == ABS_Z || i == ABS_RZ)
                   && udev_compute_axis(abs, abs->value) < -1300)
               pad->neg_trigger[axes] = true;
+            udev_joypad_view_axis(pad, axes);
             pad->axes_bind[i] = axes++;
          }
       }
    }
 
-   udev_find_pressure_sibling(dev, p, &axes);
+   udev_find_members(dev, pad, (uint64_t)st.st_rdev, &nodes);
+   udev_open_reports(pad, &nodes, p, &axes);
 
    pad->device = st.st_rdev;
    udev_pad_set_fd(p, fd);
    pad->path   = strdup(path);
 
-   /* Look for a sibling sensor (IMU) evdev node under the same HID parent */
-   udev_find_sensor_sibling(dev, p);
+   udev_open_members(pad, &nodes, p);
+
+   /* its lights: under its HID device, or an Xbox 360 pad's under its
+    * USB device */
+   pad->led_scope[0] = '\0';
+   pad->led_count    = 0;
+   pad->led_tries    = 0;
+   if (*pad->hid_syspath)
+      strlcpy(pad->led_scope, pad->hid_syspath, sizeof(pad->led_scope));
+   else
+   {
+      struct udev_device *usb = udev_device_get_parent_with_subsystem_devtype(
+            dev, "usb", "usb_device");
+      const char *syspath     = usb ? udev_device_get_syspath(usb) : NULL;
+      if (syspath)
+         strlcpy(pad->led_scope, syspath, sizeof(pad->led_scope));
+   }
+   udev_led_attach(p);
 
    if (*pad->ident)
    {
@@ -1103,11 +1453,13 @@ static void udev_check_device(struct udev_device *dev, const char *path)
 
 static void udev_free_pad(unsigned pad)
 {
+   udev_led_detach(pad);
    udev_rumble_detach(pad);
    if (udev_pads[pad].fd >= 0)
       close(udev_pads[pad].fd);
    if (udev_pads[pad].sensor_fd >= 0)
       close(udev_pads[pad].sensor_fd);
+   udev_close_touch_node(&udev_pads[pad]);
    if (udev_pads[pad].pressure)
       close(udev_pads[pad].pressure_fd);
 
@@ -1123,6 +1475,7 @@ static void udev_free_pad(unsigned pad)
 
    udev_pad_set_fd(pad, -1);
    udev_pads[pad].sensor_fd = -1;
+   udev_pads[pad].touch_fd  = -1;
 }
 
 static void udev_joypad_remove_device(const char *path)
@@ -1141,74 +1494,74 @@ static void udev_joypad_remove_device(const char *path)
    }
 }
 
-static void udev_hotplug_sensor_add(struct udev_device *sensor_dev,
-      const char *sensor_path)
+/* A node that comes or goes after its pad: its motion sensors or its
+ * touchpad, as udev_find_members() would have given it a role */
+static void udev_hotplug_member(struct udev_device *dev, const char *devnode,
+      bool add)
 {
    int i;
-   struct udev_device *sensor_parent;
-   const char *sensor_parent_syspath;
+   struct udev_device *parent;
+   const char *syspath, *sysname, *tag;
+   linux_pad_node_t node;
+   linux_pad_members_t m;
 
-   sensor_parent = udev_device_get_parent_with_subsystem_devtype(
-         sensor_dev, "hid", NULL);
-   if (!sensor_parent)
-      return;
-   sensor_parent_syspath = udev_device_get_syspath(sensor_parent);
-   if (!sensor_parent_syspath)
-      return;
-
-   for (i = 0; i < MAX_USERS; i++)
+   if (!add)
    {
-      struct udev_device *pad_dev, *pad_parent;
-      const char *pad_parent_syspath;
-      struct udev_joypad *pad = &udev_pads[i];
-
-      if (pad->fd < 0 || pad->sensor_fd >= 0)
-         continue;
-
-      pad_dev = udev_device_new_from_devnum(
-            udev_joypad_fd, 'c', pad->device);
-      if (!pad_dev)
-         continue;
-
-      pad_parent = udev_device_get_parent_with_subsystem_devtype(
-            pad_dev, "hid", NULL);
-      if (pad_parent)
+      for (i = 0; i < MAX_USERS; i++)
       {
-         pad_parent_syspath = udev_device_get_syspath(pad_parent);
-         if (  pad_parent_syspath
-            && string_is_equal(sensor_parent_syspath, pad_parent_syspath))
+         struct udev_joypad *pad = &udev_pads[i];
+         if (     pad->touch_fd >= 0 && pad->touch_path
+               && string_is_equal(pad->touch_path, devnode))
+            udev_close_touch_node(pad);
+         else if (pad->sensor_fd >= 0 && pad->sensor_path
+               && string_is_equal(pad->sensor_path, devnode))
          {
-            udev_device_unref(pad_dev);
-            udev_open_sensor_node(pad, sensor_path, i);
-            return;
+            close(pad->sensor_fd);
+            pad->sensor_fd = -1;
+            free(pad->sensor_path);
+            pad->sensor_path          = NULL;
+            pad->sensor_accel_enabled = false;
+            pad->sensor_gyro_enabled  = false;
+            pad->sensor_has_accel     = false;
+            pad->sensor_has_gyro      = false;
+            pad->sensor_accel_on_rxyz_codes = false;
+            RARCH_LOG("[udev] Pad #%u: sensor removed.\n", i);
          }
       }
-      udev_device_unref(pad_dev);
+      return;
    }
-}
 
-static void udev_hotplug_sensor_remove(const char *path)
-{
-   int i;
+   sysname = udev_device_get_sysname(dev);
+   if (     !sysname || !string_starts_with_size(sysname, "event",
+               STRLEN_CONST("event"))
+         || !(parent  = udev_device_get_parent_with_subsystem_devtype(
+               dev, "hid", NULL))
+         || !(syspath = udev_device_get_syspath(parent)))
+      return;
+
+   memset(&node, 0, sizeof(node));
+   node.event    = true;
+   node.rdev     = (uint64_t)udev_device_get_devnum(dev);
+   tag           = udev_device_get_property_value(dev, "ID_INPUT_ACCELEROMETER");
+   node.accel    = tag && string_is_equal(tag, "1");
+   tag           = udev_device_get_property_value(dev, "ID_INPUT_TOUCHPAD");
+   node.touchpad = tag && string_is_equal(tag, "1");
+
    for (i = 0; i < MAX_USERS; i++)
    {
       struct udev_joypad *pad = &udev_pads[i];
-      if (  pad->sensor_fd >= 0
-         && pad->sensor_path
-         && string_is_equal(pad->sensor_path, path))
+      if (     pad->fd < 0 || !*pad->hid_syspath
+            || !string_is_equal(pad->hid_syspath, syspath))
+         continue;
+      linux_pad_members_choose(&node, 1, (uint64_t)pad->device, false, &m);
+      if (m.touchpad == 0)
       {
-         close(pad->sensor_fd);
-         pad->sensor_fd = -1;
-         free(pad->sensor_path);
-         pad->sensor_path          = NULL;
-         pad->sensor_accel_enabled = false;
-         pad->sensor_gyro_enabled  = false;
-         pad->sensor_has_accel     = false;
-         pad->sensor_has_gyro      = false;
-         pad->sensor_accel_on_rxyz_codes = false;
-         RARCH_LOG("[udev] Pad #%u: sensor removed.\n", i);
-         break;
+         if (pad->touch_fd < 0)
+            udev_open_touch_node(pad, devnode, i);
       }
+      else if (m.sensors[0] == 0 && pad->sensor_fd < 0)
+         udev_open_sensor_node(pad, devnode, i);
+      return;
    }
 }
 
@@ -1271,8 +1624,16 @@ static bool udev_joypad_poll_hotplug_available(struct udev_monitor *dev)
 static void udev_joypad_poll(void)
 {
    unsigned p;
+   static unsigned led_tick;
 
    udev_rumble_poll();
+
+   /* lights a driver adds just after a pad's input nodes */
+   if (!(++led_tick & 63))
+      for (p = 0; p < MAX_USERS; p++)
+         if (     (udev_pads_active & (1u << p))
+               && !udev_pads[p].led_count && udev_pads[p].led_tries < 4)
+            udev_led_attach(p);
 
    while (udev_joypad_mon && udev_joypad_poll_hotplug_available(udev_joypad_mon))
    {
@@ -1299,18 +1660,13 @@ static void udev_joypad_poll(void)
                udev_check_device(dev, devnode);
             }
          }
-         else if (devnode)
+         /* one of a pad's other nodes, coming or going */
+         else if (devnode && action)
          {
-            /* Check for sensor node hotplug */
-            const char *accel_val = udev_device_get_property_value(
-                  dev, "ID_INPUT_ACCELEROMETER");
-            if (accel_val && string_is_equal(accel_val, "1"))
-            {
-               if (string_is_equal(action, "add"))
-                  udev_hotplug_sensor_add(dev, devnode);
-               else if (string_is_equal(action, "remove"))
-                  udev_hotplug_sensor_remove(devnode);
-            }
+            if (string_is_equal(action, "add"))
+               udev_hotplug_member(dev, devnode, true);
+            else if (string_is_equal(action, "remove"))
+               udev_hotplug_member(dev, devnode, false);
          }
 
          udev_device_unref(dev);
@@ -1342,9 +1698,9 @@ static void udev_joypad_poll(void)
                   if (code > 0 && code < KEY_MAX)
                   {
                      if (value)
-                        BIT64_SET(pad->buttons, pad->button_bind[code]);
+                        BIT256_SET(pad->view.buttons, pad->button_bind[code]);
                      else
-                        BIT64_CLEAR(pad->buttons, pad->button_bind[code]);
+                        BIT256_CLEAR(pad->view.buttons, pad->button_bind[code]);
                   }
                   break;
 
@@ -1364,6 +1720,7 @@ static void udev_joypad_poll(void)
                      case ABS_HAT3Y:
                         code                           -= ABS_HAT0X;
                         pad->hats[code >> 1][code & 1]  = value;
+                        udev_joypad_view_hat(pad, code >> 1);
                         break;
                      default:
                         {
@@ -1378,6 +1735,7 @@ static void udev_joypad_poll(void)
                                  && abs(pad->axes[axis]) < 0x2000)
                               pad->neg_trigger[axis] = false;
                            pad->axis_reported[axis] = true;
+                           udev_joypad_view_axis(pad, axis);
                            break;
                         }
                   }
@@ -1391,6 +1749,19 @@ static void udev_joypad_poll(void)
 
       if (pad->pressure)
          udev_pressure_read(pad);
+
+      if (pad->touch_fd >= 0)
+      {
+         struct input_event tevents[32];
+         ssize_t tlen;
+         while ((tlen = read(pad->touch_fd, tevents, sizeof(tevents))) > 0)
+         {
+            tlen /= sizeof(*tevents);
+            for (i = 0; i < tlen; i++)
+               udev_touch_event(pad, tevents[i].type, tevents[i].code,
+                     tevents[i].value);
+         }
+      }
 
       /* Read sensor events from sibling IMU node */
       if (  pad->sensor_fd >= 0
@@ -1463,6 +1834,7 @@ static void *udev_joypad_init(void *data)
    {
       udev_pad_set_fd(i, -1);
       udev_pads[i].sensor_fd = -1;
+      udev_pads[i].touch_fd  = -1;
    }
    udev_rumble_start();
 
@@ -1541,7 +1913,7 @@ static int32_t udev_joypad_button_state(
       /* hat requested and no hat button down */
    }
    else if (joykey < UDEV_NUM_BUTTONS)
-      return (BIT64_GET(pad->buttons, joykey));
+      return BIT256_GET(pad->view.buttons, joykey) ? 1 : 0;
    return 0;
 }
 
@@ -1561,7 +1933,7 @@ static void udev_joypad_get_buttons(unsigned port, input_bits_t *state)
 
 	if (pad)
    {
-		BITS_COPY64_PTR( state, pad->buttons );
+		*state = pad->view.buttons;
 	}
    else
       BIT256_CLEAR_ALL_PTR(state);
@@ -1590,6 +1962,12 @@ static int16_t udev_joypad_axis_state(
          return val;
    }
    return 0;
+}
+
+/* Read in the poll alone: the state is the same until the next. */
+static const input_pad_view_t *udev_joypad_view(unsigned port)
+{
+   return (port < MAX_USERS) ? &udev_pads[port].view : NULL;
 }
 
 static int16_t udev_joypad_axis(unsigned port, uint32_t joyaxis)
@@ -1777,6 +2155,12 @@ input_device_driver_t udev_joypad = {
    "udev",
 #if defined(__linux__)
    udev_joypad_get_bt_host,
-   udev_joypad_set_bt_host
+   udev_joypad_set_bt_host,
+#else
+   NULL, /* get_bt_host */
+   NULL, /* set_bt_host */
 #endif
+   NULL, /* survives_video */
+   udev_joypad_set_player,
+   udev_joypad_view
 };

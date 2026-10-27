@@ -16,7 +16,7 @@
 #ifndef __D3D11_VIDEO_DECODE_H
 #define __D3D11_VIDEO_DECODE_H
 
-/* H.264/HEVC/VP9 decoded on the GPU with D3D11 video (DXVA).
+/* H.264/HEVC/VP9/AV1 decoded on the GPU with D3D11 video (DXVA).
  * Each decoder has a device of its own on the driver's
  * adapter, so the driver's device is never shared between threads; the
  * pictures to be shown are copied into shared NV12 textures, ordered
@@ -27,10 +27,13 @@
 #include <boolean.h>
 #include <formats/rh265_hw.h>
 #include <formats/rvp9_hw.h>
+#ifdef HAVE_RAV1
+#include <formats/rav1_hw.h>
+#endif
 
 RETRO_BEGIN_DECLS
 
-/* Offers H.264/HEVC/VP9 backends for decoders on @device's adapter (an
+/* Offers H.264/HEVC/VP9/AV1 backends for decoders on @device's adapter (an
  * ID3D11Device). Main thread, once the device is up; false when the
  * system cannot share the frames. */
 bool d3d11_video_decode_init(void *device);
@@ -43,6 +46,8 @@ bool d3d11_video_decode_init_adapter(void *adapter);
  * is offered only when @formats includes IMAGE_PIXFMT_P010. */
 /* D3D12 consumers can read shared decoder arrays directly. */
 #define D3D11_VIDEO_DECODE_SHARED_DPB (1u << 31)
+/* Single-plane sample packing for Win32 external-memory consumers. */
+#define D3D11_VIDEO_DECODE_PACKED_YUV (1u << 30)
 bool d3d11_video_decode_init_formats(void *device, unsigned formats);
 bool d3d11_video_decode_init_adapter_formats(void *adapter, unsigned formats);
 
@@ -65,6 +70,23 @@ void d3d11_video_decode_hevc_close(rh265_hw_ops_t *ops);
 bool d3d11_video_decode_vp9_open(const rvp9_hdr *header,
       unsigned slots, rvp9_hw_ops_t *ops);
 void d3d11_video_decode_vp9_close(rvp9_hw_ops_t *ops);
+
+/* Packed GPU exports for VP9/AV1, optionally replacing H.264. */
+bool d3d11_video_decode_init_packed_adapter(void *adapter, unsigned formats,
+      bool h264);
+
+#ifdef HAVE_RAV1
+/* Offers only AV1 with packed sample exports; other codec owners stay intact. */
+bool d3d11_video_decode_init_av1_adapter(void *adapter, unsigned formats);
+
+/* Fixed-size Profile 0, 8/10-bit 4:2:0, without film grain.
+ * SDR and supported PQ/HLG matrix/gamut combinations are preserved for
+ * container source-colour metadata and the shared-frame importer.
+ * Owner-thread calls; retained GPU leases can outlive close. */
+bool d3d11_video_decode_av1_open(const rav1_sequence_t *sequence,
+      unsigned slots, rav1_hw_ops_t *ops);
+void d3d11_video_decode_av1_close(rav1_hw_ops_t *ops);
+#endif
 
 RETRO_END_DECLS
 

@@ -31,6 +31,9 @@
 
 #define VULKAN_DIRTY_DYNAMIC_BIT                0x0001
 
+#ifdef ANDROID
+#include <compat/android_native_window.h>
+#endif
 #include "vksym.h"
 
 #include <stddef.h>
@@ -208,7 +211,8 @@ enum vulkan_context_flags
     * present from it is the surface's standing answer, not a request
     * to rebuild again. */
    VK_CTX_FLAG_SUBOPTIMAL_REBUILT           = (1 << 8),
-   VK_CTX_FLAG_VIDEO_GENERAL                = (1 << 9)
+   VK_CTX_FLAG_VIDEO_GENERAL                = (1 << 9),
+   VK_CTX_FLAG_ANDROID_IMAGES               = (1 << 10)
 };
 
 enum gfx_ctx_vulkan_data_flags
@@ -268,6 +272,12 @@ typedef struct vulkan_context
 
    VkPhysicalDeviceProperties gpu_properties;
    VkPhysicalDeviceMemoryProperties memory_properties;
+#if defined(ANDROID) \
+      && (defined(HAVE_RMP4) || defined(HAVE_RVP9) || defined(HAVE_RAV1) \
+            || defined(HAVE_RECORD_MEDIACODEC))
+   unsigned android_sampler_descriptors;
+   bool android_legacy_descriptor_budget;
+#endif
 
    VkPresentModeKHR present_modes[16];
    /* Whether the surface offers FIFO_RELAXED, which is what the
@@ -389,10 +399,136 @@ struct vulkan_emulated_mailbox
    bool has_pending_request;
 };
 
+/* VK_NV_low_latency2 (NVIDIA Reflex) on the native swapchain, behind
+ * the driver_pacing_* pokes. The mode is a property of one swapchain:
+ * a replacement starts from nothing, and @swapchain records which one
+ * the mode was set on so a sleep or a marker never names an obsolete
+ * one. Each content frame's present is followed by one sleep that
+ * signals @semaphore, a timeline semaphore of the device, to the
+ * frame's identity; the frame loop waits for the identity of the frame
+ * it last handed over. @frame_id is the identity the presenter is on
+ * and @stage how far its markers have gone: 1 its render submission
+ * began, 2 it was presented (any present after that is out of band:
+ * a repeat, a dark frame, a sub-frame, the same frame again).
+ *
+ * The presenter's thread owns everything above; under the threaded
+ * wrapper the frame loop is another thread, and what crosses is
+ * lock-free: @want and @answer carry the mode request and the answer
+ * the presenter gave it; @pub_gen and @pub_table publish the swapchain
+ * the mode is on for the frame loop's own markers, written only while
+ * that thread is seen out of a call (@in_call), and @retired keeps a
+ * replaced swapchain alive until it is (vulkan_low_latency_mark_main). @failed latches
+ * on a backend error, or on sleeps the driver stopped signalling,
+ * until the mode is asked for again; the semaphore is then left to the
+ * device. */
+/* VK_AMD_anti_lag postdates the tree's Vulkan headers; the types it
+ * uses are the registry's, declared here when the headers lack them */
+#ifndef VK_AMD_anti_lag
+#define VK_AMD_ANTI_LAG_EXTENSION_NAME "VK_AMD_anti_lag"
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD ((VkStructureType)1000476000)
+#define VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD                     ((VkStructureType)1000476001)
+#define VK_STRUCTURE_TYPE_ANTI_LAG_PRESENTATION_INFO_AMD        ((VkStructureType)1000476002)
+typedef enum VkAntiLagModeAMD
+{
+   VK_ANTI_LAG_MODE_DRIVER_CONTROL_AMD = 0,
+   VK_ANTI_LAG_MODE_ON_AMD             = 1,
+   VK_ANTI_LAG_MODE_OFF_AMD            = 2,
+   VK_ANTI_LAG_MODE_MAX_ENUM_AMD       = 0x7FFFFFFF
+} VkAntiLagModeAMD;
+typedef enum VkAntiLagStageAMD
+{
+   VK_ANTI_LAG_STAGE_INPUT_AMD    = 0,
+   VK_ANTI_LAG_STAGE_PRESENT_AMD  = 1,
+   VK_ANTI_LAG_STAGE_MAX_ENUM_AMD = 0x7FFFFFFF
+} VkAntiLagStageAMD;
+typedef struct VkPhysicalDeviceAntiLagFeaturesAMD
+{
+   VkStructureType sType;
+   void           *pNext;
+   VkBool32        antiLag;
+} VkPhysicalDeviceAntiLagFeaturesAMD;
+typedef struct VkAntiLagPresentationInfoAMD
+{
+   VkStructureType   sType;
+   void             *pNext;
+   VkAntiLagStageAMD stage;
+   uint64_t          frameIndex;
+} VkAntiLagPresentationInfoAMD;
+typedef struct VkAntiLagDataAMD
+{
+   VkStructureType                     sType;
+   const void                         *pNext;
+   VkAntiLagModeAMD                    mode;
+   uint32_t                            maxFPS;
+   const VkAntiLagPresentationInfoAMD *pPresentationInfo;
+} VkAntiLagDataAMD;
+typedef void (VKAPI_PTR *PFN_vkAntiLagUpdateAMD)(VkDevice device,
+      const VkAntiLagDataAMD *pData);
+#endif
+
+#if defined(_WIN32) && !defined(__WINRT__)
+#include "d3d_driver_pacing.h"
+#define VULKAN_DXGI_PACING
+#endif
+
+typedef struct vulkan_low_latency
+{
+   uint64_t frame_id;
+   uint64_t sleep_value;
+   VkSemaphore semaphore;        /* 64-bit handle */
+   VkSwapchainKHR swapchain;     /* 64-bit handle */
+   VkSwapchainKHR pub_table[2];
+   VkSwapchainKHR pub_pending;
+   VkSwapchainKHR retired[4];
+   PFN_vkVoidFunction set_sleep_mode;
+   PFN_vkVoidFunction sleep;
+   PFN_vkVoidFunction set_marker;
+   PFN_vkVoidFunction wait_semaphores;
+   /* VK_AMD_anti_lag, where the device has it and not the above: the
+    * frame loop's INPUT update is the hold, the presenter's PRESENT
+    * update names the same frame. Device-wide, no swapchain, so the
+    * mode crosses threads as @amd_mode alone. */
+   PFN_vkVoidFunction anti_lag_update;
+   retro_atomic_size_t pub_gen;
+   retro_atomic_int_t want;
+   retro_atomic_int_t answer;
+   retro_atomic_int_t in_call;
+   retro_atomic_int_t stalled;   /* the frame loop gave up waiting */
+   retro_atomic_int_t amd_mode;  /* enum video_driver_pacing_mode in effect */
+   retro_atomic_int_t amd_max_fps; /* the frame limit, from the presenter */
+   uint32_t min_interval_us;
+   uint32_t spec_version;
+   unsigned num_retired;
+   unsigned timeouts;
+   uint8_t mode;        /* enum video_driver_pacing_mode set on @swapchain */
+   uint8_t stage;
+   bool supported;
+   bool failed;
+   bool publish_pending;
+   bool anti_lag;        /* VK_AMD_anti_lag and its feature are on */
+   bool anti_lag_ext;    /* the extension is in the device's list */
+   /* The device is a core's, made without RetroArch's list (an older
+    * negotiation interface, or the core's own) */
+   bool core_device;
+   bool noted;           /* this device's extensions were seen */
+#ifdef VULKAN_DXGI_PACING
+   /* Presented through DXGI: Reflex through NVAPI on the D3D12 device
+    * that presents, the presenter's to set as the native path's mode
+    * is. @dxgi_pub is the device the frame loop sleeps and marks on
+    * while the mode is in effect there, 0 otherwise; every device it
+    * has been is referenced in @dxgi_held until the context goes. */
+   d3d_driver_pacing_t dxgi;
+   void *dxgi_held[4];
+   unsigned dxgi_num_held;
+   retro_atomic_size_t dxgi_pub;
+#endif
+} vulkan_low_latency_t;
+
 typedef struct gfx_ctx_vulkan_data
 {
    struct string_list *gpu_list;
    vulkan_context_t context;
+   vulkan_low_latency_t low_latency;
    VkSurfaceKHR vk_surface;      /* ptr alignment */
    VkSwapchainKHR swapchain;     /* ptr alignment */
    struct vulkan_emulated_mailbox mailbox;
@@ -417,6 +553,10 @@ typedef struct gfx_ctx_vulkan_data
    PFN_vkVoidFunction display_timing_query;
    uint32_t present_id;
    bool display_timing_supported;
+#ifdef __APPLE__
+   /* Bound on the acquire fence wait, from the display's rate. */
+   int64_t acquire_timeout_us;
+#endif
 #ifdef HAVE_OPENXR
    /* A headset's own context (the Quest's): OpenXR starts whatever
     * Headset Output says, and a failure falls through to the flat
@@ -501,6 +641,11 @@ uint32_t vulkan_find_memory_type(
       const VkPhysicalDeviceMemoryProperties *mem_props,
       uint32_t device_reqs, uint32_t host_reqs);
 
+/* Signals @fence once the work already on @queue is done: an empty
+ * batch, not a NULL one, as layers such as OptiScaler refuse a NULL
+ * pSubmits. The caller holds the queue lock. */
+VkResult vulkan_queue_signal_fence(VkQueue queue, VkFence fence);
+
 /* Allocates alloc->allocationSize for a buffer the CPU only writes and
  * the GPU reads. alloc->memoryTypeIndex is the caller's host-visible
  * choice; it is used as given unless the device maps all of its memory
@@ -577,6 +722,133 @@ unsigned vulkan_context_take_acquire_waits(struct vulkan_context *ctx,
  * leaves the extent to the swapchain. */
 bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
       unsigned dims, int8_t swap_interval);
+
+/* The low-latency release, behind the video driver's driver_pacing_*
+ * pokes (gfx/video_driver.h says what each does and answers). The
+ * three below are the frame loop's, safe from a thread other than the
+ * presenter's; the rest run on the presenter's thread. */
+unsigned vulkan_low_latency_set(gfx_ctx_vulkan_data_t *vk, unsigned mode);
+bool vulkan_low_latency_wait(gfx_ctx_vulkan_data_t *vk,
+      uint64_t frame_id, uint64_t next_id, unsigned max_wait_us);
+void vulkan_low_latency_mark_main(gfx_ctx_vulkan_data_t *vk,
+      uint64_t frame_id, unsigned marker);
+/* The driver's frame begins, with the frame's identity and interval
+ * from its info: applies a mode the frame loop asked for, takes the
+ * identity, and says the frame's simulation ended and its render
+ * submission began, once per identity. */
+void vulkan_low_latency_frame_begin(gfx_ctx_vulkan_data_t *vk,
+      uint64_t frame_id, unsigned min_interval_us);
+/* Around every present of the swapchain: the released frame's own
+ * present gets its markers and the sleep that follows; any other is
+ * marked out of band on the same identity. */
+void vulkan_low_latency_present_begin(gfx_ctx_vulkan_data_t *vk);
+void vulkan_low_latency_present_end(gfx_ctx_vulkan_data_t *vk);
+/* A swapchain goes: destroyed now, or once the frame loop is seen out
+ * of a marker call that may name it. Every swapchain destroy of the
+ * context goes through here. */
+void vulkan_low_latency_retire(gfx_ctx_vulkan_data_t *vk,
+      VkSwapchainKHR swapchain);
+
+#ifdef HAVE_VIDEO_WINDOWS
+#define VULKAN_OUTPUT_RETIRED_MAX 2
+
+/* A swapchain an output let go of, destroyed once its fence shows that
+ * the frames that drew into it and its presents have run */
+struct vulkan_output_retired
+{
+   VkSwapchainKHR swapchain;     /* ptr alignment */
+   VkImageView views[VULKAN_MAX_SWAPCHAIN_IMAGES];
+   VkFramebuffer framebuffers[VULKAN_MAX_SWAPCHAIN_IMAGES];
+   VkSemaphore semaphores[VULKAN_MAX_SWAPCHAIN_IMAGES];
+   /* Made with the output; signalled by an empty submission queued
+    * behind its last present */
+   VkFence fence;
+   unsigned num_images;
+   bool pending;
+};
+
+enum vulkan_output_flags
+{
+   /* images[index] is acquired and not yet presented */
+   VK_OUTPUT_FLAG_ACQUIRED           = (1 << 0),
+   /* and acquire_fence has signalled: the image is free to draw into */
+   VK_OUTPUT_FLAG_READY              = (1 << 1),
+   /* acquire_fence went to an acquire and needs a reset before the next */
+   VK_OUTPUT_FLAG_FENCE_USED         = (1 << 2),
+   /* out of date or suboptimal: remade at the next chance */
+   VK_OUTPUT_FLAG_RECREATE           = (1 << 3),
+   /* remade for a suboptimal present; another suboptimal one is kept */
+   VK_OUTPUT_FLAG_SUBOPTIMAL_REBUILT = (1 << 4),
+   /* the surface is gone, or no swapchain can be made for it */
+   VK_OUTPUT_FLAG_LOST               = (1 << 5),
+   /* teardown gave up on acquire_fence, which may still be signalled:
+    * it is left, never destroyed */
+   VK_OUTPUT_FLAG_FENCE_PENDING      = (1 << 6)
+};
+
+/* A second presentable surface on the context's device and queue, with
+ * a swapchain of its own. The driver draws into it in the frame's own
+ * submission, which signals semaphores[index], and presents it after.
+ * Nothing here waits in a frame: the acquire takes no time, its fence
+ * is polled, and a swapchain let go of is destroyed once a fence says
+ * its work is done. */
+typedef struct vulkan_output
+{
+   vulkan_context_t *owner;      /* borrowed: instance, device, queue */
+   VkSurfaceKHR surface;
+   VkSwapchainKHR swapchain;
+   /* Set by the caller before create: the framebuffers are made for it */
+   VkRenderPass render_pass;
+   VkFence acquire_fence;
+   VkImage images[VULKAN_MAX_SWAPCHAIN_IMAGES];
+   VkImageView views[VULKAN_MAX_SWAPCHAIN_IMAGES];
+   VkFramebuffer framebuffers[VULKAN_MAX_SWAPCHAIN_IMAGES];
+   /* Signalled by the submission that drew image i, waited by its
+    * present */
+   VkSemaphore semaphores[VULKAN_MAX_SWAPCHAIN_IMAGES];
+   struct vulkan_output_retired retired[VULKAN_OUTPUT_RETIRED_MAX];
+   VkFormat format;
+   VkPresentModeKHR present_mode;
+   unsigned num_images;
+   unsigned index;
+   unsigned dims;                /* VIDEO_SCALE_PACK of the extent */
+   unsigned flags;               /* VK_OUTPUT_FLAG_* */
+} vulkan_output_t;
+
+/* @output's surface, from @display and @surface as
+ * vulkan_surface_create() takes them, and a swapchain of @dims (or of
+ * the surface's own extent) in @owner's swapchain format: MAILBOX where
+ * the surface offers it, else FIFO. @output is zeroed by the caller,
+ * with render_pass set. False when it can't be made; retire still
+ * frees what was. */
+bool vulkan_output_create(vulkan_output_t *output,
+      vulkan_context_t *owner, enum vulkan_wsi_type type,
+      void *display, void *surface, unsigned dims);
+
+/* A new swapchain at @dims, the old one retired behind a fence. False
+ * while it can't be yet (an acquire still pending, both retired slots
+ * busy, a zero extent), and with VK_OUTPUT_FLAG_LOST when it can't be. */
+bool vulkan_output_resize(vulkan_output_t *output, unsigned dims);
+
+/* True when images[index] is free to draw into. Never waits: an image
+ * whose fence has not signalled is kept for the next call, and out of
+ * date remakes the swapchain and tries once more. */
+bool vulkan_output_acquire(vulkan_output_t *output);
+
+/* Presents images[index] behind semaphores[index]. Never waits. Out of
+ * date, or suboptimal once, remakes the swapchain. False with
+ * VK_OUTPUT_FLAG_LOST when the surface is gone. */
+bool vulkan_output_present(vulkan_output_t *output);
+
+/* Lets go of everything, the surface last: true once all of it is
+ * destroyed. Never waits; call it again on a later frame until true. */
+bool vulkan_output_retire(vulkan_output_t *output);
+
+/* The driver's teardown only, after its own submissions: waits for
+ * what retire waits on, so that the next vulkan_output_retire() returns
+ * true. An acquire never answered is waited on for a bound. */
+void vulkan_output_finish(vulkan_output_t *output);
+#endif
 
 void vulkan_debug_mark_image(VkDevice device, VkImage image);
 void vulkan_debug_mark_memory(VkDevice device, VkDeviceMemory memory);

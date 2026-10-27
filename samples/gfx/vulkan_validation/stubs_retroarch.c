@@ -83,6 +83,8 @@ void *config_get_ptr(void) { return s_settings; }
 void *video_state_get_ptr(void) { static char st[1 << 16]; return st; }
 
 const char *msg_hash_to_str(int e) { (void)e; return "stub"; }
+const char *stub_video_ident = "vulkan";
+const char *video_driver_get_ident(void) { return stub_video_ident; }
 
 void video_driver_set_gpu_api_devices(int api, void *list) { (void)api; (void)list; }
 void video_driver_set_gpu_api_version_string(const char *s) { (void)s; }
@@ -90,6 +92,9 @@ void video_driver_cache_context_ack_set(void) { }
 uint32_t video_driver_get_disp_flags(void) { return 0; }
 /* The emulated mailbox derives its waits from this. */
 float video_driver_get_refresh_rate(void) { return 60.0f; }
+/* The core's declared rate: what a test says it is */
+float stub_core_hz = 0.0f;
+float video_driver_get_core_hz(void) { return stub_core_hz; }
 void video_driver_modify_disp_flags(uint32_t s, uint32_t c) { (void)s; (void)c; }
 /* No display peak known: HDR metadata keeps the driver's own value */
 float video_driver_hdr_metadata_peak(float driver_value) { return driver_value; }

@@ -38,6 +38,7 @@
 #include "input_defines.h"
 #include "../gfx/video_defines.h"
 #include "input_types.h"
+#include "input_sensor_snap.h"
 #ifdef HAVE_OVERLAY
 #include "input_overlay.h"
 #endif
@@ -229,6 +230,17 @@ struct bsv_input_data
 };
 typedef struct bsv_input_data bsv_input_data_t;
 
+#define BSV_MOVIE_MAX_INPUT_EVENTS 512
+
+enum bsv_netplay_flags
+{
+   BSV_NETPLAY_FLAG_ACTIVE    = (1 << 0),
+   BSV_NETPLAY_FLAG_ARMED     = (1 << 1),
+   BSV_NETPLAY_FLAG_COMMITTED = (1 << 2)
+};
+
+#define BSV_MOVIE_IS_NETPLAY(m) (((m)->netplay_flags & BSV_NETPLAY_FLAG_ACTIVE) != 0)
+
 struct bsv_movie
 {
    intfstream_t *file;
@@ -246,13 +258,20 @@ struct bsv_movie
    uint8_t key_event_count;
    uint16_t input_event_count;
    bsv_key_data_t key_events[128];
-   bsv_input_data_t input_events[512];
+   bsv_input_data_t input_events[BSV_MOVIE_MAX_INPUT_EVENTS];
 
    /* Rewind state */
    bool playback;
    bool first_rewind;
    bool did_rewind;
    bool checkpoint_ready;
+
+   /* Netplay stages frames until their inputs have been confirmed. */
+   const char *netplay_error;
+   size_t netplay_next_ptr;
+   uint32_t netplay_start_frame;
+   uint32_t netplay_next_frame;
+   uint8_t netplay_flags; /* enum bsv_netplay_flags */
 
 #ifdef HAVE_STATESTREAM
    /* Block index and superblock index for incremental checkpoints */
@@ -540,10 +559,10 @@ struct input_driver
     * the video driver is restarted: nothing it holds belongs to the video
     * driver, its window or its thread, and it needs no restart to notice
     * anything a restart used to make it notice. The joypad driver in use
-    * is its to answer for as well, since the two are kept or restarted
-    * together. NULL, which every driver that does not name it has, means
-    * no: the driver is freed with the video driver
-    * and started again, as it always was. See
+    * is kept or restarted with it, and answers for itself
+    * (rarch_joypad_driver::survives_video). NULL, which every driver
+    * that does not name it has, means no: the driver is freed with the
+    * video driver and started again, as it always was. See
     * input_driver_keep_for_video_restart().
     *
     * @param data  The input state struct
@@ -595,6 +614,31 @@ struct input_driver
    unsigned (*bind_mouse_buttons)(void *data, unsigned port);
 };
 
+/* A pad's state as a joypad driver keeps it, for a driver whose state
+ * changes only in its own poll: lent to the readers between two polls
+ * in place of a copy (input_driver.c, the snapshot bridge). What each
+ * field holds is what button(), axis() and get_buttons() answer. */
+#define INPUT_PAD_VIEW_AXES 16
+#define INPUT_PAD_VIEW_HATS 4
+#define INPUT_PAD_VIEW_TOUCHES 2
+/* touch_down's bit for the touchpad pressed in, beside its fingers' */
+#define INPUT_PAD_TOUCH_PRESS 0x80
+
+typedef struct input_pad_view
+{
+   input_bits_t buttons;
+   /* each axis signed, as axis() gives its two directions */
+   int16_t      axes[INPUT_PAD_VIEW_AXES];
+   /* four bits a hat, from bit 0: up, down, left, right */
+   uint16_t     hats;
+   /* A touchpad's fingers where the pointer device puts a place: x in
+    * the low half of each word, y in the high, -0x7fff to 0x7fff across
+    * the pad. Bit n of touch_down is finger n on it. */
+   uint32_t     touch[INPUT_PAD_VIEW_TOUCHES];
+   uint8_t      touch_down;
+   bool         touchpad;   /* the pad has one */
+} input_pad_view_t;
+
 struct rarch_joypad_driver
 {
    void *(*init)(void *data);
@@ -627,6 +671,27 @@ struct rarch_joypad_driver
     * byte first. NULL, or false, where the pad has none. */
    bool (*get_bt_host)(unsigned pad, uint8_t *addr);
    bool (*set_bt_host)(unsigned pad, const uint8_t *addr);
+
+   /* Whether the driver, as it runs now, can be left running with the
+    * input driver across a video driver restart: it holds nothing of
+    * the video driver's. NULL means no, and both are restarted. */
+   bool (*survives_video)(void);
+
+   /* The player pad @pad's lights are to show, from 1; 0 for none, no
+    * port reading it. Told by the frontend now and then, whether or not
+    * it changed; the driver acts on a change. NULL where the driver
+    * lights nothing, or lights by its own lights. */
+   void (*set_player)(unsigned pad, unsigned player);
+
+   /* Pad @pad's state, unchanged until the driver's next poll; NULL
+    * where the driver cannot say that, which then gets copied. Asked
+    * once a poll per pad read. */
+   const input_pad_view_t *(*view)(unsigned pad);
+
+   /* Pad @pad's touchpad now, into @view's touch and touch_down; false
+    * where it has none. For a driver without view(), whose pads are
+    * copied; NULL where the driver reads no touchpad. */
+   bool (*get_touchpad)(unsigned pad, input_pad_view_t *view);
 };
 
 /**
@@ -794,6 +859,8 @@ typedef struct
 
    /* primitives */
    bool analog_requested[MAX_USERS];
+   /* the core reads the port's controller touchpad itself */
+   bool touchpad_requested[MAX_USERS];
 
    /* Per-port joypad state bitmask cache.
     * Populated lazily on the first JOYPAD query for each mapped_port
@@ -826,6 +893,8 @@ typedef struct
    uint32_t core_hold_gun[MAX_USERS];
    uint8_t  core_hold_pointer[MAX_USERS];
    bool core_hold_armed;
+   /* tested with core_hold_armed in the core's read */
+   bool enabler_tap_active;
    /* any of cmd_buttons or cmd_analog is held */
    bool cmd_input;
    /* The same for what the run loop and the menu see - the RetroPad
@@ -940,12 +1009,9 @@ typedef struct
     * demand check on the main thread: atomic with release/acquire,
     * not a plain bool. */
    retro_atomic_int_t shader_uses_sensors;
-   /* Seqlock publication of the sensor caches below - poll computes
-    * the caches, then publishes gyro, accelerometer and rest (nine
-    * floats as bits) here for the shader backends' per-frame reads
-    * from the video thread. */
-   retro_atomic_int_t sensor_snap_seq;
-   retro_atomic_int_t sensor_snap_bits[9];
+   /* The sensor caches below, as the shader backends read them each
+    * frame from the video thread (input_sensor_snap.h). */
+   input_sensor_snap_t sensor_snap;
    bool frontend_sensors_enabled;
    /* The snapshot shaders read holds noughts and no shader reads
     * sensors: the poll has nothing to publish. The poll's own. */
@@ -1166,6 +1232,11 @@ bool input_bluetooth_host_address(uint8_t *addr, char *name, size_t len);
 
 /* The Bluetooth address a controller connects to, read and set where
  * its driver can (see input_device_driver_t's get_bt_host). */
+/* A device number for a pad of a source beside the joypad driver
+ * (input_device_pool.h), or -1; and giving it back. */
+int input_driver_device_claim(unsigned source, unsigned slot);
+void input_driver_device_release(unsigned source, unsigned slot);
+
 bool input_driver_get_bt_host(unsigned pad, uint8_t *addr);
 bool input_driver_set_bt_host(unsigned pad, const uint8_t *addr);
 bool input_config_get_android_disconnect_workaround(void);
@@ -1189,6 +1260,10 @@ void input_driver_command_release(unsigned port);
 /* The buttons a command holds for a port, one bit each, and the four
  * axes into analog. */
 uint16_t input_driver_command_held(unsigned port, int16_t *analog);
+
+/* Whether a replay is being recorded: what a state restored outside
+ * the replay's own data would break. */
+bool input_driver_replay_recording(void);
 void input_driver_set_native_keyboard_shown(bool shown);
 bool input_driver_native_keyboard_shown(void);
 bool input_driver_keyboard_mapping_blocked(void);
@@ -1418,6 +1493,26 @@ enum input_pointers_flags
 void input_driver_publish_pointers(const input_pointer_frame_t *frames,
       unsigned count, unsigned flags);
 
+/* The window a device or a touch is in: 0 the main window, else a
+ * screen's own, with the generation it was made with. */
+typedef struct input_video_window
+{
+   unsigned window;
+   unsigned generation;
+} input_video_window_t;
+
+#ifdef HAVE_VIDEO_WINDOWS
+/* input_driver_publish_pointers() with each device's window. Its place
+ * is in that window, through the layout the window last published; a
+ * screen's window has no place on the main window's screen, and one
+ * that is gone places it off-screen. Motion and buttons are as they
+ * were. NULL @windows: all in the main window. */
+void input_driver_publish_window_pointers(
+      const input_pointer_frame_t *frames,
+      const input_video_window_t *windows,
+      unsigned count, unsigned flags);
+#endif
+
 /* The viewport as of this poll: asked of the video driver the first
  * time it is wanted after a poll, and that answer given until the
  * next. For a driver that places its own touches or mouse, in its poll
@@ -1443,8 +1538,23 @@ unsigned input_driver_pointer_read_as(unsigned i);
  * all; a bit in @down if it is pressed. The three are separate: a
  * contact at 0,0 is a contact, and one that has lifted may keep its
  * place (@present without @down). */
+/* Each touch's contact, as the touchscreen reports it, for touch @i
+ * of the driver's pointer: @contacts as OVERLAY_CONTACT_PACK(major,
+ * minor) in pixels, @angles its orientation in ten-thousandths of a
+ * radian, 0 upright and positive clockwise. From the driver's poll;
+ * none is had again until the next. For the overlay's D-pad and face
+ * buttons (input/common/overlay_contact.h). */
+void input_driver_publish_touch_contacts(const uint32_t *contacts,
+      const int16_t *angles, unsigned count);
 void input_driver_publish_touches(const uint32_t *pos, unsigned count,
       unsigned present, unsigned down);
+
+#ifdef HAVE_VIDEO_WINDOWS
+/* The same with each place's window, as for the devices. */
+void input_driver_publish_window_touches(const uint32_t *pos,
+      const input_video_window_t *windows, unsigned count,
+      unsigned present, unsigned down);
+#endif
 
 typedef struct input_pointer_view
 {
@@ -1673,6 +1783,21 @@ const char* config_get_hid_driver_options(void);
  **/
 const hid_driver_t *input_hid_init_first(void);
 
+/* The device number a HID driver's pad in @slot is known by: the slot
+ * itself where the HID driver is the joypad driver's, a number from
+ * the shared pool where it is a source beside it; -1 when there is
+ * none. Released when the pad goes. */
+int input_driver_hid_claim(const void *hid_data, unsigned slot,
+      const char *name, uint16_t vid, uint16_t pid);
+int input_driver_hid_number(const void *hid_data, unsigned slot);
+void input_driver_hid_release(const void *hid_data, unsigned slot);
+/* Whether the HID driver runs beside another joypad driver, which sees
+ * every pad Windows' own HID driver has: it takes only the pads nothing
+ * else can reach. */
+bool input_driver_hid_beside(const void *hid_data);
+/* A test's source beside the joypad driver, in place of the platform's. */
+void input_driver_beside_override(const hid_driver_t *drv);
+
 /**
  * Get a pointer to the HID driver data structure
  *
@@ -1850,17 +1975,20 @@ unsigned input_config_get_device_count(void);
 /**
  * input_config_sanitize_joypad_indices:
  *
- * Restores the invariant that settings->uints.input_joypad_index[]
- * is a permutation of [0, MAX_USERS): every player maps to a distinct
- * pad index, and every entry is in range.
- *
- * Entries are examined in ascending player order and the first
- * claimant of an index keeps it, so repairing a duplicate never takes
- * a pad away from a lower numbered player.
+ * Puts a player whose pad index is out of range on an index no player
+ * holds. Players sharing an index are left as they are.
  *
  * Returns true if the mapping had to be corrected.
  **/
 bool input_config_sanitize_joypad_indices(void);
+
+/* A port whose pad index a lower port also holds follows that port:
+ * @leader gets, for each of the MAX_USERS ports, the lowest port on
+ * its index. Code that moves controllers between ports moves only the
+ * leaders and then calls input_config_follow_shared_ports(). Returns
+ * how many ports follow another. */
+unsigned input_config_shared_ports(uint8_t *leader);
+void input_config_follow_shared_ports(const uint8_t *leader);
 
 unsigned *input_config_get_device_ptr(unsigned port);
 
@@ -2156,6 +2284,14 @@ void bsv_movie_frame_rewind(input_driver_state_t *input_st);
 /* The replay is over: said by the code that reads it, which is handed
  * the replay and not the input state. */
 void bsv_movie_set_end(void);
+#ifdef HAVE_NETWORKING
+bsv_movie_t *input_driver_netplay_bsv_recording(void);
+void input_driver_netplay_bsv_stop(const char *reason, bool checkpoint_failed);
+bool input_driver_netplay_bsv_take_checkpoint(void);
+bool input_driver_netplay_bsv_next_frame(const void *state, size_t size,
+      bool forced);
+bool input_driver_bsv_stop_recording(void);
+#endif
 /* @checkpoint_interval and @checkpoint_deserialize are the two replay
  * settings, handed over by the run loop, which has them. */
 void bsv_movie_next_frame(input_driver_state_t *input_st,
@@ -2362,6 +2498,8 @@ size_t input_entry_target(unsigned number, char *s, size_t len);
  * second (0: at once); and set. */
 unsigned input_entry_hold(unsigned number);
 bool input_entry_set_hold(unsigned number, unsigned tenths);
+unsigned input_entry_depth(unsigned number);
+bool input_entry_set_depth(unsigned number, unsigned percent);
 size_t input_entry_spec(unsigned number, char *s, size_t len);
 /* The entries and macros written into a configuration to be saved. */
 void input_entries_write(void *conf);

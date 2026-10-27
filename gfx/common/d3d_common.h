@@ -33,10 +33,12 @@
 #endif
 
 #include <boolean.h>
+#include <retro_atomic.h>
 #include <retro_common_api.h>
 
 #include "../font_driver.h"
 #include "../../retroarch.h"
+#include "d3d_driver_pacing.h"
 
 RETRO_BEGIN_DECLS
 

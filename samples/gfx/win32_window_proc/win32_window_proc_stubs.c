@@ -133,6 +133,7 @@ bool video_driver_is_threaded(void)                          { return false; }
 uint32_t runloop_get_flags(void)                             { return stub_runloop_st.flags; }
 bool task_is_on_main_thread(void)                            { return true; }
 bool video_thread_host_hold(void (*on_exit)(void))           { return false; }
+bool video_thread_host_set_cleanup(void (*cleanup)(void))    { (void)cleanup; return false; }
 bool video_thread_host_is_held(void)                         { return false; }
 void video_thread_host_stop(void)                            { }
 void *video_driver_get_ptr(void)                             { return NULL; }
@@ -149,12 +150,17 @@ void create_gl_context(HWND hwnd, bool *quit)
    stub_create_steps |= 1;
 }
 
+/* As the real one answers: no swapchain is made for a window with no
+ * client area, and the surface is refused with it. */
+unsigned stub_vk_surface_dims;
+
 bool vulkan_surface_create(gfx_ctx_vulkan_data_t *vk,
       enum vulkan_wsi_type type, void *display, void *surface,
       unsigned dims, int8_t swap_interval)
 {
-   stub_create_steps |= 2;
-   return true;
+   stub_create_steps    |= 2;
+   stub_vk_surface_dims  = dims;
+   return VIDEO_SCALE_W(dims) && VIDEO_SCALE_H(dims);
 }
 
 /* ---- the Win32 UI ---- */

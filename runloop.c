@@ -112,6 +112,15 @@
 #include "input/drivers/android_input.h"
 #endif
 
+/* Android publishes the device's GLES level as a system property;
+ * SET_HW_RENDER grants GLES versions against it. */
+#if defined(ANDROID) && !defined(RUNLOOP_GLES_VERSION_PROPERTY)
+#define RUNLOOP_GLES_VERSION_PROPERTY
+#endif
+#ifdef RUNLOOP_GLES_VERSION_PROPERTY
+#include <sys/system_properties.h>
+#endif
+
 #if defined(ANDROID) && defined(HAVE_SAF)
 bool android_get_vfs_authorized_locations(
       struct retro_vfs_authorized_locations *locations);
@@ -131,7 +140,7 @@ bool android_get_vfs_authorized_locations(
 #include "camera/camera_driver.h"
 #include "location_driver.h"
 #include "record/record_driver.h"
-#include "record/drivers/record_nvenc.h"
+#include "record/record_driver.h"
 #include "msg_hash_lbl_str.h"
 
 #ifdef HAVE_CONFIG_H
@@ -214,6 +223,9 @@ bool android_get_vfs_authorized_locations(
 #include "gfx/video_thread_wrapper.h"
 #endif
 #include "gfx/video_display_server.h"
+#ifdef HAVE_TEMPORAL_UPSCALER
+#include "gfx/video_upscaler.h"
+#endif
 #ifdef HAVE_MODELINE
 #include "gfx/video_crt_switch.h"
 #endif
@@ -1210,6 +1222,12 @@ static bool dynamic_verify_hw_context(
       size_t len = strlen(video_ident);
       switch (type)
       {
+#ifdef HAVE_GCM
+         case RETRO_HW_CONTEXT_RSX:
+            if (!(len == 3 && memcmp(video_ident, "rsx", 3) == 0))
+               return false;
+            break;
+#endif
          case RETRO_HW_CONTEXT_VULKAN:
             if (!(len == 6 && memcmp(video_ident, "vulkan", 6) == 0))
                return false;
@@ -1253,6 +1271,35 @@ static bool dynamic_verify_hw_context(
    return true;
 }
 
+#if defined(HAVE_OPENGLES) && (defined(HAVE_OPENGLES2) || defined(HAVE_OPENGLES3))
+/* The highest GLES version a core may be granted, as major * 100 +
+ * minor. A device that publishes its GLES level is taken at its word,
+ * so a core walking down a version list stops at one the context can
+ * really give; otherwise the build decides. A GLES2 build already
+ * grants OPENGLES3, so 3.0 is its ceiling as well. */
+static unsigned runloop_gles_version_ceiling(void)
+{
+#if defined(HAVE_OPENGLES3_2)
+   unsigned ceiling = 302;
+#elif defined(HAVE_OPENGLES3_1)
+   unsigned ceiling = 301;
+#else
+   unsigned ceiling = 300;
+#endif
+#ifdef RUNLOOP_GLES_VERSION_PROPERTY
+   char value[PROP_VALUE_MAX];
+   /* ro.opengles.version is major << 16 | minor */
+   if (__system_property_get("ro.opengles.version", value) > 0)
+   {
+      unsigned long v = strtoul(value, NULL, 10);
+      if (v >> 16)
+         ceiling = (unsigned)((v >> 16) * 100 + (v & 0xFFFF));
+   }
+#endif
+   return ceiling;
+}
+#endif
+
 static bool dynamic_request_hw_context(enum retro_hw_context_type type,
       unsigned minor, unsigned major)
 {
@@ -1262,12 +1309,18 @@ static bool dynamic_request_hw_context(enum retro_hw_context_type type,
          RARCH_LOG("[HW] Requesting no HW context.\n");
          break;
 
+#ifdef HAVE_GCM
+      case RETRO_HW_CONTEXT_RSX:
+         RARCH_LOG("[HW] Requesting RSX context.\n");
+         break;
+#endif
+
       case RETRO_HW_CONTEXT_VULKAN:
 #ifdef HAVE_VULKAN
          RARCH_LOG("[HW] Requesting Vulkan context.\n");
          break;
 #else
-         RARCH_ERR("[HW] Requesting Vulkan context, but RetroArch is not compiled against Vulkan. Cannot use HW context.\n");
+         RARCH_WARN("[HW] Requesting Vulkan context, but RetroArch is not compiled against Vulkan. Cannot use HW context.\n");
          return false;
 #endif
 
@@ -1276,50 +1329,50 @@ static bool dynamic_request_hw_context(enum retro_hw_context_type type,
 #if (defined(HAVE_OPENGLES2) || defined(HAVE_OPENGLES3))
       case RETRO_HW_CONTEXT_OPENGLES2:
       case RETRO_HW_CONTEXT_OPENGLES3:
-         RARCH_LOG("[HW] Requesting OpenGLES%u context.\n",
-               type == RETRO_HW_CONTEXT_OPENGLES2 ? 2 : 3);
-         break;
-
-#if defined(HAVE_OPENGLES3)
       case RETRO_HW_CONTEXT_OPENGLES_VERSION:
-#ifndef HAVE_OPENGLES3_2
-         if (major == 3 && minor == 2)
          {
-            RARCH_ERR("[HW] Requesting OpenGLES%u.%u context, but RetroArch is compiled against a lesser version. Cannot use HW context.\n",
-                  major, minor);
-            return false;
+            unsigned ceiling = runloop_gles_version_ceiling();
+
+            if (type == RETRO_HW_CONTEXT_OPENGLES2)
+            {
+               major = 2;
+               minor = 0;
+            }
+            else if (type == RETRO_HW_CONTEXT_OPENGLES3)
+            {
+               major = 3;
+               minor = 0;
+            }
+
+            if (major * 100 + minor > ceiling)
+            {
+               RARCH_WARN("[HW] Requesting OpenGLES%u.%u context, but "
+                     "only OpenGLES%u.%u is available. Cannot use HW "
+                     "context.\n", major, minor,
+                     ceiling / 100, ceiling % 100);
+               return false;
+            }
          }
-#endif
-#if !defined(HAVE_OPENGLES3_2) && !defined(HAVE_OPENGLES3_1)
-         if (major == 3 && minor == 1)
-         {
-            RARCH_ERR("[HW] Requesting OpenGLES%u.%u context, but RetroArch is compiled against a lesser version. Cannot use HW context.\n",
-                  major, minor);
-            return false;
-         }
-#endif
          RARCH_LOG("[HW] Requesting OpenGLES%u.%u context.\n",
                major, minor);
          break;
 #endif
-
-#endif
       case RETRO_HW_CONTEXT_OPENGL:
       case RETRO_HW_CONTEXT_OPENGL_CORE:
-         RARCH_ERR("[HW] Requesting OpenGL context, but RetroArch "
+         RARCH_WARN("[HW] Requesting OpenGL context, but RetroArch "
                "is compiled against OpenGLES. Cannot use HW context.\n");
          return false;
 
 #elif defined(HAVE_OPENGL) || defined(HAVE_OPENGL_CORE)
       case RETRO_HW_CONTEXT_OPENGLES2:
       case RETRO_HW_CONTEXT_OPENGLES3:
-         RARCH_ERR("[HW] Requesting OpenGLES%u context, but RetroArch "
+         RARCH_WARN("[HW] Requesting OpenGLES%u context, but RetroArch "
                "is compiled against OpenGL. Cannot use HW context.\n",
                type == RETRO_HW_CONTEXT_OPENGLES2 ? 2 : 3);
          return false;
 
       case RETRO_HW_CONTEXT_OPENGLES_VERSION:
-         RARCH_ERR("[HW] Requesting OpenGLES%u.%u context, but RetroArch "
+         RARCH_WARN("[HW] Requesting OpenGLES%u.%u context, but RetroArch "
                "is compiled against OpenGL. Cannot use HW context.\n",
                major, minor);
          return false;
@@ -1357,7 +1410,8 @@ static bool dynamic_request_hw_context(enum retro_hw_context_type type,
          break;
 #endif
       default:
-         RARCH_LOG("[HW] Requesting unknown context.\n");
+         RARCH_WARN("[HW] Requesting context type %d, which this build "
+               "does not support. Cannot use HW context.\n", (int)type);
          return false;
    }
 
@@ -3028,12 +3082,13 @@ bool runloop_environment_cb(unsigned cmd, void *data)
             return false;
          }
 
-         RARCH_LOG("[Environ] SET_HW_RENDER, context type: %s.\n", hw_render_context_name(cb->context_type, cb->version_major, cb->version_minor));
-
+         /* A refusal is the answer to one probe: cores walk a list
+          * of context types until one is accepted, so it is a warning
+          * here and the core decides whether it was fatal. */
          if (!dynamic_request_hw_context(
                   cb->context_type, cb->version_minor, cb->version_major))
          {
-            RARCH_ERR("[Environ] SET_HW_RENDER: Dynamic request HW context failed.\n");
+            RARCH_WARN("[Environ] SET_HW_RENDER: Context refused, the core may request another.\n");
             return false;
          }
 
@@ -3409,6 +3464,7 @@ bool runloop_environment_cb(unsigned cmd, void *data)
             bool video_frame_delay_auto           = settings->bools.video_frame_delay_auto;
             bool video_switch_refresh_rate        = false;
             bool no_video_reinit                  = true;
+            bool fps_changed                      = false;
 
             /* Refresh rate switch for regular displays */
             if (video_display_server_has_resolution_list())
@@ -3460,9 +3516,19 @@ bool runloop_environment_cb(unsigned cmd, void *data)
                   (*info)->timing.fps,
                   (*info)->timing.sample_rate);
 
+            fps_changed = (*info)->timing.fps != av_info->timing.fps;
             memcpy(av_info, *info, sizeof(*av_info));
 
-            command_event(CMD_EVENT_REINIT, &reinit_flags);
+            /* With video kept, only audio has anything to follow - the
+             * rate, and the timing the frame rate sets - and the
+             * running driver takes both in place; nothing starts over. */
+            if (!no_video_reinit || !driver_set_audio_input_rate())
+               command_event(CMD_EVENT_REINIT, &reinit_flags);
+
+            /* The frame limit is the frame rate times the fast-forward
+             * ratio; nothing else recomputes it while the core runs. */
+            if (fps_changed)
+               command_event(CMD_EVENT_SET_FRAME_LIMIT, NULL);
 
             if (no_video_reinit)
                command_event(CMD_EVENT_VIDEO_SET_ASPECT_RATIO, NULL);
@@ -3746,6 +3812,18 @@ bool runloop_environment_cb(unsigned cmd, void *data)
          return false;
       }
 
+      case RETRO_ENVIRONMENT_GET_HW_RENDER_UPSCALER_INTERFACE:
+      {
+#ifdef HAVE_TEMPORAL_UPSCALER
+         const struct retro_hw_render_upscaler_interface **iface =
+            (const struct retro_hw_render_upscaler_interface **)data;
+         video_upscaler_note_wanted();
+         if (iface && (*iface = video_upscaler_get_interface()))
+            return true;
+#endif
+         return false;
+      }
+
       case RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS:
 #ifdef HAVE_CHEEVOS
          {
@@ -3886,6 +3964,7 @@ bool runloop_environment_cb(unsigned cmd, void *data)
                && !runloop_ff_skips_render(
                   (video_st->main_flags & VIDEO_FLAG_FF_SKIP_FRAME) != 0,
                   (video_st->main_flags & VIDEO_FLAG_FF_FRAME_OWED) != 0)
+               && !(video_st->main_flags & VIDEO_FLAG_STUB_FRAME)
                && !(video_st->current_video->frame == video_null.frame))
             result |= RETRO_AV_ENABLE_VIDEO;
 
@@ -3974,7 +4053,7 @@ bool runloop_environment_cb(unsigned cmd, void *data)
 
          if (midi_interface)
          {
-            midi_driver_request();
+            midi_driver_request(true);
             midi_interface->input_enabled  = midi_driver_input_enabled;
             midi_interface->output_enabled = midi_driver_output_enabled;
             midi_interface->read           = midi_driver_read;
@@ -5329,6 +5408,8 @@ static void uninit_libretro_symbols(
     * reset 'analog input requested' flags */
    memset(&input_st->analog_requested, 0,
          sizeof(input_st->analog_requested));
+   memset(&input_st->touchpad_requested, 0,
+         sizeof(input_st->touchpad_requested));
 
    /* Performance counters no longer valid. */
    runloop_st->perf_ptr_libretro  = 0;
@@ -5382,6 +5463,9 @@ static bool core_unload_game(void)
    runloop_state_t *runloop_st    = &runloop_state;
 
    video_driver_free_hw_context();
+#ifdef HAVE_TEMPORAL_UPSCALER
+   video_upscaler_clear_wanted();
+#endif
 
    /* The core owns the buffer the cache points at and is about to
     * close: wait out any reader before it goes. */
@@ -5390,7 +5474,13 @@ static bool core_unload_game(void)
    if ((runloop_st->current_core.flags & RETRO_CORE_FLAG_GAME_LOADED))
    {
       RARCH_LOG("[Core] Unloading game...\n");
+#ifdef HAVE_THREADS
+      video_thread_core_context_take();
+#endif
       runloop_st->current_core.retro_unload_game();
+#ifdef HAVE_THREADS
+      video_thread_core_context_release();
+#endif
 #ifdef HAVE_WEBMPLAYER
       if (runloop_st->current_core_type == CORE_TYPE_WEBM)
       {
@@ -5579,8 +5669,13 @@ void runloop_event_deinit_core(void)
 #ifdef HAVE_COMMAND
    if (runloop_st->frame_work & RUNLOOP_WORK_RUN_FRAMES)
       command_run_frames_cancel("the content was closed");
-   /* the next content's addresses mean something else */
+   runloop_frame_work_set(RUNLOOP_WORK_PAUSE_LOADED, false);
+   /* the next content's addresses mean something else, and its first
+    * frame is not to find buttons held for this one */
    command_watch_clear();
+   command_checkpoint_clear();
+   command_run_frames_forget();
+   input_driver_command_release(MAX_USERS);
 #endif
 
    audio_driver_set_core_float(false);
@@ -5649,6 +5744,8 @@ void runloop_event_deinit_core(void)
     * follows to write that. */
    input_driver_flush_rumble();
    led_driver_flush();
+   /* After retro_deinit, which may still send its notes-off */
+   midi_driver_request(false);
 
    /* retro_deinit() may call
     * RETRO_ENVIRONMENT_SET_FASTFORWARDING_OVERRIDE
@@ -6038,8 +6135,60 @@ static void runloop_runtime_log_init(runloop_state_t *runloop_st)
 static unsigned runloop_menu_rate(settings_t *settings,
       runloop_state_t *runloop_st, bool menu_pause_libretro);
 
+/* The low-latency release, asked of the video driver for this iteration
+ * from what the pace decision already knows: the mode the setting
+ * wants where a content frame will follow at normal speed, nothing
+ * otherwise. What the driver answers, and why nothing was asked, is
+ * kept on video_st for the statistics line. Returns the facts with
+ * PACE_FACT_DRIVER_PACING added when the mode is in effect. */
+static runloop_pace_facts_t runloop_driver_pacing_gather(settings_t *settings,
+      runloop_state_t *runloop_st, video_driver_state_t *video_st,
+      runloop_pace_facts_t f)
+{
+   unsigned want                  = settings->uints.video_driver_pacing;
+   unsigned reason                = VIDEO_DRIVER_PACING_REASON_NONE;
+   const video_poke_interface_t *poke = video_st->poke;
+   if (want >= VIDEO_DRIVER_PACING_LAST)
+      want = VIDEO_DRIVER_PACING_OFF;
+   if (!want)
+      reason = VIDEO_DRIVER_PACING_REASON_OFF;
+   else if (!poke || !poke->driver_pacing_set || !video_st->data)
+      reason = VIDEO_DRIVER_PACING_REASON_DRIVER;
+   /* A present paced to a scanline is its own release */
+   else if (settings->bools.video_scanline_sync)
+      reason = VIDEO_DRIVER_PACING_REASON_MODE;
+   else if (!runloop_pace_driver_owns(f | PACE_FACT_DRIVER_PACING,
+            runloop_pace_sources(f)))
+      reason = VIDEO_DRIVER_PACING_REASON_SUSPENDED;
+   if (reason != VIDEO_DRIVER_PACING_REASON_NONE)
+      want = VIDEO_DRIVER_PACING_OFF;
+   /* The driver keeps the mode on its swapchain; it is told OFF once,
+    * and asked again every frame while wanted, since a replaced
+    * swapchain comes up without it. */
+   if (want || video_st->driver_pacing_mode)
+   {
+      unsigned answer = (poke && poke->driver_pacing_set && video_st->data)
+         ? poke->driver_pacing_set(video_st->data, want)
+         : (unsigned)VIDEO_DRIVER_PACING_REASON_DRIVER;
+      if (want)
+         reason = answer;
+      video_st->driver_pacing_mode = (uint8_t)
+         ((answer == VIDEO_DRIVER_PACING_REASON_NONE) ? want : VIDEO_DRIVER_PACING_OFF);
+   }
+   video_st->driver_pacing_reason = (uint8_t)reason;
+   if (reason == VIDEO_DRIVER_PACING_REASON_NONE)
+      f |= PACE_FACT_DRIVER_PACING;
+   else
+   {
+      runloop_st->driver_pacing_frame_id     = 0;
+      video_st->driver_pacing_id             = 0;
+      video_st->driver_pacing_interval_us    = 0;
+   }
+   return f;
+}
+
 static runloop_pace_facts_t runloop_pace_gather(settings_t *settings,
-      bool menu_pause_libretro)
+      bool menu_pause_libretro, bool core_ran)
 {
    runloop_state_t *runloop_st    = &runloop_state;
    input_driver_state_t *input_st = input_state_get_ptr();
@@ -6070,7 +6219,8 @@ static runloop_pace_facts_t runloop_pace_gather(settings_t *settings,
    if (settings->bools.audio_rate_control)                 f |= PACE_FACT_RATE_CONTROL;
    if (video_context_driver_presentable())                 f |= PACE_FACT_PRESENTABLE;
    if (runloop_st->frame_limit_minimum_time)               f |= PACE_FACT_FRAME_LIMIT;
-   return f;
+   if (core_ran)                                           f |= PACE_FACT_CORE_RAN;
+   return runloop_driver_pacing_gather(settings, runloop_st, video_st, f);
 }
 
 size_t runloop_pace_string(char *s, size_t len)
@@ -6094,10 +6244,46 @@ size_t runloop_pace_string(char *s, size_t len)
       _len += strlcpy(s + _len, _len ? "+Display" : "Display", len - _len);
    if (pace & RUNLOOP_PACE_TIMER)
       _len += strlcpy(s + _len, _len ? "+Timer" : "Timer", len - _len);
+   if (pace & RUNLOOP_PACE_DRIVER)
+      _len += strlcpy(s + _len, _len ? "+Driver" : "Driver", len - _len);
    if (pace & RUNLOOP_PACE_NOWINDOW)
       _len += strlcpy(s + _len, _len ? "+NoWindow" : "NoWindow", len - _len);
    if (!_len)
       _len  = strlcpy(s, "None", len);
+   return _len;
+}
+
+size_t runloop_driver_pacing_string(char *s, size_t len)
+{
+   static const char *modes[VIDEO_DRIVER_PACING_LAST] = { "Off", "On", "On+Boost" };
+   /* Indexed by enum video_driver_pacing_reason; the first is "in effect" */
+   static const char *reasons[VIDEO_DRIVER_PACING_REASON_LAST] = {
+      NULL,
+      NULL,
+      "no backend in this video driver",
+      "waiting for the video thread",
+      "not offered by the GPU driver",
+      "no native swapchain",
+      "Scanline Sync",
+      "driver error",
+      "menu, pause, fast-forward or unfocused",
+      "the core made the device without it"
+   };
+   video_driver_state_t *video_st = video_state_get_ptr();
+   unsigned want   = config_get_ptr()->uints.video_driver_pacing;
+   unsigned reason = video_st->driver_pacing_reason;
+   size_t _len;
+   if (want >= VIDEO_DRIVER_PACING_LAST)
+      want = VIDEO_DRIVER_PACING_OFF;
+   if (reason >= VIDEO_DRIVER_PACING_REASON_LAST)
+      reason = VIDEO_DRIVER_PACING_REASON_NONE;
+   _len = strlcpy(s, modes[want], len);
+   if (want && reason != VIDEO_DRIVER_PACING_REASON_NONE && reasons[reason])
+   {
+      _len += strlcpy(s + _len, " (off: ", len - _len);
+      _len += strlcpy(s + _len, reasons[reason], len - _len);
+      _len += strlcpy(s + _len, ")", len - _len);
+   }
    return _len;
 }
 
@@ -6238,6 +6424,20 @@ static INLINE enum poll_type core_poll_type_current(void)
       : (enum poll_type)(runloop_state.current_core.poll_type);
 }
 
+/* The content frame's input sample, wherever the poll type puts it:
+ * the marker the low-latency backend wants at exactly that point. */
+static INLINE void runloop_driver_pacing_input_sampled(void)
+{
+   runloop_state_t *runloop_st = &runloop_state;
+   if (runloop_st->driver_pacing_frame_id)
+   {
+      video_driver_state_t *video_st = video_state_get_ptr();
+      if (video_st->poke && video_st->poke->driver_pacing_mark)
+         video_st->poke->driver_pacing_mark(video_st->data,
+               runloop_st->driver_pacing_frame_id, VIDEO_DRIVER_PACING_MARK_INPUT_SAMPLE);
+   }
+}
+
 /* The core's input_state callback, in every poll mode.
  *
  * Under late polling the frame's first query polls. Whether late
@@ -6261,6 +6461,7 @@ static int16_t core_input_state_cb(unsigned port,
    if (     !(runloop_state.current_core.flags & RETRO_CORE_FLAG_INPUT_POLLED)
          && core_poll_type_current() == POLL_TYPE_LATE)
    {
+      runloop_driver_pacing_input_sampled();
       input_driver_poll();
       runloop_state.current_core.flags |= RETRO_CORE_FLAG_INPUT_POLLED;
    }
@@ -6272,6 +6473,7 @@ static void core_input_state_poll_maybe(void)
 {
    if (core_poll_type_current() == POLL_TYPE_NORMAL)
    {
+      runloop_driver_pacing_input_sampled();
       input_driver_poll();
       runloop_state.current_core.flags |= RETRO_CORE_FLAG_INPUT_POLLED;
    }
@@ -6651,7 +6853,7 @@ void runloop_pause_checks(void)
 #endif
 
       /* Limit paused frames to video refresh. */
-      runloop_st->frame_limit_minimum_time = (retro_time_t)roundf(1000000.0f /
+      runloop_st->frame_limit_minimum_time = runloop_content_frame_time_us(
             ((video_st->video_refresh_rate_original)
                ? video_st->video_refresh_rate_original
                : video_refresh_rate));
@@ -7807,6 +8009,7 @@ static enum runloop_state_enum runloop_check_state(
       if (input_st->overlay_ptr)
       {
          if (     settings->bools.input_stylus_enable
+               && settings->bools.input_stylus_hide_overlay
                && android_input_stylus_recently_active())
             input_st->overlay_ptr->flags |=  INPUT_OVERLAY_STYLUS_HIDDEN;
          else
@@ -8431,16 +8634,26 @@ static enum runloop_state_enum runloop_check_state(
          }
          return RUNLOOP_STATE_POLLED_AND_CONTINUE;
       }
-      else if (!menu_driver_iterate(menu_st, p_disp, anim_get_ptr(),
-               settings, action, current_time))
+      else
       {
-         if (err_on_init)
+#ifdef HAVE_COMMAND
+         /* a MENU request's action, run as the menu's own input is */
+         action = (enum menu_action)command_menu_action(action);
+#endif
+         if (!menu_driver_iterate(menu_st, p_disp, anim_get_ptr(),
+                  settings, action, current_time))
          {
-            content_ctx_info_t content_info = {0};
-            task_push_start_dummy_core(&content_info);
+            if (err_on_init)
+            {
+               content_ctx_info_t content_info = {0};
+               task_push_start_dummy_core(&content_info);
+            }
+            else
+               retroarch_menu_running_finished(false);
          }
-         else
-            retroarch_menu_running_finished(false);
+#ifdef HAVE_COMMAND
+         command_menu_iterated();
+#endif
       }
 
       /* Handle pending core reload separately after menu driver iterate */
@@ -9519,10 +9732,10 @@ int runloop_iterate(void)
 #endif
    float slowmotion_ratio                 = settings->floats.slowmotion_ratio;
    bool audio_sync                        = settings->bools.audio_sync;
-   bool frame_advanced;
+   bool frame_advanced                    = false;
    bool savestate_automatic_enable        = settings->uints.savestate_automatic_interval > 0;
 
-   record_nvenc_poll();
+   recording_gpu_poll();
    runloop_msg_queue_drain_deferred();
 
    /* A quit waiting for its state to be written: the core is not run
@@ -9675,6 +9888,13 @@ int runloop_iterate(void)
 #ifdef HAVE_THREADS
    if (runloop_st->flags & RUNLOOP_FLAG_AUTOSAVE)
       autosave_check();
+#endif
+
+#ifdef HAVE_COMMAND
+   /* before the frame is decided: a STEPS checkpoint with the core off
+    * the stack, and a list it ends runs no frame past it */
+   if (runloop_st->frame_work & RUNLOOP_WORK_RUN_FRAMES)
+      command_run_frames_between();
 #endif
 
    switch ((enum runloop_state_enum)runloop_check_state(
@@ -9902,6 +10122,16 @@ int runloop_iterate(void)
 #ifdef HAVE_COMMAND
    if (frame_advanced && (runloop_st->frame_work & RUNLOOP_WORK_RUN_FRAMES))
       command_run_frames_tick();
+   else if (frame_advanced
+         && (runloop_st->frame_work & RUNLOOP_WORK_FREE_FRAME))
+      command_run_frames_free_frame();
+   /* LOAD_CONTENT ... paused, from no running core: pausing waits for
+    * the first frame, which is what marks a core running */
+   if (frame_advanced && (runloop_st->frame_work & RUNLOOP_WORK_PAUSE_LOADED))
+   {
+      runloop_frame_work_set(RUNLOOP_WORK_PAUSE_LOADED, false);
+      command_event(CMD_EVENT_PAUSE, NULL);
+   }
 #else
    (void)frame_advanced;
 #endif
@@ -9941,13 +10171,17 @@ int runloop_iterate(void)
     * has in cache; no bit needed. */
    if (input_st->bsv_movie_state_handle)
    {
-      bsv_movie_next_frame(input_st,
-            settings->uints.replay_checkpoint_interval,
-            settings->bools.replay_checkpoint_deserialize);
+      if (!BSV_MOVIE_IS_NETPLAY(input_st->bsv_movie_state_handle))
+         bsv_movie_next_frame(input_st,
+               settings->uints.replay_checkpoint_interval,
+               settings->bools.replay_checkpoint_deserialize);
       if (input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_END)
       {
+         bool netplay_movie = BSV_MOVIE_IS_NETPLAY(
+               input_st->bsv_movie_state_handle);
          movie_stop(input_st);
-         command_event(CMD_EVENT_PAUSE, NULL);
+         if (!netplay_movie)
+            command_event(CMD_EVENT_PAUSE, NULL);
       }
    }
 #endif
@@ -10050,7 +10284,8 @@ end:
     * runloop_pace_decide() in runloop.h, and the table in
     * samples/runloop/pacing that pins it row by row. The audio write
     * flag is read by the gather and cleared here. */
-   pace_facts       = runloop_pace_gather(settings, menu_pause_libretro);
+   pace_facts       = runloop_pace_gather(settings, menu_pause_libretro,
+         frame_advanced);
    AUDIO_FLAGS_CLEAR(audio_st, AUDIO_FLAG_WROTE);
    runloop_st->pace = runloop_pace_sources(pace_facts);
 
@@ -10095,6 +10330,39 @@ end:
             (video_st->video_refresh_rate_original)
                ? video_st->video_refresh_rate_original
                : settings->floats.video_refresh_rate);
+   }
+
+   /* The low-latency backend releases the next frame: the hold is the
+    * driver's signal, taken here where the frame delay would have
+    * slept, before the next iteration samples input. The timer's
+    * period, where the timer would hold, goes to it as the minimum
+    * present interval; nothing is slept twice. A release the driver
+    * could not give leaves the frame to the pacing below, and the
+    * limiter's schedule restarts rather than catching up. */
+   if (runloop_st->pace & RUNLOOP_PACE_DRIVER)
+   {
+      retro_time_t period = runloop_content_frame_time_us(video_st->core_hz);
+      /* The interval the next frame's sleep is to keep, carried to the
+       * presenter with that frame */
+      video_st->driver_pacing_interval_us = runloop_pace_driver_interval(
+            runloop_st->pace, pace_limit_min, period);
+      if (video_st->poke->driver_pacing_wait(video_st->data,
+            runloop_st->driver_pacing_frame_id,
+            runloop_st->driver_pacing_next_id + 1,
+            (unsigned)(2 * period + 10000)))
+      {
+         uint64_t id                        = ++runloop_st->driver_pacing_next_id;
+         runloop_st->driver_pacing_frame_id = id;
+         video_st->driver_pacing_id         = id;
+         runloop_st->frame_limit_anchor_ns  = 0;
+         if (video_st->poke->driver_pacing_mark)
+            video_st->poke->driver_pacing_mark(video_st->data, id,
+                  VIDEO_DRIVER_PACING_MARK_SIMULATION_START);
+         goto driver_paced;
+      }
+      runloop_st->driver_pacing_frame_id = 0;
+      video_st->driver_pacing_id         = 0;
+      runloop_st->pace                  &= ~RUNLOOP_PACE_DRIVER;
    }
 
    /* if there's a fast forward limit, inject sleeps to keep from going too fast. */
@@ -10154,6 +10422,7 @@ end:
          || (runloop_st->flags & RUNLOOP_FLAG_FASTMOTION))
       video_frame_delay(video_st, settings);
 
+driver_paced:
    /* Set paused state after x frames */
    if (runloop_st->run_frames_and_pause > 0)
    {
@@ -10572,6 +10841,8 @@ bool core_set_controller_port_device(retro_ctx_controller_info_t *pad)
     * of 'input_state()' */
    memset(&input_st->analog_requested, 0,
          sizeof(input_st->analog_requested));
+   memset(&input_st->touchpad_requested, 0,
+         sizeof(input_st->touchpad_requested));
 
 #if defined(HAVE_RUNAHEAD)
 #if defined(HAVE_DYNAMIC) || defined(HAVE_DYLIB)
@@ -10658,7 +10929,17 @@ bool core_get_system_info(struct retro_system_info *sysinfo)
 bool core_unserialize(retro_ctx_serialize_info_t *info)
 {
    runloop_state_t *runloop_st  = &runloop_state;
-   if (!info || !runloop_st->current_core.retro_unserialize(info->data_const, info->size))
+   bool ok;
+   if (!info)
+      return false;
+#ifdef HAVE_THREADS
+   video_thread_core_context_take();
+#endif
+   ok = runloop_st->current_core.retro_unserialize(info->data_const, info->size);
+#ifdef HAVE_THREADS
+   video_thread_core_context_release();
+#endif
+   if (!ok)
       return false;
 
 #ifdef HAVE_NETWORKING
@@ -10749,7 +11030,13 @@ void core_reset(void)
 
    /* retro_reset() may reallocate the core's framebuffer. */
    video_driver_cached_frame_retire();
+#ifdef HAVE_THREADS
+   video_thread_core_context_take();
+#endif
    runloop_st->current_core.retro_reset();
+#ifdef HAVE_THREADS
+   video_thread_core_context_release();
+#endif
 }
 
 static void runloop_load_deferred_auto_state(void)
@@ -10853,6 +11140,7 @@ bool core_run(void)
     * and input_poll or the first input_state sets it. */
    if (early_polling)
    {
+      runloop_driver_pacing_input_sampled();
       input_driver_poll();
       current_core->flags |=  RETRO_CORE_FLAG_INPUT_POLLED;
    }
@@ -10867,11 +11155,20 @@ bool core_run(void)
       /* The flags this iteration's checks flipped, fast-forward above
        * all, reach the frame's own audio rather than the next frame's. */
       audio_driver_publish_runloop();
+#ifdef HAVE_THREADS
+      /* One GL context handed between the threads: the core's for the
+       * frame, the video thread's between frames. */
+      video_thread_core_context_take();
+#endif
       current_core->retro_run();
+#ifdef HAVE_THREADS
+      video_thread_core_context_release();
+#endif
       ran = true;
       if (runloop_st->auto_state_load_pending)
          runloop_st->auto_state_load_core_ran = true;
       audio_driver_frame_end();
+      recording_start_frame();
    }
 
 #ifdef HAVE_GAME_AI

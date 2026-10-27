@@ -15,6 +15,7 @@ static uint8_t saved_hints[32][8];
 static rav1_grain_t saved_grains[32];
 static int decode_result, output_result, bad_output, verify_retry;
 static size_t packet_size;
+static int format_override = -1;
 
 #define CHECK(x)                                                               \
    do                                                                          \
@@ -41,6 +42,29 @@ static int decode(void *owner, const uint8_t *bytes, size_t size,
    int ret;
    CHECK(owner == &session && seq == &session.sequence);
    CHECK(bytes == session.packet && size == session.packet_size);
+   if (picture->header.show_existing)
+   {
+      CHECK(session.packet_decoder && picture->slot ==
+            session.reference_slots[picture->header.frame_to_show]);
+      CHECK(picture->setup.size.upscaled_width == widths[picture->slot]);
+      CHECK(picture->setup.size.height == heights[picture->slot]);
+      CHECK(!memcmp(&picture->grain.params, &saved_grains[picture->slot],
+            sizeof(picture->grain.params)));
+      if (verify_retry)
+         CHECK(!memcmp(&snapshot, picture, sizeof(snapshot)));
+      decode_calls++;
+      if (decode_result > 0)
+      {
+         snapshot = *picture;
+         verify_retry = 1;
+      }
+      if (!decode_result)
+      {
+         accepted++;
+         verify_retry = 0;
+      }
+      return decode_result;
+   }
    CHECK(group.data >= bytes && group.data + group.size <= bytes + size);
    CHECK(picture->slot >= 0 && picture->slot < (int)session.slots);
    for (i = 0; i < 8; i++)
@@ -108,6 +132,7 @@ static int export_frame(void *owner, unsigned slot, const rav1_grain_t *grain,
    frame->height = heights[slot];
    frame->pixfmt =
        sequence.bit_depth == 10 ? IMAGE_PIXFMT_P010 : IMAGE_PIXFMT_NV12;
+   if (format_override >= 0) frame->pixfmt = (unsigned)format_override;
    frame->wait = 1;
    frame->wait_value = accepted;
    frame->done = 2;
@@ -117,13 +142,18 @@ static int export_frame(void *owner, unsigned slot, const rav1_grain_t *grain,
    return 0;
 }
 
-static bool initialize(unsigned slots)
+static bool initialize_mode(unsigned slots, bool packet_decoder)
 {
    rav1_hw_ops_t ops;
    ops.decoder = &session;
    ops.decode = decode;
    ops.output = export_frame;
-   return rav1_hw_session_init(&session, &sequence, &ops, slots);
+   return rav1_hw_session_init_mode(&session, &sequence, &ops, slots, packet_decoder);
+}
+
+static bool initialize(unsigned slots)
+{
+   return initialize_mode(slots, false);
 }
 
 static void reset(void)
@@ -138,6 +168,7 @@ static void reset(void)
    memset(saved_grains, 0, sizeof(saved_grains));
    decode_calls = accepted = exports = abandons = 0;
    decode_result = output_result = bad_output = verify_retry = 0;
+   format_override = -1;
    CHECK(initialize(9));
 }
 
@@ -259,6 +290,57 @@ static void test_replay_and_cancel(void)
    CHECK(exports == 1);
 }
 
+static void test_packet_repeat(void)
+{
+   static const uint8_t replay[] = {0x1a, 1, 0x88};
+   unsigned depth;
+   for (depth = 8; depth <= 10; depth += 2)
+   {
+      rav1_hw_ops_t ops;
+      unsigned before;
+      reset();
+      sequence.bit_depth = depth;
+      ops = session.ops;
+      CHECK(rav1_hw_session_init_mode(&session, &sequence, &ops, 9, true));
+      make_packet(0, 0, 255);
+      CHECK(rav1_hw_session_submit(&session, packet, packet_size) == 0);
+      saved = session.state;
+      before = decode_calls;
+      decode_result = 1;
+      CHECK(rav1_hw_session_submit(&session, replay, sizeof(replay)) == 1);
+      CHECK(session.phase == 2 && session.output_slot < 0);
+      CHECK(!memcmp(&saved, &session.state, sizeof(saved)));
+      memcpy(different, replay, sizeof(replay));
+      CHECK(rav1_hw_session_submit(&session, different, sizeof(replay)) == -1);
+      CHECK(rav1_hw_session_submit(&session, replay, sizeof(replay) - 1) == -1);
+      CHECK(decode_calls == before + 1);
+      CHECK(rav1_hw_session_cancel(&session));
+      CHECK(!memcmp(&saved, &session.state, sizeof(saved)));
+      verify_retry = 0;
+      CHECK(rav1_hw_session_submit(&session, replay, sizeof(replay)) == 1);
+      CHECK(!memcmp(&saved, &session.state, sizeof(saved)));
+      decode_result = 0;
+      CHECK(rav1_hw_session_submit(&session, replay, sizeof(replay)) == 0);
+      CHECK(accepted == 2 && session.output_slot >= 0 && !session.phase);
+      CHECK(memcmp(&saved, &session.state, sizeof(saved)));
+      output_result = 1;
+      CHECK(rav1_hw_session_output(&session, &output) == 1);
+      CHECK(rav1_hw_session_submit(&session, replay, sizeof(replay)) == 1);
+      output_result = 0;
+      CHECK(rav1_hw_session_output(&session, &held) == 0);
+      CHECK(held.pixfmt == (depth == 8 ? IMAGE_PIXFMT_NV12 : IMAGE_PIXFMT_P010));
+      CHECK(rav1_hw_session_submit(&session, replay, sizeof(replay)) < 0);
+      video_hw_frame_abandon(&held);
+      make_packet(0, 0, 255);
+      CHECK(rav1_hw_session_submit(&session, packet, packet_size) == 0);
+      saved = session.state;
+      decode_result = -2;
+      CHECK(rav1_hw_session_submit(&session, replay, sizeof(replay)) == -2);
+      CHECK(session.broken && !memcmp(&saved, &session.state, sizeof(saved)));
+      CHECK(rav1_hw_session_submit(&session, replay, sizeof(replay)) == -1);
+   }
+}
+
 static void test_unsized(void)
 {
    static const uint8_t replay[] = {0x18, 0x88};
@@ -332,7 +414,37 @@ static void test_failures(void)
          !memcmp(&output, &zero, sizeof(output)));
 }
 
-static int inspect(const char *path)
+static void test_output_formats(void)
+{
+   static const unsigned formats[] = { 0, IMAGE_PIXFMT_NV12, IMAGE_PIXFMT_P010,
+      IMAGE_PIXFMT_YUV8_FP16, IMAGE_PIXFMT_YUV10_FP16, IMAGE_PIXFMT_FP16,
+      IMAGE_PIXFMT_YUV8_FP16 | IMAGE_PIXFMT_YUV10_FP16 };
+   unsigned depth, i;
+   for (depth = 8; depth <= 10; depth += 2)
+      for (i = 0; i < sizeof(formats) / sizeof(formats[0]); i++)
+      {
+         bool valid = depth == 10
+            ? formats[i] == IMAGE_PIXFMT_P010 || formats[i] == IMAGE_PIXFMT_YUV10_FP16
+            : !formats[i] || formats[i] == IMAGE_PIXFMT_NV12 || formats[i] == IMAGE_PIXFMT_YUV8_FP16;
+         reset();
+         sequence.bit_depth = depth;
+         CHECK(initialize(9));
+         format_override = (int)formats[i];
+         make_packet(0, 1, 255);
+         CHECK(rav1_hw_session_submit(&session, packet, packet_size) == 0);
+         CHECK(rav1_hw_session_output(&session, &output) == (valid ? 0 : -1));
+         CHECK(session.broken == !valid);
+         if (valid)
+         {
+            CHECK(output.pixfmt == formats[i]);
+            video_hw_frame_abandon(&output);
+         }
+         else CHECK(!memcmp(&output, &zero, sizeof(output)));
+         CHECK(abandons == 1);
+      }
+}
+
+static int inspect(const char *path, bool packet_decoder)
 {
    FILE *file = fopen(path, "rb");
    uint8_t *data = NULL;
@@ -359,7 +471,7 @@ static int inspect(const char *path)
             goto done;
          if (!initialized)
          {
-            if (!initialize(9))
+            if (!initialize_mode(9, packet_decoder))
                goto done;
             initialized = true;
          }
@@ -406,10 +518,14 @@ done:
 int main(int argc, char **argv)
 {
    if (argc == 2)
-      return inspect(argv[1]);
+      return inspect(argv[1], false);
+   if (argc == 3 && !strcmp(argv[2], "--packet"))
+      return inspect(argv[1], true);
    test_busy_and_output();
    test_replay_and_cancel();
+   test_packet_repeat();
    test_failures();
+   test_output_formats();
    test_unsized();
    printf("AV1 hardware session: %u failures\n", failures);
    return failures ? 1 : 0;

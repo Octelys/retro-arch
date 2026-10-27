@@ -125,7 +125,7 @@ shaders/shaders_slang
 *.depend
 *.rpx
 *.last
-wiiu/wut/elf2rpl/elf2rpl
+os/wiiu/wut/elf2rpl/elf2rpl
 /pkg/wiiu/retroarch
 /pkg/wiiu/wiiu
 /pkg/wiiu/rpx
@@ -283,6 +283,13 @@ gfx/common/wayland/wlr-output-management-unstable-v1.h
 samples/**/*_test
 samples/**/*_test_*
 samples/audio/stretch/stretch_bench
+samples/gfx/rslc_corpus/rslc_corpus_dump
+samples/gfx/rslc_reflect/rslc_reflect_check
+samples/gfx/rslc_reflect/spirv_cross.o
+samples/gfx/slang_blob_reflect/slang_blob_reflect_check
+samples/gfx/rslc_image/pattern_core.so
+samples/gfx/rslc_image/pattern_core.dll
+samples/gfx/rslc_image/out/
 samples/**/*.o
 libretro-common/samples/**/*_test
 libretro-common/samples/**/*_test_*
@@ -338,7 +345,6 @@ param.sfo
 *.self
 *.vpk
 /.vs
-/deps/SPIRV-Cross/out/build/x64-Debug
 
 # Visual Studio Code
 .vscode/
@@ -369,3 +375,17 @@ samples/audio/asio_clock/asio_clock_driver.h
 samples/gfx/integer_scale_axis/integer_scale_driver.h
 samples/gfx/coord_array/coord_array_driver.h
 samples/gfx/integer_scale_axis/integer_scale_axis_test
+
+# os/wiiu/slang host tool
+/os/wiiu/slang/slang-cafe
+/os/wiiu/slang/slang-cafe.exe
+samples/gfx/vulkan_upscaler/Zdir/
+samples/gfx/vulkan_upscaler/Zdir_fsr/
+samples/gfx/vulkan_upscaler/Zdir_xess/
+samples/gfx/vulkan_upscaler/Zdir_none/
+samples/gfx/d3d12_upscaler/Zdir/
+samples/gfx/d3d12_upscaler/Zdir_fsr/
+samples/gfx/d3d12_upscaler/Zdir_xess/
+samples/gfx/d3d12_upscaler/Zdir_none/
+samples/record/ffmpeg_pipeline/record_finalize_fragment.c
+samples/record/ffmpeg_pipeline/record_start_fragment.c

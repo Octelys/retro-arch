@@ -131,6 +131,10 @@ static NTSTATUS NTAPI fake_HidP_GetUsages(HIDP_REPORT_TYPE type,
 
 #include "input/drivers_joypad/winraw_joypad.c"
 
+/* the frontend's; the user's list is the settings', here none */
+bool input_device_ignored(uint16_t vid, uint16_t pid)
+{ return input_ignore_devices_check(NULL, vid, pid); }
+
 /* ---- The frontend, as far as the driver links against it ------------ */
 
 void RARCH_LOG(const char *fmt, ...)  { (void)fmt; }
@@ -148,7 +152,6 @@ bool input_autoconfigure_connect(const char *name, const char *display_name,
 bool input_autoconfigure_disconnect(unsigned port, const char *name)
 { (void)port; (void)name; return true; }
 /* winraw_input.c's side of reading by the poll: not used here */
-bool winraw_raw_input_polled(void) { return false; }
 void winraw_queue_read(void) { }
 void winraw_queue_claim_thread(bool claim) { (void)claim; }
 

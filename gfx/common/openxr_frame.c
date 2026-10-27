@@ -36,23 +36,36 @@ typedef char openxr_seq_fits[
        && OPENXR_WORDS(openxr_projection_t) <= OPENXR_WORDS(video_xr_quad_set_t))
       ? 1 : -1];
 
-/* One writer stamps odd, stores the words, stamps even; a reader that
- * sees the stamp move across its copy starts over. */
+/* A latched seqlock: two copies of the words, one writer, any number
+ * of readers. The writer stamps odd and stores copy 0, stamps even and
+ * stores copy 1; a reader reads the copy the stamp says is not being
+ * stored - copy 1 while it is odd, copy 0 while it is even - so a
+ * writer stopped part way through holds no reader up. A reader starts
+ * over only when the writer has got through a whole copy during its
+ * read, which is the writer going on, never waiting for it. */
+static void openxr_seq_store(retro_atomic_int_t *words,
+      const int *tmp, size_t n)
+{
+   size_t i;
+   for (i = 0; i < n; i++)
+      retro_atomic_store_relaxed_int(&words[i], tmp[i]);
+}
+
 static void openxr_seq_publish(retro_atomic_int_t *seq,
       retro_atomic_int_t *words, const void *src, size_t len)
 {
    int tmp[OPENXR_WORDS(video_xr_quad_set_t)];
    size_t n = (len + sizeof(int) - 1) / sizeof(int);
-   size_t i;
    int s    = retro_atomic_load_relaxed_int(seq);
 
    tmp[n - 1] = 0;
    memcpy(tmp, src, len);
-   retro_atomic_store_release_int(seq, s + 1);
+   retro_atomic_store_release_int(seq, (int)((unsigned)s + 1u));
    retro_atomic_thread_fence_release();
-   for (i = 0; i < n; i++)
-      retro_atomic_store_relaxed_int(&words[i], tmp[i]);
-   retro_atomic_store_release_int(seq, s + 2);
+   openxr_seq_store(words, tmp, n);
+   retro_atomic_store_release_int(seq, (int)((unsigned)s + 2u));
+   retro_atomic_thread_fence_release();
+   openxr_seq_store(words + n, tmp, n);
 }
 
 static void openxr_seq_read(retro_atomic_int_t *seq,
@@ -63,14 +76,11 @@ static void openxr_seq_read(retro_atomic_int_t *seq,
    for (;;)
    {
       size_t i;
-      int s1 = retro_atomic_load_acquire_int(seq);
-      if (s1 & 1)
-      {
-         retro_cpu_relax();
-         continue;
-      }
+      int s1                         = retro_atomic_load_acquire_int(seq);
+      const retro_atomic_int_t *copy = words + ((s1 & 1) ? n : 0);
       for (i = 0; i < n; i++)
-         tmp[i] = retro_atomic_load_relaxed_int(&words[i]);
+         tmp[i] = retro_atomic_load_relaxed_int(
+               (retro_atomic_int_t*)&copy[i]);
       retro_atomic_thread_fence_acquire();
       if (retro_atomic_load_relaxed_int(seq) == s1)
          break;
@@ -143,7 +153,23 @@ static void openxr_frame_error(openxr_frame_t *f,
       openxr_session_end(f->session, res == XR_ERROR_INSTANCE_LOST);
 }
 
-/* The published quads whose slot has released an image. The caller
+/* The swapchains slot shows and their size and layer count: its own
+ * once released, else those a resize replaced; NULL for none. */
+static const XrSwapchain *openxr_frame_chains(openxr_slot_t *slot,
+      unsigned *dims, unsigned *layers)
+{
+   if (retro_atomic_load_acquire_int(&slot->content))
+   {
+      *dims   = slot->dims;
+      *layers = slot->layers;
+      return slot->swapchains[0] ? slot->swapchains : NULL;
+   }
+   *dims   = slot->old_dims;
+   *layers = (unsigned)retro_atomic_load_acquire_int(&slot->old_layers);
+   return (*layers && slot->old[0]) ? slot->old : NULL;
+}
+
+/* The published quads whose slot shows an image. The caller
  * holds the graphics lock, so no slot changes under it. */
 static unsigned openxr_frame_layers(openxr_frame_t *f,
       XrCompositionLayerQuad *layers,
@@ -157,11 +183,13 @@ static unsigned openxr_frame_layers(openxr_frame_t *f,
    for (i = 0; i < quads.num_quads; i++)
    {
       video_xr_pose_t pose;
+      unsigned dims, count;
+      const XrSwapchain *chains;
       const video_xr_quad_t *q        = &quads.quads[i];
       openxr_slot_t *slot             = &f->sc->slots[q->slot];
       XrCompositionLayerQuad *l       = &layers[n];
-      if (     !slot->swapchains[0] || q->layer >= slot->layers
-            || !retro_atomic_load_acquire_int(&slot->content))
+      if (     !(chains = openxr_frame_chains(slot, &dims, &count))
+            || q->layer >= count)
          continue;
       video_xr_compose(&f->screens.pose, &q->pose, &pose);
       l->type                        = XR_TYPE_COMPOSITION_LAYER_QUAD;
@@ -178,9 +206,9 @@ static unsigned openxr_frame_layers(openxr_frame_t *f,
          ? XR_EYE_VISIBILITY_LEFT
          : ((q->eye == VIDEO_XR_EYE_RIGHT)
                ? XR_EYE_VISIBILITY_RIGHT : XR_EYE_VISIBILITY_BOTH);
-      l->subImage.swapchain               = slot->swapchains[q->layer];
-      l->subImage.imageRect.extent.width  = (int32_t)VIDEO_SCALE_W(slot->dims);
-      l->subImage.imageRect.extent.height = (int32_t)VIDEO_SCALE_H(slot->dims);
+      l->subImage.swapchain               = chains[q->layer];
+      l->subImage.imageRect.extent.width  = (int32_t)VIDEO_SCALE_W(dims);
+      l->subImage.imageRect.extent.height = (int32_t)VIDEO_SCALE_H(dims);
       l->pose.orientation.x = pose.orientation.x;
       l->pose.orientation.y = pose.orientation.y;
       l->pose.orientation.z = pose.orientation.z;
@@ -203,17 +231,21 @@ static bool openxr_frame_projection(openxr_frame_t *f,
       XrCompositionLayerProjectionView *views)
 {
    unsigned eye, w, h;
+   unsigned dims             = 0;
+   unsigned count            = 0;
+   const XrSwapchain *chains = NULL;
    openxr_projection_t p;
-   openxr_slot_t *slot = &f->sc->slots[OPENXR_PROJECTION_SLOT];
+   openxr_slot_t *slot       = &f->sc->slots[OPENXR_PROJECTION_SLOT];
    openxr_seq_read(&f->proj_seq, f->proj_words, &p, sizeof(p));
-   if (     !p.active || !slot->swapchains[0] || slot->layers < 2
+   if (     !p.active
+         || !(chains = openxr_frame_chains(slot, &dims, &count))
+         || count < 2
          || !f->session->track_space
          || p.track_seq != retro_atomic_load_acquire_int(
-               &f->session->track_seq)
-         || !retro_atomic_load_acquire_int(&slot->content))
+               &f->session->track_seq))
       return false;
-   w = MIN(p.width,  VIDEO_SCALE_W(slot->dims));
-   h = MIN(p.height, VIDEO_SCALE_H(slot->dims));
+   w = MIN(p.width,  VIDEO_SCALE_W(dims));
+   h = MIN(p.height, VIDEO_SCALE_H(dims));
    if (!w || !h)
       return false;
    for (eye = 0; eye < 2; eye++)
@@ -226,7 +258,7 @@ static bool openxr_frame_projection(openxr_frame_t *f,
       views[eye].subImage.imageArrayIndex         = 0;
       views[eye].pose                             = p.pose[eye];
       views[eye].fov                              = p.fov[eye];
-      views[eye].subImage.swapchain               = slot->swapchains[eye];
+      views[eye].subImage.swapchain               = chains[eye];
       views[eye].subImage.imageRect.extent.width  = (int32_t)w;
       views[eye].subImage.imageRect.extent.height = (int32_t)h;
    }
@@ -546,12 +578,14 @@ static uint32_t openxr_frame_fit(const openxr_frame_t *f,
       const XrCompositionLayerBaseHeader **ptrs, uint32_t count,
       uint32_t first, uint32_t end)
 {
-   XrSwapchain menu = f->sc->slots[VIDEO_XR_MENU_SLOT].swapchains[0];
+   XrSwapchain menu     = f->sc->slots[VIDEO_XR_MENU_SLOT].swapchains[0];
+   XrSwapchain menu_old = f->sc->slots[VIDEO_XR_MENU_SLOT].old[0];
    while (count > f->rt->max_layers && end > first)
    {
       const XrCompositionLayerQuad *q =
          (const XrCompositionLayerQuad*)ptrs[--end];
-      if (q->subImage.swapchain == menu)
+      if (     q->subImage.swapchain == menu
+            || q->subImage.swapchain == menu_old)
          continue;
       memmove(&ptrs[end], &ptrs[end + 1],
             (count - end - 1) * sizeof(*ptrs));
@@ -599,6 +633,7 @@ static void openxr_frame_submit(openxr_frame_t *f,
    }
    end_info.layers = end_info.layerCount ? ptrs : NULL;
    res = f->EndFrame(f->session->session, &end_info);
+   openxr_swapchains_drop_old(f->sc);
    openxr_session_unlock(f->session);
    if (XR_FAILED(res))
       openxr_frame_error(f, "xrEndFrame", res);

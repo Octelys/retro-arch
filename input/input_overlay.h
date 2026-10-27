@@ -256,6 +256,9 @@ struct overlay_desc
    float range_x_mod, range_y_mod;
    float mod_x, mod_y, mod_w, mod_h;
    float delta_x, delta_y;
+   /* the delta its image was last drawn at: a movable desc's geometry
+    * goes to the driver only when it moves */
+   float sent_dx, sent_dy;
    float x;
    float y;
    /* These are 'raw' x/y values shifted
@@ -302,6 +305,9 @@ struct overlay
     * the overlay is enabled on a driver with load_textures; views
     * into input_overlay_t::page_textures. */
    uintptr_t *textures;
+   /* The pack's unique image behind each of those handles, alongside
+    * them in the same block. */
+   uint32_t *texture_images;
 
    struct texture_image image;
 
@@ -409,6 +415,8 @@ typedef struct input_overlay_pointer_state
    uint8_t device_mask;
 } input_overlay_pointer_state_t;
 
+#define INPUT_OVERLAY_ST(ol) (&(ol)->overlay_states[(ol)->state_cur])
+
 struct input_overlay
 {
    struct overlay *overlays;
@@ -416,7 +424,10 @@ struct input_overlay
    char *path;
    void *iface_data;
    const video_overlay_interface_t *iface;
-   input_overlay_state_t overlay_state;
+   /* This poll's state and the last one's, flipped each poll, so the
+    * last is kept without a copy: INPUT_OVERLAY_ST() is this poll's */
+   input_overlay_state_t overlay_states[2];
+   unsigned state_cur;
    input_overlay_pointer_state_t pointer_state;
    struct texture_image **images;
    /* One block: the pack's texture handle per unique image (the first
@@ -445,13 +456,19 @@ struct input_overlay
 
    /* Two-frame APNGs are treated as a pressed/unpressed pair rather
     * than a looping animation. One entry per unique image; only valid
-    * when the corresponding anim_stream entry is non-NULL. */
+    * when the corresponding anim_stream entry is non-NULL.
+    * INPUT_OVERLAY_2FRAME_ATLAS once both frames are one texture,
+    * stacked: a press is then the texture rectangle moved, nothing
+    * uploaded. */
    uint8_t *anim_2frame;
    uint8_t *anim_2frame_pressed;
    uint8_t *anim_2frame_cur;
    /* Both frames of each two-frame APNG, composed once at load and
-    * laid out back to back (width * height pixels each), so a press
-    * is a copy rather than a decode. NULL for every other image. */
+    * stacked as one image (INPUT_OVERLAY_2FRAME_ROWS rows of width):
+    * the first frame, its last row again, the second frame's first
+    * row, then the second frame - the repeated rows keep one frame's
+    * edge from filtering into the other's. NULL for every other image,
+    * and for an atlas once its texture is in. */
    uint32_t **anim_2frame_pix;
 
    /* The alpha last handed to the driver for each image of the active
@@ -608,6 +625,15 @@ bool input_overlay_upload_textures(input_overlay_t *ol);
 /* Submit the frame in looping animated image @i's slot, or the one a
  * driver dropped there before. False when nothing was taken. */
 bool input_overlay_anim_submit(input_overlay_t *ol, size_t i);
+
+#define INPUT_OVERLAY_2FRAME_PAIR  1
+#define INPUT_OVERLAY_2FRAME_ATLAS 2
+/* The rows of a two-frame APNG's stacked frames, each @h rows tall. */
+#define INPUT_OVERLAY_2FRAME_ROWS(h) (2 * (h) + 2)
+
+/* Point the active page's entries of two-frame image @image - every
+ * two-frame image when it is (size_t)-1 - at the frame each shows. */
+void input_overlay_atlas_frames(input_overlay_t *ol, size_t image);
 
 /* Stops every looping image's playback; the next tick starts each
  * again from where its stream stands. */

@@ -35,6 +35,8 @@
 
 #include "gfx_display.h"
 #include "gfx_anim_preview.h"
+#include "gfx_media_player.h"
+#include "gfx_media_cpu.h"
 #include "gfx_animation.h"
 #include <formats/data_transfer.h>
 
@@ -337,7 +339,11 @@ static void gfx_thumbnail_init_fade(
        || (p_gfx_thumb->fade_missing
        && (GFX_THUMB_STATUS_LOAD(&thumbnail->status) == GFX_THUMBNAIL_STATUS_MISSING)))
    {
-      if (p_gfx_thumb->fade_duration > 0.0f && !runloop_is_content_switching())
+      if (p_gfx_thumb->fade_duration > 0.0f && !runloop_is_content_switching()
+#ifdef HAVE_MENU
+            && !menu_driver_media_startup_token()
+#endif
+            )
       {
          gfx_animation_ctx_entry_t animation_entry;
 
@@ -472,7 +478,7 @@ static void gfx_thumbnail_init_fade(
  * running under the menu - content loaded and not paused - in which
  * case one, so that a 4K preview does not take the cores the game is
  * on. */
-static unsigned gfx_thumbnail_anim_threads_wanted(void)
+unsigned gfx_thumbnail_anim_threads_wanted(void)
 {
    runloop_state_t *runloop_st = runloop_state_get_ptr();
    if (     (runloop_st->flags & RUNLOOP_FLAG_CORE_RUNNING)
@@ -511,6 +517,7 @@ static void gfx_thumbnail_anim_dispose(gfx_thumbnail_anim_lifetime_t *life)
 static void gfx_thumbnail_anim_reap(void)
 {
    gfx_thumbnail_anim_lifetime_t **link = &gfx_thumb_retired;
+   gfx_media_cpu_reap();
    while (*link)
    {
       gfx_thumbnail_anim_lifetime_t *life = *link;
@@ -582,7 +589,8 @@ static void gfx_thumbnail_anim_close(gfx_thumbnail_t *thumbnail)
    thumbnail->anim_type         = 0;
    thumbnail->anim_read_pending = 0;
    thumbnail->anim_windowed     = 0;
-   thumbnail->flags            &= ~GFX_THUMB_FLAG_ANIM_ACTIVE;
+   thumbnail->flags            &= ~(GFX_THUMB_FLAG_ANIM_ACTIVE
+         | GFX_THUMB_FLAG_MEDIA_COMPLETED | GFX_THUMB_FLAG_MEDIA_ENDED);
 }
 
 static gfx_surface_t *gfx_thumbnail_anim_surface(void *user,
@@ -723,8 +731,11 @@ static bool gfx_thumbnail_anim_install(gfx_thumbnail_t *thumbnail,
          return false;
       }
    }
-   if (thumbnail->anim_sess && !thumbnail->anim_read_pending)
-      gfx_anim_preview_audio_begin((gfx_anim_preview_t*)thumbnail->anim_sess);
+   if (thumbnail->anim_sess
+         && ((gfx_anim_preview_t*)thumbnail->anim_sess)->seekable)
+      video_player_set_seek_handler(
+            ((gfx_surface_player_t*)thumbnail->anim_player)->vp,
+            gfx_anim_preview_seek_step, thumbnail->anim_sess);
    return true;
 
 fail:
@@ -745,6 +756,9 @@ static void gfx_thumbnail_anim_open_probed(gfx_thumbnail_t *thumbnail,
       const char *path, int png_probe)
 {
    gfx_anim_preview_t *p;
+   settings_t *settings = config_get_ptr();
+   bool hardware = !settings
+      || settings->uints.video_hw_decode != VIDEO_HW_DECODE_OFF;
 
    gfx_thumbnail_anim_close(thumbnail);
 
@@ -755,7 +769,8 @@ static void gfx_thumbnail_anim_open_probed(gfx_thumbnail_t *thumbnail,
     * admission live in gfx_anim_preview (shared with the desktop
     * companions' preview panes). NULL: a still, or not admitted - keep
     * the static thumbnail. */
-   if (!(p = gfx_anim_preview_open_hw(path, png_probe)))
+   if (!(p = hardware ? gfx_anim_preview_open_hw(path, png_probe)
+         : gfx_anim_preview_open(path, png_probe)))
       return;
 
    /* Hand the stream and the mapping to the thumbnail (install borrows
@@ -977,6 +992,86 @@ static bool gfx_thumb_frame_budget(void *ud, size_t avail, size_t len)
    return cpu_features_get_time_usec() - *(int64_t*)ud < 2000;
 }
 
+bool gfx_thumbnail_has_file(const gfx_thumbnail_t *thumbnail, const char *path)
+{
+   const gfx_anim_preview_t *session = thumbnail
+      ? (const gfx_anim_preview_t*)thumbnail->anim_sess : NULL;
+   return session && string_is_equal(session->path, path);
+}
+
+/* Main-thread transport command; the audio mixer applies its request
+ * at a block boundary while video retains the current display slot. */
+bool gfx_thumbnail_set_repeat(gfx_thumbnail_t *thumbnail, bool repeat)
+{
+   gfx_surface_player_t *player;
+   if (!thumbnail || !(thumbnail->flags & GFX_THUMB_FLAG_ANIM_ACTIVE)
+         || !(player = (gfx_surface_player_t *)thumbnail->anim_player))
+      return false;
+   return gfx_media_player_set_repeat(
+         (gfx_anim_preview_t *)thumbnail->anim_sess, player->vp, repeat);
+}
+
+bool gfx_thumbnail_take_completed(gfx_thumbnail_t *thumbnail)
+{
+   if (!thumbnail || !(thumbnail->flags & GFX_THUMB_FLAG_MEDIA_COMPLETED))
+      return false;
+   thumbnail->flags &= ~GFX_THUMB_FLAG_MEDIA_COMPLETED;
+   return true;
+}
+
+bool gfx_thumbnail_set_paused(gfx_thumbnail_t *thumbnail, bool paused,
+      retro_time_t current_time)
+{
+   gfx_surface_player_t *player;
+   if (!thumbnail || !(thumbnail->flags & GFX_THUMB_FLAG_ANIM_ACTIVE)
+         || !(player = (gfx_surface_player_t*)thumbnail->anim_player))
+      return false;
+   if (!paused && (thumbnail->flags & GFX_THUMB_FLAG_MEDIA_ENDED)
+         && !gfx_thumbnail_seek(thumbnail, 0, current_time))
+      return false;
+   return gfx_media_player_set_paused((gfx_anim_preview_t*)thumbnail->anim_sess,
+         player->vp, paused, !thumbnail->anim_read_pending, (int64_t)current_time);
+}
+
+bool gfx_thumbnail_get_playback_state(gfx_thumbnail_t *thumbnail,
+      retro_time_t current_time, gfx_thumbnail_playback_state_t *state)
+{
+   gfx_anim_preview_t *session = NULL;
+   gfx_surface_player_t *player = NULL;
+   if (thumbnail && (thumbnail->flags & GFX_THUMB_FLAG_ANIM_ACTIVE))
+   {
+      session = (gfx_anim_preview_t*)thumbnail->anim_sess;
+      player = (gfx_surface_player_t*)thumbnail->anim_player;
+   }
+   return gfx_media_player_state(session, player ? player->vp : NULL,
+         (int64_t)current_time, state);
+}
+
+bool gfx_thumbnail_seek(gfx_thumbnail_t *thumbnail, int64_t target_us,
+      retro_time_t current_time)
+{
+   gfx_surface_player_t *player;
+   gfx_anim_preview_t *session;
+   unsigned rate = 0;
+   bool s16 = false;
+   bool result;
+   if (!thumbnail || thumbnail->anim_read_pending
+         || !(thumbnail->flags & GFX_THUMB_FLAG_ANIM_ACTIVE)
+         || !(player = (gfx_surface_player_t*)thumbnail->anim_player)
+         || !(session = (gfx_anim_preview_t*)thumbnail->anim_sess)
+         || !session->seekable)
+      return false;
+#ifdef GFX_THUMB_PREVIEW_AUDIO
+   if (config_get_ptr()->bools.menu_thumbnail_preview_audio)
+      audio_driver_mixer_prepare_format(&rate, &s16);
+#endif
+   result = gfx_media_player_seek(session, player->vp, target_us, rate, s16,
+         (int64_t)current_time);
+   if (result)
+      thumbnail->flags &= ~(GFX_THUMB_FLAG_MEDIA_ENDED | GFX_THUMB_FLAG_MEDIA_COMPLETED);
+   return result;
+}
+
 /* Advances an animated thumbnail: at most one frame shown a call, once
  * its duration has elapsed. The decode runs on video_player's worker
  * where there is one, a frame ahead of the clock, and this only shows
@@ -996,6 +1091,7 @@ void gfx_thumbnail_animate(gfx_thumbnail_t *thumbnail,
    gfx_thumbnail_anim_reap();
    if (   !thumbnail
        || !(thumbnail->flags & GFX_THUMB_FLAG_ANIM_ACTIVE)
+       || (thumbnail->flags & GFX_THUMB_FLAG_MEDIA_ENDED)
        || !thumbnail->anim)
       return;
    {
@@ -1055,17 +1151,26 @@ void gfx_thumbnail_animate(gfx_thumbnail_t *thumbnail,
        * truncated, so pacing matches a fully-read open exactly. */
       image_transfer_anim_stream_complete_scan(thumbnail->anim, type,
             thumbnail->anim_buf, thumbnail->anim_buf_len);
-      if (thumbnail->anim_sess)
-         gfx_anim_preview_audio_begin((gfx_anim_preview_t*)thumbnail->anim_sess);
    }
 
    video_player_set_threads(gfx_thumbnail_anim_threads_wanted());
-   /* Loops done or the stream failed: the last frame's texture stays,
-    * the decoder and the file buffer go. */
-   if (video_player_poll(
+   /* The last picture stays when playback ends. */
+   if (gfx_media_player_poll((gfx_anim_preview_t*)thumbnail->anim_sess,
             ((gfx_surface_player_t*)thumbnail->anim_player)->vp, now)
          == VIDEO_PLAYER_ENDED)
-      gfx_thumbnail_anim_close(thumbnail);
+   {
+      bool completed = video_player_completed(
+            ((gfx_surface_player_t*)thumbnail->anim_player)->vp);
+      if (completed)
+      {
+         gfx_media_player_set_paused((gfx_anim_preview_t*)thumbnail->anim_sess,
+               ((gfx_surface_player_t*)thumbnail->anim_player)->vp,
+               true, false, now);
+         thumbnail->flags |= GFX_THUMB_FLAG_MEDIA_COMPLETED | GFX_THUMB_FLAG_MEDIA_ENDED;
+      }
+      else
+         gfx_thumbnail_anim_close(thumbnail);
+   }
 }
 
 /* A still's decode has come back, the image (NULL: nothing) the
@@ -2348,7 +2453,7 @@ void gfx_thumbnail_draw(
       float draw_x;
       float draw_y;
 
-      /* Snapshot fields — read once, use local copies for the
+      /* Snapshot fields â€” read once, use local copies for the
        * remainder of this draw call.  The main thread may update
        * the live struct concurrently (upload callback, reset, or
        * animation tick on alpha), but these locals are stable. */
@@ -3137,6 +3242,7 @@ bool gfx_thumbnail_update_path_cfg(
 #endif
 #ifdef HAVE_RWEBM
          ".webm",
+         ".mkv",
 #endif
 #ifdef HAVE_RMP4
          ".mp4",

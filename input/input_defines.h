@@ -47,6 +47,11 @@
  * It is only used internally for overlays. */
 #define RARCH_DEVICE_POINTER_SCREEN    (RETRO_DEVICE_POINTER | 0x10000)
 
+/* Specialized _POINTER for a driver's second list of pointers (Android's
+ * second display). The frontend lists them after the main list's for
+ * RETRO_DEVICE_POINTER. */
+#define RARCH_DEVICE_POINTER_SECOND    (RETRO_DEVICE_POINTER | 0x20000)
+
 #define RARCH_DEVICE_ID_POINTER_BACK   (RETRO_DEVICE_ID_POINTER_PRESSED | 0x10000)
 
 /* libretro has 16 buttons from 0-15 (libretro.h)
@@ -242,6 +247,19 @@ enum input_aim_stick
    INPUT_AIM_STICK_LEFT,
    INPUT_AIM_STICK_RIGHT,
    INPUT_AIM_STICK_LAST
+};
+
+/* input_playerN_touchpad: what the touchpad of a port's pad is to its
+ * core, where the pad has one */
+enum input_touchpad
+{
+   INPUT_TOUCHPAD_OFF = 0,
+   INPUT_TOUCHPAD_POINTER,   /* a touchscreen */
+   INPUT_TOUCHPAD_MOUSE,
+   /* a click on the left or the right half presses a RetroPad button
+    * of each (input_playerN_touchpad_left, _right) */
+   INPUT_TOUCHPAD_HALVES,
+   INPUT_TOUCHPAD_LAST
 };
 
 /* input_rotation: 0 to 3 are quarter turns, as Video Rotation counts

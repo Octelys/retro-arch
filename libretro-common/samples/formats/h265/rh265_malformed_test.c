@@ -799,9 +799,11 @@ static void test_vps_info(void)
    const uint8_t *units[3];
    size_t lens[3], n;
    rh265_vps_info_t out;
+   rh265_nal_t raw[3];
    unsigned mode, i;
    rh265_video *v = rh265_video_open();
    if (!v) abort();
+   expect("retain parameter sets", rh265_video_retain_parameter_sets(v), 0);
    for (i = 0; i < 3; i++) units[i] = units_buf[i];
    sps(&w, F_NONE, 8); lens[1] = nal(units_buf[1], 33, &w);
    pps(&w, 0, 0); lens[2] = nal(units_buf[2], 34, &w);
@@ -829,6 +831,16 @@ static void test_vps_info(void)
       expect("VPS metadata input preserves software", rh265_video_set_extradata(v, buf, n), 0);
       memset(&out, 0xaa, sizeof(out));
       expect("VPS metadata availability", rh265_video_get_vps(v, 0, &out), mode < 2 ? 0 : -1);
+      memset(raw, 0xaa, sizeof(raw));
+      expect("retained chain availability", rh265_video_get_parameter_sets(v, 0, raw), mode < 2 ? 0 : -1);
+      if (mode < 2)
+      {
+         for (i = 0; i < 3; i++)
+            if (raw[i].data == units[i] || raw[i].size != lens[i]
+                  || memcmp(raw[i].data, units[i], lens[i])) failures++;
+      }
+      else
+         for (i = 0; i < sizeof(raw); i++) if (((uint8_t*)raw)[i]) { failures++; break; }
       if (mode < 2)
       {
          if (out.sequence.profile_idc != 1 || out.sequence.level_idc != 93
@@ -842,15 +854,63 @@ static void test_vps_info(void)
       }
       else
          for (i = 0; i < sizeof(out); i++) if (((uint8_t*)&out)[i]) { failures++; break; }
+      if (mode == 0)
+      {
+         pps(&w, 0, 15); lens[2] = nal(units_buf[2], 34, &w);
+         n = hvcc(buf, units + 2, lens + 2, 1);
+         expect("PPS selects missing SPS", rh265_video_set_extradata(v, buf, n), 0);
+         expect("raw chain follows selected SPS", rh265_video_get_parameter_sets(v, 0, raw), -1);
+         pps(&w, 0, 0); lens[2] = nal(units_buf[2], 34, &w);
+         n = hvcc(buf, units + 2, lens + 2, 1);
+         expect("PPS restores selected SPS", rh265_video_set_extradata(v, buf, n), 0);
+         expect("raw chain restored", rh265_video_get_parameter_sets(v, 0, raw), 0);
+      }
    }
    expect("VPS invalid PPS", rh265_video_get_vps(v, ~0u, &out), -1);
    expect("VPS null decoder", rh265_video_get_vps(NULL, 0, &out), -1);
    expect("VPS null output", rh265_video_get_vps(v, 0, NULL), -1);
+   expect("retained chain null output", rh265_video_get_parameter_sets(v, 0, NULL), -1);
+   expect("retained chain invalid PPS", rh265_video_get_parameter_sets(v, ~0u, raw), -1);
+   expect("retain too late", rh265_video_retain_parameter_sets(v), -1);
+   expect("retain null decoder", rh265_video_retain_parameter_sets(NULL), -1);
+   rh265_video_close(v);
+}
+
+static void test_annexb_extradata(void)
+{
+   bitw w;
+   static uint8_t units_buf[2][1024], buf[2100];
+   static rh265_video_params_t params;
+   const uint8_t *units[2];
+   size_t lens[2], n;
+   unsigned prefix, i;
+   rh265_video *v;
+   units[0] = units_buf[0]; units[1] = units_buf[1];
+   sps(&w, F_NONE, 8); lens[0] = nal(units_buf[0], 33, &w);
+   pps(&w, 0, 0); lens[1] = nal(units_buf[1], 34, &w);
+   for (prefix = 3; prefix <= 4; prefix++)
+   {
+      n = 0;
+      for (i = 0; i < 2; i++)
+      {
+         memset(buf + n, 0, prefix); buf[n + prefix - 1] = 1; n += prefix;
+         memcpy(buf + n, units[i], lens[i]); n += lens[i];
+      }
+      v = rh265_video_open(); if (!v) abort();
+      expect("Annex-B parameter input", rh265_video_set_extradata(v, buf, n), 0);
+      expect("Annex-B parameter sets parsed", rh265_video_get_params(v, 0, &params), 0);
+      rh265_video_close(v);
+   }
+   n = hvcc(buf, units, lens, 2); buf[2] = 1;
+   v = rh265_video_open(); if (!v) abort();
+   expect("hvcC compatibility byte is not a start code", rh265_video_set_extradata(v, buf, n), 0);
+   expect("hvcC compatibility input sets parsed", rh265_video_get_params(v, 0, &params), 0);
    rh265_video_close(v);
 }
 
 int main(void)
 {
+   test_annexb_extradata();
    test_nal_iterator(); test_access_unit();
    test_slice_info();
    test_color_info();

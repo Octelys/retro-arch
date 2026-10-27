@@ -25,6 +25,10 @@ static int claim_add(retro_atomic_int_t *p, int value)
 #define retro_atomic_fetch_add_int(p, value) claim_add(p, value)
 #include "../../../input/connect/joypad_connection.c"
 
+/* the frontend's; the user's list is the settings', here none */
+bool input_device_ignored(uint16_t vid, uint16_t pid)
+{ return input_ignore_devices_check(NULL, vid, pid); }
+
 void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
 void RARCH_DBG(const char *fmt, ...) { (void)fmt; }
 void RARCH_ERR(const char *fmt, ...) { (void)fmt; }
@@ -35,11 +39,21 @@ void input_pad_connect(unsigned port, input_device_driver_t *driver)
 { (void)port; (void)driver; }
 
 pad_connection_interface_t pad_connection_wii, pad_connection_wiiupro,
-   pad_connection_ps3, pad_connection_ps4, pad_connection_snesusb,
+   pad_connection_ps3, pad_connection_ps4, pad_connection_ps5,
+   pad_connection_ps5_edge, pad_connection_switch_pro,
+   pad_connection_switch2_pro,
+   pad_connection_snesusb,
    pad_connection_nesusb, pad_connection_wiiugca, pad_connection_ps2adapter,
    pad_connection_psxadapter, pad_connection_retrode,
    pad_connection_ps4_hori_mini, pad_connection_kade,
-   pad_connection_dragonrise;
+   pad_connection_dragonrise, pad_connection_8bitdo_sn30_pro,
+   pad_connection_8bitdo_sf30_pro, pad_connection_ps3_shanwan,
+   pad_connection_8bitdo_pro_2, pad_connection_8bitdo_pro_3,
+   pad_connection_8bitdo_ultimate_2, pad_connection_8bitdo_ultimate_2c,
+   pad_connection_8bitdo_ultimate_3, pad_connection_ps5_third_party,
+   pad_connection_switch_pro_n64, pad_connection_ps4_third_party,
+   pad_connection_ps4_razer, pad_connection_ps4_no_output,
+   pad_connection_gamecube_pc;
 
 static int payload;
 static retro_atomic_int_t destroyed, stop, bad_reads;
@@ -95,6 +109,10 @@ static void read_many(void *data)
       int value = pad_connection_get_axis(slot, 0, 0);
       if (value != 0 && value != 42)
          retro_atomic_fetch_add_int(&bad_reads, 1);
+      /* as a reader does, between reads: four spinning without a break
+       * on two cores keep the gate from ever being seen empty, and the
+       * retirement waiting for that starves */
+      sthread_yield();
    }
 }
 

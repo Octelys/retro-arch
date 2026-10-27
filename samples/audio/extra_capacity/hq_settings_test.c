@@ -2,6 +2,7 @@
 
 /* Runtime defaults unrelated to the HQ setting. */
 struct defaults g_defaults;
+void RARCH_ERR(const char *fmt, ...) { (void)fmt; }
 bool *audio_get_bool_ptr(enum audio_action action)
 {
    static bool values[2];
@@ -12,6 +13,13 @@ bool *video_driver_get_threaded(void)
 {
    static bool value;
    return &value;
+}
+bool retroarch_override_setting_is_set(
+      enum rarch_override_setting enum_idx, void *data)
+{
+   (void)enum_idx;
+   (void)data;
+   return false;
 }
 
 struct hq_setting_row

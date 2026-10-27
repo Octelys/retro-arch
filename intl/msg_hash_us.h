@@ -1580,6 +1580,14 @@ MSG_HASH(
    "Pacing"
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_DRIVER_PACING,
+   "Driver Pacing"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_TEMPORAL_UPSCALER,
+   "Temporal Upscaler"
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_DISPLAY_METRIC_MM_WIDTH,
    "Display Width (mm)"
    )
@@ -3358,6 +3366,10 @@ MSG_HASH(
    "OpenSL driver."
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_HELP_AUDIO_DRIVER_AAUDIO,
+   "AAudio driver, Android 8.0 and later. Lower latency than OpenSL; surround layouts go to an output that takes only stereo PCM as AC-3 where it decodes it (Android 14 and later)."
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_HELP_AUDIO_DRIVER_DSOUND,
    "DirectSound driver. DirectSound is used mainly from Windows 95 to Windows XP."
    )
@@ -4504,6 +4516,7 @@ MSG_HASH(MENU_ENUM_SUBLABEL_##T, sub)
 #define S_ACTION_EX_NS(T, n, sd, ok, rp, c, us) \
 MSG_HASH(MENU_ENUM_LABEL_VALUE_##T, us)
 #include "../settings/settings_def_shader_delay.h"
+#include "../settings/settings_def_shader_simulated_resolution.h"
 #undef S_BOOL
 #undef S_BOOL_NS
 #undef S_BOOL_H
@@ -7512,6 +7525,142 @@ MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_HDR_EXPAND_GAMUT_SUPER,
    "Super"
    )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_DLSS,
+   "NVIDIA DLSS Super Resolution"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_FSR,
+   "AMD FidelityFX Super Resolution (FSR)"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_XESS,
+   "Intel XeSS Super Resolution"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_QUALITY_AUTO,
+   "Auto"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_QUALITY_NATIVE,
+   "Native (anti-aliasing only)"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_QUALITY_QUALITY,
+   "Quality"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_QUALITY_BALANCED,
+   "Balanced"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_QUALITY_PERFORMANCE,
+   "Performance"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_QUALITY_ULTRA_PERFORMANCE,
+   "Ultra Performance"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_PRESET_DEFAULT,
+   "Default"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_PRESET_J,
+   "Preset J (Transformer, less ghosting)"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_PRESET_K,
+   "Preset K (Transformer, best quality)"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_PRESET_A,
+   "Preset A (CNN, DLSS 2/3)"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_PRESET_B,
+   "Preset B (CNN, DLSS 2/3)"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_PRESET_C,
+   "Preset C (CNN, DLSS 2/3)"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_PRESET_D,
+   "Preset D (CNN, DLSS 2/3)"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_PRESET_E,
+   "Preset E (CNN, DLSS 3)"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_PRESET_F,
+   "Preset F (CNN, DLSS 2/3)"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_PRESET_G,
+   "Preset G (CNN)"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_PRESET_H,
+   "Preset H"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_PRESET_I,
+   "Preset I"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_PRESET_L,
+   "Preset L"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_PRESET_M,
+   "Preset M"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_PRESET_N,
+   "Preset N"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_PRESET_O,
+   "Preset O"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_PRESET_NOT_IN_RUNTIME,
+   " (not in this DLSS runtime)"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_DLSS_NR_PRESET_DEFAULT,
+   "Default"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_DLSS_NR_PRESET_1,
+   "Preset 1"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_DLSS_NR_PRESET_2,
+   "Preset 2"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_DLSS_NR_PRESET_3,
+   "Preset 3"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_DLSS_NR_STYLE_DEFAULT,
+   "Default"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_DLSS_NR_STYLE_NATURAL,
+   "Natural"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_DLSS_NR_STYLE_CINEMATIC,
+   "Cinematic"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_DLSS_NR_SKIN_STRUCTURE_FOLLOW,
+   "Follow Local Structure"
+   )
 /* GENERATED REGION: HDR toggle group, stereo 3D & screens group and headset group (see settings_def_video_hdr_toggles.h, settings_def_video_stereo.h and settings_def_video_headset.h). */
 #define SETTINGS_DEF_STRINGS_PASS
 #define S_BOOL(f, T, n, d, sd, df, c, us, sub) \
@@ -7590,6 +7739,7 @@ MSG_HASH(MENU_ENUM_SUBLABEL_##T, sub)
 #define S_ACTION_EX_NS(T, n, sd, ok, rp, c, us) \
 MSG_HASH(MENU_ENUM_LABEL_VALUE_##T, us)
 #include "../settings/settings_def_video_hdr_toggles.h"
+#include "../settings/settings_def_video_upscaler.h"
 #include "../settings/settings_def_video_stereo.h"
 #include "../settings/settings_def_video_headset.h"
 #undef S_BOOL
@@ -7722,6 +7872,38 @@ MSG_HASH(
    "Horizontal"
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_ATTACHED,
+   "Attached"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_SEPARATE,
+   "Separate"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_HIDDEN,
+   "Hidden"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_VIDEO_WINDOWS_ENABLE_ANDROID,
+   "Show secondary screens on another display."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_WINDOW_MODE,
+   "Screen %u"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_VIDEO_SCREEN_WINDOW_MODE,
+   "Attached keeps this screen with the others. Separate puts it on a window or display of its own. Hidden leaves it out."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_WINDOW_MONITOR,
+   "Screen %u Display"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_VIDEO_SCREEN_WINDOW_MONITOR,
+   "Where this screen goes when it is Separate. Auto picks a second display. The display RetroArch is on keeps the screen attached."
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_CONTROLLERS_COMBINED,
    "Combined"
    )
@@ -7793,6 +7975,7 @@ MSG_HASH(MENU_ENUM_SUBLABEL_##T, sub)
 MSG_HASH(MENU_ENUM_LABEL_VALUE_##T, us)
 #include "../settings/settings_def_video_adaptive_vsync.h"
 #include "../settings/settings_def_video_gl_direct_spirv.h"
+#include "../settings/settings_def_shader_compiler.h"
 #undef S_BOOL
 #undef S_BOOL_NS
 #undef S_UINT
@@ -10813,6 +10996,14 @@ MSG_HASH(
    "Allow stylus hover (without touching screen) to move the cursor. Essential for drawing and painting games or lightgun games. Turn OFF if cursor moves unexpectedly."
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_STYLUS_HIDE_OVERLAY,
+   "Hide Overlay While Using Stylus"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_STYLUS_HIDE_OVERLAY,
+   "Hide the on-screen overlay while the stylus is in use, and show it again once the stylus has been idle for two seconds. A stylus hovering counts only when 'Stylus Hover Moves Cursor' is on. Turn OFF to keep the overlay on screen, to play with it while using the stylus on the screen."
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_STYLUS_PRESSURE_SENSITIVITY,
    "Stylus Pressure Sensitivity"
    )
@@ -12536,6 +12727,42 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_AIM_STICK,
    "Aim From Analog Stick"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_TOUCHPAD,
+   "Controller Touchpad"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_TOUCHPAD_POINTER,
+   "Touchscreen"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_TOUCHPAD_MOUSE,
+   "Mouse"
+   )
+MSG_HASH( /* Controller Touchpad value: a click on each half of the touchpad is a button */
+   MENU_ENUM_LABEL_VALUE_INPUT_TOUCHPAD_HALVES,
+   "Halves as Buttons"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_TOUCHPAD_LEFT,
+   "Touchpad Left Half"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_TOUCHPAD_RIGHT,
+   "Touchpad Right Half"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_TOUCHPAD,
+   "What the touchpad on this port's controller is to the core, on a DualShock 4 or DualSense. 'Touchscreen': a finger on the pad touches that spot on the screen, two fingers two spots. 'Mouse': moving a finger moves the mouse, and pressing the pad in clicks, with two fingers on it a right click. 'Halves as Buttons': pressing the pad in on its left or right half presses the button set for that half, both with a finger on each; needs 'Remap Controls'."
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_TOUCHPAD_LEFT,
+   "With 'Controller Touchpad' set to 'Halves as Buttons': the RetroPad button pressing the left half of the touchpad in presses."
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_TOUCHPAD_RIGHT,
+   "With 'Controller Touchpad' set to 'Halves as Buttons': the RetroPad button pressing the right half of the touchpad in presses."
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_AIM_STICK,
@@ -15187,6 +15414,30 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_OVERLAY_ANALOG_RECENTER_ZONE,
    "Analog stick input will be relative to first touch if pressed within this zone."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_OVERLAY_DPAD_METHOD,
+   "D-Pad Input Method"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_OVERLAY_DPAD_METHOD,
+   "How the D-pad reads a touch. 'Direction': the way the finger's centre lies. 'Contact Area': every way the finger's contact covers, so a thumb laid across two directions presses both. 'Both': either."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_OVERLAY_ABXY_METHOD,
+   "ABXY Input Method"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_OVERLAY_ABXY_METHOD,
+   "How the face buttons read a touch. 'Direction': the button the finger's centre is nearest. 'Contact Area': every button the finger's contact covers, so a thumb between two presses both. 'Both': either."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_OVERLAY_CONTACT_SCALE,
+   "Contact Area Size"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_OVERLAY_CONTACT_SCALE,
+   "How large a finger's contact counts, against the size the touchscreen reports. Raise it for a touchscreen that reports small contacts."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_OVERLAY,
@@ -24143,14 +24394,6 @@ MSG_HASH(
    "Results are added to this playlist. In case of Auto - Any, multiple system playlists may be updated. Custom without database reference will not link the entries to any database in the playlist."
    )
 MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_SCAN_SINGLE_FILE,
-   "Scan Single File"
-   )
-MSG_HASH(
-   MENU_ENUM_SUBLABEL_SCAN_SINGLE_FILE,
-   "Scans only one file instead of a directory. Re-select content location after changing this entry."
-   )
-MSG_HASH(
    MENU_ENUM_LABEL_VALUE_SCAN_OMIT_DB_REF,
    "Skip Database References From Playlist"
    )
@@ -24964,7 +25207,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_COMBO_HOLD,
-   "Instant acts the moment all of the buttons are down. Hold For waits until they have been held together for a time you choose next, so that pressing them briefly - in the middle of a game, say - does nothing."
+   "Instant acts the moment all of the buttons are down. Hold For waits until they have been held together for a time you choose next, so that pressing them briefly - in the middle of a game, say - does nothing. Press Depth waits until they are pushed in as far as you choose next, so that analog triggers and pressure-sensitive buttons (DualShock 2 and 3) only act when pressed hard."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_COMBO_HOLD_TIME,
@@ -24973,6 +25216,14 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_COMBO_HOLD_TIME,
    "How long all of the combination's buttons must be held down together before it acts."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_COMBO_DEPTH,
+   "Press Depth"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_COMBO_DEPTH,
+   "How far in each of the combination's buttons must be pushed before it acts: for analog triggers and pressure-sensitive buttons. A button that only reads pressed or not counts as pushed all the way."
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_REMAP_FIND,
@@ -25893,6 +26144,10 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_NO_BT_DEVICES_FOUND,
    "No Bluetooth Devices Found"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_BLUETOOTH_SCAN,
+   "Scan for Devices"
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_NO_NETWORKS_FOUND,
@@ -26984,6 +27239,18 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_SOCD_UP,
    "Up Priority"
+   )
+MSG_HASH( /* An overlay D-pad or face buttons read the way the finger's centre lies */
+   MENU_ENUM_LABEL_VALUE_OVERLAY_CONTACT_METHOD_VECTOR,
+   "Direction"
+   )
+MSG_HASH( /* ... every way the finger's contact on the touchscreen covers */
+   MENU_ENUM_LABEL_VALUE_OVERLAY_CONTACT_METHOD_AREA,
+   "Contact Area"
+   )
+MSG_HASH( /* ... either of the two */
+   MENU_ENUM_LABEL_VALUE_OVERLAY_CONTACT_METHOD_BOTH,
+   "Both"
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_TIMEDATE_YMD_HMS,
@@ -30912,6 +31179,10 @@ MSG_HASH(
    MENU_ENUM_LABEL_VALUE_QT_MENU_VIEW_OPTIONS,
    "&Settings..."
    )
+MSG_HASH( /* The desktop companion's window of controller combinations and macros, as the hotkeys list has them */
+   MENU_ENUM_LABEL_VALUE_QT_MENU_VIEW_CONTROLLER_SHORTCUTS,
+   "Controller &Shortcuts..."
+   )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_QT_MENU_VIEW_OPTIONS_SAVE_DOCK_POSITIONS,
    "Remember dock positions:"
@@ -31677,9 +31948,37 @@ MSG_HASH( /* The same, when that address is this computer's */
    MENU_ENUM_LABEL_VALUE_PORT_BT_HOST_THIS,
    "- Connects over Bluetooth to: This Computer (%s)"
    )
+MSG_HASH( /* The same, when the controller holds no address: it is paired with no computer */
+   MENU_ENUM_LABEL_VALUE_PORT_BT_HOST_NONE,
+   "- Connects over Bluetooth to: Nothing (not paired)"
+   )
 MSG_HASH( /* Under the same entry: selecting it makes the controller connect to this computer over Bluetooth when it is unplugged */
    MENU_ENUM_LABEL_VALUE_PORT_BT_PAIR,
    "- Pair with This Computer"
+   )
+MSG_HASH( /* Under a DualShock 3 that Windows' own driver cannot start: selecting it moves every DualShock 3 plugged in to Windows' WinUSB driver, after one administrator prompt */
+   MENU_ENUM_LABEL_VALUE_PORT_DS3_ENABLE,
+   "- Enable DualShock 3 Support"
+   )
+MSG_HASH( /* Under a DualShock 3 on WinUSB: selecting it gives every DualShock 3 plugged in back to the driver Windows chooses itself */
+   MENU_ENUM_LABEL_VALUE_PORT_DS3_RESTORE,
+   "- Restore Windows Driver"
+   )
+MSG_HASH( /* Under a controller: selecting it makes RetroArch stop reading this model of controller - for one another program also shows as a virtual controller, which would otherwise be read twice */
+   MENU_ENUM_LABEL_VALUE_PORT_IGNORE,
+   "- Ignore This Controller"
+   )
+MSG_HASH( /* A controller model the user chose to ignore, as its USB vendor and product IDs in hexadecimal; selecting it reads it again */
+   MENU_ENUM_LABEL_VALUE_INPUT_IGNORED_DEVICE,
+   "Ignored Controller %04X:%04X (select to use it again)"
+   )
+MSG_HASH( /* Shown while a Wii U GameCube adapter is plugged in that Windows' own driver cannot run: selecting it moves the adapter to Windows' WinUSB driver, after one administrator prompt */
+   MENU_ENUM_LABEL_VALUE_INPUT_GCA_ENABLE,
+   "Enable Wii U GameCube Adapter"
+   )
+MSG_HASH( /* Shown while an original Xbox controller is plugged in, which no driver of Windows' runs: selecting it moves the controller to Windows' WinUSB driver, after one administrator prompt */
+   MENU_ENUM_LABEL_VALUE_INPUT_XID_ENABLE,
+   "Enable Original Xbox Controller"
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_CHEAT_SETTINGS,
@@ -32928,6 +33227,82 @@ MSG_HASH(
    MSG_INPUT_BT_PAIR_FAILED,
    "Port %u's controller could not be paired with this computer."
    )
+MSG_HASH( /* %u is the other port on the same controller */
+   MSG_INPUT_DEVICE_INDEX_SHARED,
+   "shared with Port %u"
+   )
+MSG_HASH(
+   MSG_INPUT_DS3_ASKING,
+   "Changing the DualShock 3 driver: allow it in the Windows prompt."
+   )
+MSG_HASH(
+   MSG_INPUT_DS3_ENABLED,
+   "DualShock 3 support enabled. The controller reconnects by itself."
+   )
+MSG_HASH( /* %u is the controller's number, then its USB vendor and product IDs */
+   MSG_INPUT_DEVICE_IGNORED,
+   "Controller %u (%04X:%04X) is ignored and no longer read."
+   )
+MSG_HASH( /* the controller's USB vendor and product IDs */
+   MSG_INPUT_DEVICE_UNIGNORED,
+   "Controller %04X:%04X is read again."
+   )
+MSG_HASH(
+   MSG_INPUT_DS3_RESTORED,
+   "DualShock 3 given back to the Windows driver."
+   )
+MSG_HASH(
+   MSG_INPUT_DS3_NOT_CHANGED,
+   "The DualShock 3 driver could not be changed."
+   )
+MSG_HASH(
+   MSG_INPUT_DS3_DECLINED,
+   "The DualShock 3 driver was not changed: administrator rights were not given."
+   )
+MSG_HASH( /* %s is the controller's name, %u its port */
+   MSG_INPUT_DS3_NEEDS_ENABLING,
+   "%s (port %u) needs enabling: Information > Input Information > Enable DualShock 3 Support."
+   )
+MSG_HASH(
+   MSG_INPUT_GCA_ASKING,
+   "Changing the GameCube adapter's driver: allow it in the Windows prompt."
+   )
+MSG_HASH(
+   MSG_INPUT_GCA_ENABLED,
+   "GameCube adapter enabled. It reconnects by itself."
+   )
+MSG_HASH(
+   MSG_INPUT_GCA_NOT_CHANGED,
+   "The GameCube adapter's driver could not be changed."
+   )
+MSG_HASH(
+   MSG_INPUT_GCA_DECLINED,
+   "The GameCube adapter's driver was not changed: administrator rights were not given."
+   )
+MSG_HASH(
+   MSG_INPUT_GCA_NEEDS_ENABLING,
+   "Wii U GameCube adapter found, which Windows' own driver cannot run: Information > Input Information > Enable Wii U GameCube Adapter."
+   )
+MSG_HASH(
+   MSG_INPUT_XID_ASKING,
+   "Changing the original Xbox controller's driver: allow it in the Windows prompt."
+   )
+MSG_HASH(
+   MSG_INPUT_XID_ENABLED,
+   "Original Xbox controller enabled. It reconnects by itself."
+   )
+MSG_HASH(
+   MSG_INPUT_XID_NOT_CHANGED,
+   "The original Xbox controller's driver could not be changed."
+   )
+MSG_HASH(
+   MSG_INPUT_XID_DECLINED,
+   "The original Xbox controller's driver was not changed: administrator rights were not given."
+   )
+MSG_HASH(
+   MSG_INPUT_XID_NEEDS_ENABLING,
+   "Original Xbox controller found, which Windows has no driver for: Information > Input Information > Enable Original Xbox Controller."
+   )
 MSG_HASH(
    MSG_INPUT_COMBO_SET_BUTTONS,
    "Set Buttons"
@@ -32947,6 +33322,14 @@ MSG_HASH(
 MSG_HASH(
    MSG_INPUT_COMBO_HOLD_FOR,
    "Hold For"
+   )
+MSG_HASH(
+   MSG_INPUT_COMBO_PRESS_DEPTH,
+   "Press Depth"
+   )
+MSG_HASH(
+   MSG_INPUT_COMBO_DEPTH_PERCENT,
+   "%u%% Pressed In"
    )
 MSG_HASH(
    MSG_INPUT_COMBO_ROW_SUBLABEL,
@@ -33051,6 +33434,10 @@ MSG_HASH(
 MSG_HASH(
    MSG_SENDING_COMMAND,
    "Sending command"
+   )
+MSG_HASH( /* %s is the address and %u the port the MCP server was set to listen on */
+   MSG_MCP_SERVER_NOT_LISTENING,
+   "MCP server could not listen on %s:%u. Is another RetroArch running?"
    )
 MSG_HASH(
    MSG_SEVERAL_PATCHES_ARE_EXPLICITLY_DEFINED,
@@ -33275,6 +33662,26 @@ MSG_HASH(
 MSG_HASH(
    MSG_BLUETOOTH_SCAN_COMPLETE,
    "Bluetooth scan complete."
+   )
+MSG_HASH(
+   MSG_BLUETOOTH_ADAPTER_GENERIC_DRIVER,
+   "This computer's Bluetooth adapter runs on Windows' generic driver, which often finds no devices. Install the Bluetooth driver from the computer's or motherboard's maker."
+   )
+MSG_HASH(
+   MSG_BLUETOOTH_PAIRING,
+   "Pairing \"%s\"..."
+   )
+MSG_HASH(
+   MSG_BLUETOOTH_PAIRED,
+   "\"%s\" paired."
+   )
+MSG_HASH(
+   MSG_BLUETOOTH_PAIRING_FAILED,
+   "\"%s\" could not be paired."
+   )
+MSG_HASH(
+   MSG_BLUETOOTH_PAIRING_FAILED_WII,
+   "\"%s\" could not be paired. Press its sync button, then select it again while its lights blink."
    )
 MSG_HASH(
    MSG_BLUETOOTH_PAIRING_REMOVED,
@@ -33723,6 +34130,14 @@ MSG_HASH(
 MSG_HASH(
    MSG_MENU_FRAME_RATE_CONTENT,
    "Content Rate"
+   )
+MSG_HASH(
+   MSG_VIDEO_DRIVER_PACING_ON,
+   "On"
+   )
+MSG_HASH(
+   MSG_VIDEO_DRIVER_PACING_BOOST,
+   "On + Boost"
    )
 MSG_HASH(
    MSG_RESAMPLER_QUALITY_LOWEST,

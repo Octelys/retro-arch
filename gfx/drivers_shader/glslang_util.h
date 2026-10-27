@@ -243,19 +243,33 @@ void glslang_include_cache_free(void *cache);
 bool glslang_read_shader_pragmas_cached(const char *path,
       struct shader_line_buf *output, void *cache);
 
-/* Whether the last pass of @shader needs a render target of its own,
- * copied to the backbuffer by a hidden pass after it.  A last pass
- * scaled to exactly the viewport renders straight to the backbuffer
- * unless the preset or its shader asks for a render target format, or
- * some pass of the preset reads its feedback.  Reads the passes through
- * @cache, which may be NULL. */
-bool glslang_last_pass_needs_target(const struct video_shader *shader,
-      void *cache);
+struct glslang_last_pass
+{
+   unsigned index;
+   char name[64];
+   bool needs_target;
+   bool inspect_feedback;
+};
+
+/* Scale and format requirements are known before compilation. Reserve
+ * an optional final copy until compiled feedback usage is known, for a
+ * last pass with no scale as for one at the viewport. */
+void glslang_last_pass_init(const struct video_shader *shader,
+      void *cache, struct glslang_last_pass *state);
 
 /* As glslang_read_shader_file(), but reads through @cache. */
 bool glslang_read_shader_file_cached(const char *path,
       struct shader_line_buf *output, bool root_file, bool is_optional,
       void *cache);
+
+/* Assemble the source for one stage ("vertex" / "fragment") from the
+ * include-expanded line buffer: line 0 is the #version line, '#pragma
+ * stage' selects, '#pragma name' and '#pragma format' are dropped,
+ * every other line of the active stage is kept.  Returns a malloc'd
+ * NUL-terminated string the caller frees, NULL on allocation failure;
+ * an empty line buffer yields an empty string. */
+char *glslang_build_stage_source(const struct shader_line_buf *lines,
+      const char *stage);
 
 bool shader_line_buf_init(struct shader_line_buf *buf);
 

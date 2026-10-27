@@ -35,6 +35,12 @@
 #include "../video_driver.h"
 #include "gl_common.h"
 
+/* A software core's frames sampled where it writes them, on KMS */
+#if defined(HAVE_KMS) && defined(HAVE_EGL) && !defined(HAVE_PSGL)
+#define GL2_KMS_FRAMES
+#include "egl_gbm_frames.h"
+#endif
+
 /* The hardware ring's per-slot sync, handed from the core's thread to
  * the video thread by exchange so that one thread waits and deletes
  * each. A backend without pointer atomics only serves single-core
@@ -75,6 +81,18 @@ struct gl2_views_prog
    GLint  loc_height;
 };
 
+/* A window of screens' own: the context's record, which stays put
+ * until its destroy, and what the views draw into it with */
+struct gl2_window
+{
+   video_window_native_t native;
+   /* As last drawn and published */
+   video_views_layout_t  layout;
+   /* Anaglyph and interlaced draw both eyes into it first */
+   struct gl2_views_fbo  canvas;
+   video_views_target_t  canvas_target;
+};
+
 enum gl2_flags
 {
    GL2_FLAG_TEXTURE_MIPMAP         = (1 <<  0),
@@ -100,10 +118,6 @@ enum gl2_flags
    GL2_FLAG_MENU_TEXTURE_FULLSCREEN= (1 << 20),
    GL2_FLAG_NONE                   = (1 << 21),
    GL2_FLAG_FRAME_DUPE_LOCK        = (1 << 22),
-   /* The threaded wrapper's hardware ring is driving this driver: the
-    * core's context is current on the main thread, so this thread
-    * never takes it, and the frame reads the ring's slot. */
-   GL2_FLAG_HW_RING                = (1 << 23),
    /* Latched at init: the wrapper was active and the driver
     * configuration allowed a hw ring when this context came up.
     * core_context_is_mains() reads this instead of consulting the
@@ -196,6 +210,11 @@ struct gl2
    void *pbo_readback_sync[4];
 
    uint32_t flags;
+   /* The threaded wrapper's hardware ring is driving this driver: set
+    * and cleared on the core's thread, read on the video thread. Kept
+    * apart from flags, whose bits the video thread moves: a bit the
+    * core's thread moved in the same word could be lost either way. */
+   retro_atomic_int_t hw_ring;
 
    /* In VIDEO_SCALE_PACK's layout. */
    unsigned video_dims;
@@ -239,12 +258,20 @@ struct gl2
    gl_frame_mem_t *frame_mem;
    gl_sw_fb_t sw_fb;
 #endif
+#ifdef GL2_KMS_FRAMES
+   egl_gbm_frames_t *kms_frames;
+   /* Could not be made: frames are uploaded */
+   bool kms_frames_off;
+#endif
 #ifdef HAVE_GL_PLANAR
    gl_planar_t planar;
 #endif
    bool pbo_readback_valid[4];
    /* At init: textures take half floats (TEXTURE_GPU_FORMAT_RGBA16F) */
    bool fp16_textures;
+   /* At init: ARB_sync is there (GL2_FLAG_HAVE_SYNC). Read by the
+    * ring's capture on the core's thread, where flags is not read. */
+   bool hw_ring_have_sync;
    /* scRGB (FP16) default framebuffer support (Windows/WGL HDR):
     * everything renders into this SDR offscreen and one GLSL 1.20
     * pass encodes it into the FP16 backbuffer at end of frame.
@@ -345,6 +372,18 @@ struct gl2
       /* Each view's prev is filled */
       bool                  prev_live[RETRO_VIDEO_VIEWS_MAX];
    } views;
+
+#ifdef HAVE_VIDEO_WINDOWS
+   /* The screens' own windows, by window id; [0] is the main window
+    * and stays unused */
+   struct
+   {
+      struct gl2_window     win[RETRO_VIDEO_VIEWS_MAX];
+      video_windows_held_t  held;
+      /* gl2_frame()'s, for the preset's passes in them */
+      unsigned              frame_count;
+   } windows;
+#endif
 
 #if defined(HAVE_OPENXR) && defined(ANDROID) && defined(HAVE_OPENGLES3)
    /* The framebuffer the headset's tracked eyes are drawn through. */

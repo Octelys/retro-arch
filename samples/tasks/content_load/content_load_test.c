@@ -20,10 +20,19 @@
  *    refused, and the first still completes;
  *  - reinit deferred: a driver reinit asked for while the load is in
  *    flight leaves the drivers as they are - the load rebuilds them;
+ *  - midi boot / midi requested: a core that asks for the MIDI
+ *    interface in its load - at boot, or in a staged load on the old
+ *    session's drivers - plays through the device, through a driver
+ *    reinit too; its note-off at unload reaches the device, and a core
+ *    that does not ask has it shut;
  *  - fallback: a core that cannot be loaded ends on the dummy core
  *    with the drivers rebuilt and the menu up;
  *  - not a core: a library that opens but lacks retro_init does the
  *    same, and the failure is said;
+ *  - user dirs held: the frontend boots with the user directories
+ *    held - nothing is made or read under the playlist directory,
+ *    the playlists tab lists nothing - and the release makes the
+ *    builtin folder, loads favorites and history, and lists the tab;
  *  - quit waits for a save: a quit from the frame loop while a state
  *    is being written returns to the loop at once, which presents
  *    frames - the core not run - until the state is written, and only
@@ -46,6 +55,7 @@
 #include <dynamic/dylib.h>
 #include <file/config_file.h>
 #include <file/file_path.h>
+#include <lists/string_list.h>
 #include <streams/file_stream.h>
 #include <time/rtime.h>
 #include <retro_timers.h>
@@ -61,6 +71,8 @@
 #include "../../../frontend/frontend.h"
 #include "../../../verbosity.h"
 #include "../../../gfx/video_driver.h"
+#include "../../../audio/audio_driver.h"
+#include "../../../midi_driver.h"
 #include "../../../gfx/video_defines.h"
 #include "../../../menu/menu_driver.h"
 #include "../../../tasks/task_content.h"
@@ -71,6 +83,7 @@
 #include "../../../playlist.h"
 #include "../../../paths.h"
 #include "../../../content.h"
+#include "../../../defaults.h"
 #include "../../../input/input_driver.h"
 #include "../../../runahead.h"
 #include "../../../state_manager.h"
@@ -245,6 +258,66 @@ static void open_menu(void)
 /* Lane: staged                                                        */
 /* ------------------------------------------------------------------ */
 
+#ifdef HAVE_MENU
+static unsigned playlists_tab_size(const char *dir_playlist)
+{
+   menu_displaylist_info_t info;
+   file_list_t list = {0};
+   unsigned size;
+   menu_displaylist_info_init(&info);
+   info.list         = &list;
+   info.path         = strdup(dir_playlist);
+   info.label        = strdup(MENU_ENUM_LABEL_PLAYLISTS_TAB_STR);
+   info.exts         = strdup("lpl");
+   info.type_default = FILE_TYPE_PLAIN;
+   info.enum_idx     = MENU_ENUM_LABEL_PLAYLISTS_TAB;
+   menu_displaylist_ctl(DISPLAYLIST_DATABASE_PLAYLISTS_HORIZONTAL,
+         &info, config_get_ptr());
+   size = (unsigned)list.size;
+   menu_displaylist_info_free(&info);
+   file_list_deinitialize(&list);
+   return size;
+}
+#endif
+
+/* Runs first: main() boots the frontend held. */
+static void lane_user_dirs_held(const char *dir)
+{
+   char dir_playlist[600];
+   char builtin[640];
+   snprintf(dir_playlist, sizeof(dir_playlist), "%s/playlists", dir);
+   snprintf(builtin, sizeof(builtin), "%s/builtin", dir_playlist);
+
+   CHECK(retroarch_get_flags() & RARCH_FLAGS_USER_DIRS_HELD,
+         "held: the boot dropped the hold");
+   CHECK(!path_is_directory(builtin),
+         "held: the builtin playlist folder was made");
+#ifdef HAVE_MENU
+   CHECK(!g_defaults.content_favorites, "held: favorites were loaded");
+   CHECK(!g_defaults.content_history, "held: history was loaded");
+   retroarch_favorites_init();
+   command_event(CMD_EVENT_HISTORY_INIT, NULL);
+   CHECK(!g_defaults.content_favorites && !g_defaults.content_history,
+         "held: a playlist init read the playlist directory");
+   CHECK(playlists_tab_size(dir_playlist) == 0,
+         "held: the playlists tab listed the playlist directory");
+#endif
+
+   retroarch_user_dirs_release();
+
+   CHECK(!(retroarch_get_flags() & RARCH_FLAGS_USER_DIRS_HELD),
+         "release: the hold is still set");
+   CHECK(path_is_directory(builtin),
+         "release: the builtin playlist folder was not made");
+#ifdef HAVE_MENU
+   CHECK(g_defaults.content_favorites, "release: favorites not loaded");
+   CHECK(g_defaults.content_history, "release: history not loaded");
+   CHECK(playlists_tab_size(dir_playlist) == 1,
+         "release: the playlists tab does not list the playlist");
+#endif
+   fprintf(stderr, "user dirs held: ok\n");
+}
+
 static void lane_staged(void)
 {
    struct load_frame log[LOAD_FRAMES];
@@ -353,6 +426,246 @@ static void lane_core_opened_once(void)
    if (failures == had)
       fprintf(stderr, "[pass] core opened once lane\n");
 }
+
+/* The audio device across a content load: kept and taken back, not
+ * closed and opened again; with RETROARCH_AUDIO_KEEP=0, closed and
+ * opened again. The null driver gets a device that counts. */
+extern audio_driver_t audio_null;
+static unsigned kept_opens, kept_frees;
+static int      kept_token;
+static void *kept_init(const char *device, unsigned rate, unsigned latency,
+      unsigned *new_rate)
+{
+   (void)device; (void)latency;
+   *new_rate = rate;
+   kept_opens++;
+   return &kept_token;
+}
+static ssize_t kept_write(void *data, const void *buf, size_t len)
+{ (void)data; (void)buf; return (ssize_t)len; }
+static bool kept_true(void *data) { (void)data; return true; }
+static bool kept_start(void *data, bool shutdown)
+{ (void)data; (void)shutdown; return true; }
+static void kept_nonblock(void *data, bool state) { (void)data; (void)state; }
+static bool kept_float(void *data) { (void)data; return false; }
+static void kept_free(void *data) { (void)data; kept_frees++; }
+
+static void lane_audio_kept(void)
+{
+   struct load_frame log[LOAD_FRAMES];
+   audio_driver_t saved = audio_null;
+   unsigned had         = failures;
+   unsigned n;
+
+   audio_null.init               = kept_init;
+   audio_null.write              = kept_write;
+   audio_null.stop               = kept_true;
+   audio_null.start              = kept_start;
+   audio_null.alive              = kept_true;
+   audio_null.set_nonblock_state = kept_nonblock;
+   audio_null.free               = kept_free;
+   audio_null.use_float          = kept_float;
+   command_event(CMD_EVENT_AUDIO_REINIT, NULL);
+   pump(5);
+   CHECK(audio_state_get_ptr()->context_audio_data == &kept_token,
+         "the counting audio device did not come up");
+
+   kept_opens = kept_frees = 0;
+   open_menu();
+   CHECK(task_push_load_contentless_core_from_menu(core_path),
+         "the load was not started");
+   n = run_load(log, LOAD_FRAMES);
+   CHECK(n < LOAD_FRAMES && core_is_up(),
+         "the load did not bring the core up within %u frames", LOAD_FRAMES);
+   CHECK(kept_opens == 0 && kept_frees == 0
+         && audio_state_get_ptr()->context_audio_data == &kept_token,
+         "across the load the audio device was closed %u and opened %u time(s)",
+         kept_frees, kept_opens);
+
+   kept_opens = kept_frees = 0;
+   putenv((char*)"RETROARCH_AUDIO_KEEP=0");
+   open_menu();
+   CHECK(task_push_load_contentless_core_from_menu(core_path),
+         "the second load was not started");
+   n = run_load(log, LOAD_FRAMES);
+   putenv((char*)"RETROARCH_AUDIO_KEEP=");
+   CHECK(n < LOAD_FRAMES && core_is_up(),
+         "the second load did not bring the core up within %u frames", LOAD_FRAMES);
+   CHECK(kept_opens == 1 && kept_frees == 1,
+         "kept off, across the load the audio device was closed %u and opened %u time(s)",
+         kept_frees, kept_opens);
+
+   audio_null = saved;
+   command_event(CMD_EVENT_AUDIO_REINIT, NULL);
+   pump(5);
+   if (failures == had)
+      fprintf(stderr, "[pass] audio kept lane: the device stays open across"
+            " a content load; with keeping off it is closed and opened\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* Lanes: MIDI                                                         */
+/* ------------------------------------------------------------------ */
+
+/* Stands in for the null MIDI driver (same ident, same one "Null"
+ * output), installed in midi_drivers[] before the frontend boots, and
+ * counts what reaches it: device opens and frees, and the note-ons and
+ * note-offs the harness core plays through its interface. */
+static unsigned midi_opens, midi_frees, midi_note_ons, midi_note_offs;
+static int      midi_token;
+static bool count_midi_avail(struct string_list *list)
+{
+   union string_list_elem_attr attr;
+   attr.i = 0;
+   return string_list_append(list, "Null", attr);
+}
+static void *count_midi_init(const char *input, const char *output)
+{
+   (void)input; (void)output;
+   midi_opens++;
+   return &midi_token;
+}
+static void count_midi_free(void *p) { (void)p; midi_frees++; }
+static bool count_midi_set(void *p, const char *name)
+{ (void)p; return !name || string_is_equal(name, "Null"); }
+static bool count_midi_read(void *p, midi_event_t *event)
+{ (void)p; (void)event; return false; }
+static bool count_midi_write(void *p, const midi_event_t *event)
+{
+   (void)p;
+   if (event->data_size == 3 && (event->data[0] & 0xF0) == 0x90)
+      midi_note_ons++;
+   else if (event->data_size == 3 && (event->data[0] & 0xF0) == 0x80)
+      midi_note_offs++;
+   return true;
+}
+static bool count_midi_flush(void *p) { (void)p; return true; }
+static midi_driver_t count_midi = {
+   "null",
+   count_midi_avail,
+   count_midi_avail,
+   count_midi_init,
+   count_midi_free,
+   count_midi_set,
+   count_midi_set,
+   count_midi_read,
+   count_midi_write,
+   count_midi_flush
+};
+
+static void midi_install_counting_driver(void)
+{
+   unsigned i;
+   /* "null" is always the last entry */
+   for (i = 0; !string_is_equal(midi_drivers[i]->ident, "null"); i++) { }
+   midi_drivers[i] = &count_midi;
+}
+
+/* The core plays a note per frame while its output is enabled: every
+ * note it plays reaches the driver. */
+static void midi_check_plays(const char *when)
+{
+   unsigned core_before   = core_export("harness_core_midi_notes");
+   unsigned driver_before = midi_note_ons;
+   unsigned core_played, driver_got;
+
+   CHECK(midi_driver_output_enabled(),
+         "%s: the core asked for MIDI and the output is shut", when);
+   pump(3);
+   core_played = core_export("harness_core_midi_notes") - core_before;
+   driver_got  = midi_note_ons - driver_before;
+   CHECK(core_played >= 1 && driver_got == core_played,
+         "%s: over 3 frames the core played %u note(s), the driver got %u",
+         when, core_played, driver_got);
+}
+
+/* Boot with -L: the core asks in its load, before the first
+ * drivers_init. HARNESS_CORE_MIDI was set for the boot by main(). */
+static void lane_midi_boot(void)
+{
+   unsigned had = failures;
+
+   putenv((char*)"HARNESS_CORE_MIDI=");
+   CHECK(midi_opens >= 1, "the MIDI device was never opened at boot");
+   /* The core plays only while it runs */
+   if (menu_is_up())
+      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+   midi_check_plays("boot");
+
+   if (failures == had)
+      fprintf(stderr, "[pass] midi boot lane: a core asking at boot plays"
+            " through the device\n");
+}
+
+/* What a core's MIDI request has to outlive, and where it ends:
+ *  - a staged load: the ask comes on the old session's drivers, which
+ *    the load then rebuilds - the device is open on the new ones;
+ *  - a driver reinit while it runs (DRIVER_LIFETIME_RESET, as
+ *    SET_SYSTEM_AV_INFO does);
+ *  - its unload: the note-off it sends from retro_deinit reaches the
+ *    device, then the device is shut - closing content and starting a
+ *    core that does not ask leaves it shut, nothing left open. */
+static void lane_midi_requested(void)
+{
+   struct load_frame log[LOAD_FRAMES];
+   struct menu_state *menu_st = menu_state_get_ptr();
+   unsigned had = failures;
+   unsigned offs_before;
+   unsigned n;
+
+   putenv((char*)"HARNESS_CORE_MIDI=1");
+   open_menu();
+   CHECK(task_push_load_contentless_core_from_menu(core_path),
+         "the load was not started");
+   n = run_load(log, LOAD_FRAMES);
+   putenv((char*)"HARNESS_CORE_MIDI=");
+   CHECK(n < LOAD_FRAMES && core_is_up(),
+         "the load did not bring the core up within %u frames", LOAD_FRAMES);
+   midi_check_plays("staged load");
+
+   command_event(CMD_EVENT_REINIT, NULL);
+   pump(1);
+   midi_check_plays("driver reinit");
+
+   offs_before = midi_note_offs;
+   open_menu();
+   path_set(RARCH_PATH_CORE_LAST, core_path);
+   menu_st->flags |= MENU_ST_FLAG_PENDING_CLOSE_CONTENT;
+   pump(1);
+   n = run_load(log, LOAD_FRAMES);
+   CHECK(n < LOAD_FRAMES && !runloop_is_content_switching(),
+         "the close did not finish within %u frames", LOAD_FRAMES);
+   pump(2);
+   CHECK(midi_note_offs == offs_before + 1,
+         "the core's note-off at unload reached the device %u time(s)",
+         midi_note_offs - offs_before);
+   CHECK(!midi_driver_output_enabled() && midi_opens == midi_frees,
+         "after the close the MIDI output is %s, opened %u freed %u",
+         midi_driver_output_enabled() ? "open" : "shut",
+         midi_opens, midi_frees);
+
+   /* Start Core, as the menu would: a core that does not ask */
+   {
+      content_ctx_info_t content_info = {0};
+      CHECK(task_push_start_current_core(&content_info),
+            "Start Core was not started");
+      n = run_load(log, LOAD_FRAMES);
+      CHECK(n < LOAD_FRAMES && core_is_up()
+            && runloop_state_get_ptr()->current_core_type != CORE_TYPE_DUMMY,
+            "Start Core did not go through");
+      pump(2);
+   }
+   CHECK(!midi_driver_output_enabled() && midi_opens == midi_frees,
+         "for a core that never asked the MIDI output is %s, opened %u "
+         "freed %u", midi_driver_output_enabled() ? "open" : "shut",
+         midi_opens, midi_frees);
+
+   if (failures == had)
+      fprintf(stderr, "[pass] midi requested lane: the device plays across"
+            " a staged load and a reinit, takes the note-off at unload,"
+            " and is shut for a core that does not ask\n");
+}
+
 
 #if defined(HAVE_DYNAMIC)
 static void harness_sibling(char *s, size_t len, const char *name)
@@ -2592,17 +2905,36 @@ int main(int argc, char *argv[])
       fprintf(cfg, "savestate_auto_save = \"false\"\n");
       fprintf(cfg, "menu_show_load_content_animation = \"false\"\n");
       fprintf(cfg, "threaded_data_runloop_enable = \"false\"\n");
+      /* The null MIDI driver's one output: the MIDI lane's device */
+      fprintf(cfg, "midi_driver = \"null\"\n");
+      fprintf(cfg, "midi_output = \"Null\"\n");
       /* The records of the cores asked live next to the info cache */
       fprintf(cfg, "libretro_info_path = \"%s\"\n", dir);
       /* Where a contentless core's states go, named after the core:
        * the close-waits-for-save lane needs a save that can be
        * written, on every load */
       fprintf(cfg, "savestate_directory = \"%s\"\n", dir);
+      fprintf(cfg, "playlist_directory = \"%s/playlists\"\n", dir);
       fclose(cfg);
+   }
+   {
+      char playlist[600];
+      FILE *lpl;
+      snprintf(playlist, sizeof(playlist), "%s/playlists", dir);
+      path_mkdir(playlist);
+      snprintf(playlist, sizeof(playlist), "%s/playlists/harness.lpl", dir);
+      if ((lpl = fopen(playlist, "wb")))
+      {
+         fprintf(lpl, "{\"version\": \"1.5\", \"items\": []}\n");
+         fclose(lpl);
+      }
    }
 
    if (getenv("HARNESS_VERBOSE"))
       verbosity_enable();
+   midi_install_counting_driver();
+   /* The boot core asks for MIDI in its load: lane_midi_boot */
+   putenv((char*)"HARNESS_CORE_MIDI=1");
 
    config_file_set_io_default(config_file_io_filestream());
    rtime_init();
@@ -2635,6 +2967,7 @@ int main(int argc, char *argv[])
    if (getenv("HARNESS_VERBOSE"))
       rarch_argv[rarch_argc++] = (char*)"-v";
 
+   retroarch_user_dirs_hold();
    if (!retroarch_main_init(rarch_argc, rarch_argv))
    {
       fprintf(stderr, "FAIL: retroarch_main_init failed\n");
@@ -2648,8 +2981,12 @@ int main(int argc, char *argv[])
    CHECK(runloop_state_get_ptr()->current_core_type != CORE_TYPE_DUMMY,
          "harness core did not start (dummy core running)");
 
+   lane_user_dirs_held(dir);
+   lane_midi_boot();
    lane_staged();
    lane_core_opened_once();
+   lane_audio_kept();
+   lane_midi_requested();
 #if defined(HAVE_DYNAMIC)
    lane_probe_cached();
 #endif
@@ -2720,6 +3057,26 @@ int main(int argc, char *argv[])
       snprintf(leftover, sizeof(leftover),
             "%s/content_load_harness/content_load_harness.state.png", dir);
       remove(leftover);
+      {
+         static const char *const lpls[] = {
+            "content_favorites.lpl", "content_history.lpl",
+            "content_music_history.lpl", "content_image_history.lpl",
+            "content_video_history.lpl"
+         };
+         unsigned i;
+         for (i = 0; i < sizeof(lpls) / sizeof(lpls[0]); i++)
+         {
+            snprintf(leftover, sizeof(leftover), "%s/playlists/builtin/%s",
+                  dir, lpls[i]);
+            remove(leftover);
+         }
+         snprintf(leftover, sizeof(leftover), "%s/playlists/builtin", dir);
+         rmdir(leftover);
+         snprintf(leftover, sizeof(leftover), "%s/playlists/harness.lpl", dir);
+         remove(leftover);
+         snprintf(leftover, sizeof(leftover), "%s/playlists", dir);
+         rmdir(leftover);
+      }
       /* the per-core save folder a content load makes */
       snprintf(leftover, sizeof(leftover), "%s/content_load_harness", dir);
       rmdir(leftover);

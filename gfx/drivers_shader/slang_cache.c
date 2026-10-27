@@ -1,4 +1,5 @@
 #include "slang_cache.h"
+#include "slang_blob.h"
 #include "glslang_util.h"
 #include "slang_process.h"
 
@@ -95,12 +96,19 @@ extern "C" {
 #endif
 
 bool spirv_cache_compute_hash(const char *vertex_source,
-      const char *fragment_source, char *hash_out)
+      const char *fragment_source, const char *compiler, char *hash_out)
 {
    size_t vertex_len, fragment_len;
+   uint32_t seed;
 
-   if (!vertex_source || !fragment_source || !hash_out)
+   if (!vertex_source || !fragment_source || !compiler || !hash_out)
       return false;
+
+   /* The compiler's name seeds the vertex sum, so glslang's and rslc's
+    * modules for one source live in different entries; glslang keeps
+    * the unseeded names, so the caches users already have stay hits. */
+   seed = !strcmp(compiler, "glslang") ? 0
+      : encoding_crc32(0, (const uint8_t*)compiler, strlen(compiler));
 
    vertex_len   = strlen(vertex_source);
    fragment_len = strlen(fragment_source);
@@ -119,7 +127,7 @@ bool spirv_cache_compute_hash(const char *vertex_source,
       return false;
 
    snprintf(hash_out, 33, "%08x%08x%08x%08x",
-         (unsigned)encoding_crc32(0, (const uint8_t*)vertex_source,
+         (unsigned)encoding_crc32(seed, (const uint8_t*)vertex_source,
             vertex_len),
          (unsigned)encoding_crc32(0, (const uint8_t*)fragment_source,
             fragment_len),
@@ -150,9 +158,22 @@ bool spirv_cache_load(const char *hash, struct glslang_output *output)
          || version != SPIRV_CACHE_VERSION)
       goto error;
 
-   if (     !spirv_cache_read_stage(&r, &output->vertex,   &output->vertex_len)
-         || !spirv_cache_read_stage(&r, &output->fragment, &output->fragment_len))
-      goto error;
+   {
+      /* the words come in as two allocations the output adopts whole */
+      uint32_t *vw = NULL, *fw = NULL;
+      size_t    vn = 0, fn = 0;
+      if (     !spirv_cache_read_stage(&r, &vw, &vn)
+            || !spirv_cache_read_stage(&r, &fw, &fn))
+      {
+         free(vw);
+         free(fw);
+         goto error;
+      }
+      glslang_output_set_blob(output, false, slang_blob_adopt_words(vw, vn));
+      glslang_output_set_blob(output, true,  slang_blob_adopt_words(fw, fn));
+      if ((vn && !output->vertex) || (fn && !output->fragment))
+         goto error;
+   }
 
    if (     !spirv_cache_read(&r, &param_count, sizeof(param_count))
          || param_count > SPIRV_CACHE_MAX_PARAMETERS)

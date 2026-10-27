@@ -21,7 +21,9 @@
 #include <file/file_path.h>
 #include <retro_math.h>
 
+#include "../command.h"
 #include "../configuration.h"
+#include "../content.h"
 #include "../list_special.h"
 #include "../gfx/video_driver.h"
 #include "../audio/audio_driver.h"
@@ -39,6 +41,8 @@
 #include "drivers/record_ffmpeg.h"
 #include "drivers/record_wav.h"
 #include "drivers/record_nvenc.h"
+#include "drivers/record_metal.h"
+#include "drivers/record_mediacodec.h"
 #include "drivers/record_avfoundation.h"
 
 static recording_state_t recording_state = {0};
@@ -56,6 +60,12 @@ const record_driver_t *record_drivers[] = {
 #ifdef HAVE_AVF
    &record_avfoundation,
 #endif
+#ifdef HAVE_RECORD_METAL
+   &record_metal,
+#endif
+#ifdef HAVE_RECORD_MEDIACODEC
+   &record_mediacodec,
+#endif
 #ifdef HAVE_FFMPEG
    &record_ffmpeg,
 #endif
@@ -66,6 +76,71 @@ const record_driver_t *record_drivers[] = {
    &record_null,
    NULL,
 };
+
+void recording_gpu_frame_info(struct video_frame_info *info,bool capture)
+{
+#if defined(HAVE_RECORD_MEDIACODEC)
+   record_mediacodec_frame_info(info, capture);
+#elif defined(HAVE_RECORD_METAL)
+   record_metal_frame_info(info,capture);
+#else
+   record_nvenc_frame_info(info,capture);
+#endif
+}
+void recording_gpu_poll(void)
+{
+   if (recording_state.start_pending)
+   {
+      runloop_state_t *loop = runloop_state_get_ptr();
+      if (loop->quit_pending || loop->content_closing)
+         command_event(CMD_EVENT_RECORD_DEINIT, NULL);
+   }
+   record_nvenc_poll();
+   record_metal_poll();
+   record_mediacodec_poll();
+   recording_gpu_reinit_poll();
+}
+void recording_start_frame(void)
+{
+   if (!recording_state.start_pending || runloop_is_content_switching()
+         || content_load_state_in_progress(NULL)
+         || runloop_state_get_ptr()->auto_state_load_pending)
+      return;
+   recording_state.start_pending = false;
+   if (!recording_init())
+      command_event(CMD_EVENT_RECORD_DEINIT, NULL);
+}
+void recording_gpu_stop(void)
+{
+   record_nvenc_stop();
+   record_metal_stop();
+   record_mediacodec_stop();
+}
+bool recording_gpu_pending(void)
+{
+   return record_nvenc_pending() || record_metal_pending()
+      || record_mediacodec_pending();
+}
+bool recording_gpu_reset_pending(void)
+{
+   return record_nvenc_pending() || record_metal_pending()
+      || record_mediacodec_reset_pending();
+}
+
+bool recording_gpu_cancel_start(void)
+{
+   bool nvenc=record_nvenc_cancel_start();
+   bool metal=record_metal_cancel_start();
+   bool mediacodec = record_mediacodec_cancel_start();
+   return nvenc || metal || mediacodec;
+}
+bool recording_gpu_defer_start(const record_driver_t *driver)
+{
+   if (driver==&record_nvenc) return record_nvenc_defer_start();
+   if (driver==&record_metal) return record_metal_defer_start();
+   if (driver == &record_mediacodec) return record_mediacodec_defer_start();
+   return false;
+}
 
 recording_state_t *recording_state_get_ptr(void)
 {
@@ -142,22 +217,25 @@ bool recording_deinit(void)
 {
    recording_state_t *recording_st = &recording_state;
    bool success                   = true;
-#ifdef HAVE_RECORD_NVENC
-   bool native                    = recording_st->driver == &record_nvenc;
-#endif
 #ifdef HAVE_FFMPEG
+   bool native                    = recording_is_native_gpu(recording_st->driver);
    bool history_list_enable        = config_get_ptr()->bools.history_list_enable;
 #endif
 
-#ifdef HAVE_RECORD_NVENC
-   if (record_nvenc_cancel_start())
+   if (recording_st->start_pending)
+   {
+      recording_st->start_pending = false;
+      recording_st->path[0] = '\0';
+      return true;
+   }
+
+   if (recording_gpu_cancel_start())
    {
       recording_st->driver = NULL;
       recording_st->data = NULL;
       recording_st->path[0] = '\0';
       return true;
    }
-#endif
 
    if (     !recording_st->data
 		   || !recording_st->driver)
@@ -182,9 +260,7 @@ bool recording_deinit(void)
    /* Push recording to video history playlist */
 #ifdef HAVE_FFMPEG
    if (     success && history_list_enable
-#ifdef HAVE_RECORD_NVENC
          && !native
-#endif
          && *recording_st->path)
    {
       struct playlist_entry entry = {0};
@@ -227,15 +303,44 @@ bool recording_init(void)
       video_driver_pix_fmt              = video_st->pix_fmt;
    recording_state_t *recording_st      = &recording_state;
    bool recording_enable                = recording_st->enable;
-   bool gpu_native = string_is_equal(settings->arrays.record_driver, "nvenc");
+   bool nvenc_native = string_is_equal(settings->arrays.record_driver,"nvenc");
+   bool metal_native = string_is_equal(settings->arrays.record_driver,"metal");
+   bool mc_native = string_is_equal(settings->arrays.record_driver,"mediacodec");
+   bool gpu_native = nvenc_native || metal_native || mc_native;
+   bool menu_source = false;
+#ifdef HAVE_RECORD_MEDIACODEC
+   menu_source = mc_native && current_core_type == CORE_TYPE_DUMMY;
+#endif
 
    if (!recording_enable)
       return false;
 
+   if (content_load_state_in_progress(NULL)
+         || runloop_st->auto_state_load_pending)
+   {
+      recording_st->start_pending = true;
+      return true;
+   }
+   recording_st->start_pending = false;
+
 #ifndef HAVE_RECORD_NVENC
-   if (gpu_native)
+   if (nvenc_native)
    {
       RARCH_ERR("[Recording] Native NVENC recording is unavailable in this build.\n");
+      return false;
+   }
+#endif
+#ifndef HAVE_RECORD_METAL
+   if (metal_native)
+   {
+      RARCH_ERR("[Recording] Native Metal recording is unavailable in this build.\n");
+      return false;
+   }
+#endif
+#ifndef HAVE_RECORD_MEDIACODEC
+   if (mc_native)
+   {
+      RARCH_ERR("[Recording] Native MediaCodec recording is unavailable in this build.\n");
       return false;
    }
 #endif
@@ -247,7 +352,7 @@ bool recording_init(void)
    }
    output[0] = '\0';
 
-   if (current_core_type == CORE_TYPE_DUMMY)
+   if (current_core_type == CORE_TYPE_DUMMY && !menu_source)
    {
       RARCH_WARN("[Recording] %s\n",
             msg_hash_to_str(MSG_USING_LIBRETRO_DUMMY_CORE_RECORDING_SKIPPED));
@@ -362,6 +467,17 @@ bool recording_init(void)
    params.filename                  = output;
    params.fps                       = av_info->timing.fps;
    params.samplerate                = av_info->timing.sample_rate;
+   params.menu_source               = menu_source;
+   if (menu_source)
+   {
+      /* Menu capture follows output timing, not dummy-core AV info. */
+      params.fps = settings->floats.video_refresh_rate;
+      if (!(params.fps > 0.0))
+         params.fps = video_driver_get_window_refresh_rate();
+      params.samplerate = audio_state_get_ptr()->out_rate;
+      params.channels = recording_st->channels = 2;
+      recording_st->layout = AUDIO_LAYOUT_STEREO;
+   }
    /* XRGB2101010 source frames are down-converted to XRGB8888 before the
     * recording path sees them (see video_driver_frame), so they record as
     * ARGB8888 just like a native XRGB8888 core. */
@@ -395,15 +511,18 @@ bool recording_init(void)
       struct video_viewport vp;
       memset(&vp, 0, sizeof(vp));
       if (!video_driver_get_viewport_info(&vp)) return false;
-      if (!VIDEO_SCALE_W(vp.dims) || !VIDEO_SCALE_H(vp.dims))
+      if (!VIDEO_SCALE_W(menu_source ? vp.full_dims : vp.dims)
+            || !VIDEO_SCALE_H(menu_source ? vp.full_dims : vp.dims))
       {
-         recording_st->driver = &record_nvenc;
-         return record_nvenc_defer_start();
+         recording_st->driver = mc_native ? &record_mediacodec
+               : metal_native ? &record_metal : &record_nvenc;
+         return recording_gpu_defer_start(recording_st->driver);
       }
-      params.out_dims = params.fb_dims = vp.dims;
+      params.out_dims = params.fb_dims = menu_source ? vp.full_dims : vp.dims;
       params.pix_fmt = FFEMU_PIX_ARGB8888;
-      params.aspect_ratio = (float)VIDEO_SCALE_W(vp.dims) / VIDEO_SCALE_H(vp.dims);
-      recording_st->gpu_dims = vp.dims;
+      params.aspect_ratio = (float)VIDEO_SCALE_W(params.out_dims)
+            / VIDEO_SCALE_H(params.out_dims);
+      recording_st->gpu_dims = params.out_dims;
       recording_st->gpu_bgrx = false;
    }
    else if (video_gpu_record && video_st->current_video->read_viewport)

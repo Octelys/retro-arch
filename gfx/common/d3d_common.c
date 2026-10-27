@@ -12,6 +12,7 @@
  *  You should have received a copy of the GNU General Public License along with RetroArch.
  *  If not, see <http://www.gnu.org/licenses/>.
  */
+#include <string.h>
 #include <string/stdstring.h>
 
 #include "../../configuration.h"
@@ -19,6 +20,7 @@
 #include "../../verbosity.h"
 
 #include "d3d_common.h"
+#include "../video_driver.h"
 
 #define D3D_TEXTURE_FILTER_LINEAR 2
 #define D3D_TEXTURE_FILTER_POINT  1
@@ -43,4 +45,3 @@ int32_t d3d_translate_filter(unsigned type)
 
    return (int32_t)D3D_TEXTURE_FILTER_POINT;
 }
-

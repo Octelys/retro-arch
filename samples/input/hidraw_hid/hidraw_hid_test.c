@@ -10,11 +10,30 @@
  *                  with none waiting, one read and the state stays
  *   pressures   -> L2, R2 and the face, shoulder and D-pad buttons'
  *                  pressures are axes 4 to 15
+ *   rumble      -> the motors go in the output report with the lights,
+ *                  written at the pad's next report, once a change
  *   bluetooth   -> the address the pad connects to is feature 0xF5,
  *                  read and set most significant byte first
  *   gone        -> a read failing with ENODEV disconnects the pad, frees
  *                  its port and closes the node
- *   free        -> every node closed */
+ *   free        -> every node closed
+ *   dualsense   -> any pad with a handler is taken, not the DualShock 3
+ *                  alone: a DualSense's node is opened, on port 1 with
+ *                  its ids, and a report read through its handler
+ *   bus         -> a handler is told Bluetooth by the node's bus: a
+ *                  Switch Pro Controller greeted on USB, not on Bluetooth
+ *   no handler  -> a pad with none is read from its report descriptor,
+ *                  numbered as on the Mac, named as it names itself; a
+ *                  keyboard's descriptor is no pad
+ *   lend        -> a pad's state is lent where its handler keeps it:
+ *                  what the reads answer, the same storage poll after
+ *                  poll, the hat of a pad read from its descriptor in
+ *                  it; none for a port with no pad
+ *   bridge      -> what the snapshot bridge assumes of a driver it
+ *                  serves (samples/input/joypad_bridge_checked): its
+ *                  button(), axis() and state() say what get_buttons()
+ *                  and the lent state say - a home button's menu
+ *                  toggle and a descriptor pad's hat among them */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,8 +49,43 @@
 
 #include "input/input_driver.h"
 #include "input/connect/joypad_connection.h"
+#include "input/common/input_ignore_devices.h"
+
+/* the frontend's; the user's list is the settings', here none */
+bool input_device_ignored(uint16_t vid, uint16_t pid)
+{ return input_ignore_devices_check(NULL, vid, pid); }
 
 extern hid_driver_t hidraw_hid;
+
+#include "../joypad_bridge_checked/bridge_view.h"
+
+/* hidraw as the HID joypad driver (hid_joypad.c) has it */
+static void *bridge_hid;
+static int32_t bridge_button(unsigned pad, uint16_t key)
+{ return hidraw_hid.button(bridge_hid, pad, key); }
+static int16_t bridge_axis(unsigned pad, uint32_t axis)
+{ return hidraw_hid.axis(bridge_hid, pad, axis); }
+static void bridge_get_buttons(unsigned pad, input_bits_t *state)
+{ hidraw_hid.get_buttons(bridge_hid, pad, state); }
+static int16_t bridge_state(rarch_joypad_info_t *info,
+      const uint16_t *keys, const uint32_t *axes, unsigned port)
+{ return hidraw_hid.state(bridge_hid, info, keys, axes, port); }
+static const input_pad_view_t *bridge_view(unsigned pad)
+{ return hidraw_hid.view(bridge_hid, pad); }
+
+/* the disagreements the bridge would find on pad 0 of @hid */
+static unsigned bridge_check(void *hid)
+{
+   input_device_driver_t drv;
+   memset(&drv, 0, sizeof(drv));
+   drv.button      = bridge_button;
+   drv.axis        = bridge_axis;
+   drv.get_buttons = bridge_get_buttons;
+   drv.state       = bridge_state;
+   drv.view        = bridge_view;
+   bridge_hid      = hid;
+   return bv_compare(&drv, 0) + bv_compare_view(&drv, 0);
+}
 
 static int failures;
 #define CHECK(cond, msg) do { if (!(cond)) { \
@@ -71,6 +125,8 @@ typedef struct
    const char *node;
    const char *uevent;
    int open_errno;     /* the node cannot be opened */
+   const uint8_t *desc; /* its report descriptor, in sysfs */
+   int desc_len;
    int open_flags;
    int opens;
    int closes;
@@ -88,9 +144,29 @@ typedef struct
    int features_got[256];
 } fake_node_t;
 
+/* a keyboard's report descriptor, and a common USB pad's */
+static const uint8_t keyboard_desc[] = {
+   0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7,
+   0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01,
+   0x75, 0x08, 0x81, 0x01, 0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65,
+   0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00, 0xc0
+};
+static const uint8_t pad_desc[] = {
+   0x05, 0x01, 0x09, 0x04, 0xa1, 0x01, 0xa1, 0x02, 0x75, 0x08, 0x95, 0x05,
+   0x15, 0x00, 0x26, 0xff, 0x00, 0x35, 0x00, 0x46, 0xff, 0x00, 0x09, 0x30,
+   0x09, 0x30, 0x09, 0x30, 0x09, 0x30, 0x09, 0x31, 0x81, 0x02, 0x75, 0x04,
+   0x95, 0x01, 0x25, 0x07, 0x46, 0x3b, 0x01, 0x65, 0x14, 0x09, 0x39, 0x81,
+   0x42, 0x65, 0x00, 0x75, 0x01, 0x95, 0x0c, 0x25, 0x01, 0x45, 0x01, 0x05,
+   0x09, 0x19, 0x01, 0x29, 0x0c, 0x81, 0x02, 0x06, 0x00, 0xff, 0x75, 0x01,
+   0x95, 0x08, 0x25, 0x01, 0x45, 0x01, 0x09, 0x01, 0x81, 0x02, 0xc0, 0xa1,
+   0x02, 0x75, 0x08, 0x95, 0x07, 0x46, 0xff, 0x00, 0x26, 0xff, 0x00, 0x09,
+   0x02, 0x91, 0x02, 0xc0, 0xc0
+};
+
 static fake_node_t nodes[] = {
    { "hidraw0", "DRIVER=hid-generic\nHID_ID=0003:0000046D:0000C31C\n"
-                "HID_NAME=Logitech USB Keyboard\n" },
+                "HID_NAME=Logitech USB Keyboard\n", 0,
+                keyboard_desc, (int)sizeof(keyboard_desc) },
    { "hidraw1", "DRIVER=sony\nHID_ID=0003:0000054C:00000268\n"
                 "HID_NAME=Sony PLAYSTATION(R)3 Controller\n" },
    { "hidraw2", "DRIVER=sony\nHID_ID=0003:0000054C:00000268\n"
@@ -119,6 +195,17 @@ int __wrap_open(const char *path, int flags, ...)
          nodes[i].open_flags = flags;
          return 100 + i;
       }
+      snprintf(p, sizeof(p), "/sys/class/hidraw/%s/device/report_descriptor",
+            nodes[i].node);
+      if (!strcmp(path, p))
+      {
+         if (!nodes[i].desc)
+         {
+            errno = ENOENT;
+            return -1;
+         }
+         return 300 + i;
+      }
       snprintf(p, sizeof(p), "/sys/class/hidraw/%s/device/uevent",
             nodes[i].node);
       if (!strcmp(path, p))
@@ -142,6 +229,13 @@ ssize_t __wrap_read(int fd, void *buf, size_t len)
          n = len;
       memcpy(buf, s, n);
       uevent_pos[fd - 200] += (int)n;
+      return (ssize_t)n;
+   }
+   if (fd >= 300 && fd < 300 + NODES)
+   {
+      fake_node_t *nd = &nodes[fd - 300];
+      size_t n        = (size_t)nd->desc_len < len ? (size_t)nd->desc_len : len;
+      memcpy(buf, nd->desc, n);
       return (ssize_t)n;
    }
    if (fd >= 100 && fd < 100 + NODES)
@@ -201,6 +295,12 @@ int __wrap_ioctl(int fd, unsigned long req, ...)
    {
       memcpy(nd->feature_set, buf, size < 8 ? size : 8);
       nd->features_set++;
+      /* a DualShock 3 on USB stalls 0xF4, Bluetooth's start */
+      if (buf[0] == 0xf4)
+      {
+         errno = EPIPE;
+         return -1;
+      }
       return (int)size;
    }
    if (req == HIDIOCGFEATURE(size))
@@ -218,6 +318,8 @@ int __wrap_ioctl(int fd, unsigned long req, ...)
 
 int __wrap_close(int fd)
 {
+   if (fd >= 300)
+      return 0;
    if (fd >= 100 && fd < 100 + NODES)
       nodes[fd - 100].closes++;
    return 0;
@@ -310,7 +412,7 @@ int main(void)
          "the LED report for port 1 was not written");
    CHECK(ds3->features_set == 1 && ds3->feature_set[0] == 0xf4
          && ds3->feature_set[1] == 0x42,
-         "0xF4 was not set");
+         "0xF4 was not tried");
    CHECK(ds3->features_got[0xf2] == 1 && ds3->features_got[0xf5] == 1,
          "0xF2 and 0xF5 were not read");
 
@@ -331,6 +433,75 @@ int main(void)
          "the buttons are not the newest report's");
    x = hidraw_hid.axis(hid, 0, AXIS_POS(0));
    CHECK(x > 30000, "the stick is not the newest report's");
+
+   /* lend: the handler's own state, what the reads answered */
+   {
+      const input_pad_view_t *v = hidraw_hid.view(hid, 0);
+      CHECK(v != NULL, "the DualShock 3's state is not lent");
+      CHECK(!hidraw_hid.view(hid, 1), "a port with no pad lends a state");
+      if (v)
+      {
+         CHECK(!memcmp(&v->buttons, &bits, sizeof(bits)) && v->axes[0] == x
+               && v->axes[5] == hidraw_hid.axis(hid, 0, AXIS_POS(5))
+               && !v->hats,
+               "the lent state is not what the reads answer");
+         queue_report(ds3, cross, 0);
+         hidraw_hid.poll(hid);
+         CHECK(hidraw_hid.view(hid, 0) == v
+               && BIT256_GET(v->buttons, RETRO_DEVICE_ID_JOYPAD_B)
+               && !BIT256_GET(v->buttons, RETRO_DEVICE_ID_JOYPAD_A)
+               && v->axes[0] < -30000,
+               "the lent state is not the handler's, kept up at each poll");
+         queue_report(ds3, circle, 255);
+         hidraw_hid.poll(hid);
+      }
+      CHECK(!bridge_check(hid),
+            "the DualShock 3: the reads say what the bridge would not");
+   }
+
+   /* rumble: one output report at the next report the pad sends,
+    * the strong motor's force and the weak one only on or off; none
+    * again unchanged */
+   {
+      int writes = ds3->writes;
+      hidraw_hid.set_rumble(hid, 0, RETRO_RUMBLE_STRONG, 0x8000);
+      hidraw_hid.set_rumble(hid, 0, RETRO_RUMBLE_WEAK, 0x0100);
+      CHECK(ds3->writes == writes, "rumble was written outside the pad's report");
+      queue_report(ds3, circle, 255);
+      hidraw_hid.poll(hid);
+      CHECK(ds3->writes == writes + 1 && ds3->out[0] == 0x01
+            && ds3->out[2] == 0xff && ds3->out[3] == 1
+            && ds3->out[4] == 0xff && ds3->out[5] == 0x80
+            && ds3->out[10] == 0x02,
+            "the rumble report is not the motors asked for, with the lights");
+      queue_report(ds3, circle, 255);
+      hidraw_hid.poll(hid);
+      CHECK(ds3->writes == writes + 1, "rumble was written again unchanged");
+      hidraw_hid.set_rumble(hid, 0, RETRO_RUMBLE_STRONG, 0);
+      hidraw_hid.set_rumble(hid, 0, RETRO_RUMBLE_WEAK, 0);
+      queue_report(ds3, circle, 255);
+      hidraw_hid.poll(hid);
+      CHECK(ds3->writes == writes + 2 && !ds3->out[3] && !ds3->out[5],
+            "the motors were not stopped");
+   }
+
+   /* the left stick half up and the right one fully down: up is
+    * negative, down positive, neither turned round */
+   ds3->reads = 0;
+   queue_report(ds3, 0, 128);
+   ds3->queue[ds3->queued - 1][7] = 64;
+   ds3->queue[ds3->queued - 1][9] = 255;
+   hidraw_hid.poll(hid);
+   CHECK(hidraw_hid.axis(hid, 0, AXIS_NEG(1)) < -15000
+         && !hidraw_hid.axis(hid, 0, AXIS_POS(1)),
+         "the left stick held half up does not read up");
+   CHECK(hidraw_hid.axis(hid, 0, AXIS_POS(3)) > 32000,
+         "the right stick held down does not read fully down");
+   CHECK(!hidraw_hid.axis(hid, 0, AXIS_NEG(0))
+         && hidraw_hid.axis(hid, 0, AXIS_POS(0)) < 1000,
+         "the centred left stick reads off centre");
+   queue_report(ds3, circle, 255);
+   hidraw_hid.poll(hid);
    /* pressures: axes 4 to 15, circle the eighth */
    CHECK(hidraw_hid.axis(hid, 0, AXIS_POS(7)) == ((200 << 7) | (200 >> 1)),
          "circle's pressure is not axis 7");
@@ -338,6 +509,31 @@ int main(void)
          "R2's pressure is not axis 5");
    CHECK(!hidraw_hid.axis(hid, 0, AXIS_POS(6)),
          "cross has pressure without being pressed");
+
+   /* every pressure from its byte - L2, R2, cross, circle, square,
+    * triangle, L1, R1, up, down, left, right - and kept, not the
+    * report: a report that is not the input report leaves them */
+   {
+      static const uint8_t byte_of[12] = {
+         18, 19, 24, 23, 25, 22, 20, 21, 14, 16, 17, 15 };
+      unsigned a;
+      bool all = true;
+      queue_report(ds3, circle, 128);
+      for (a = 0; a < 12; a++)
+         ds3->queue[ds3->queued - 1][byte_of[a]] = (uint8_t)(10 + a * 20);
+      hidraw_hid.poll(hid);
+      ds3->queue[ds3->queued][0] = 0x02;
+      ds3->queued++;
+      hidraw_hid.poll(hid);
+      for (a = 0; a < 12; a++)
+      {
+         unsigned b = 10 + a * 20;
+         if (hidraw_hid.axis(hid, 0, AXIS_POS(4 + a))
+               != (int16_t)((b << 7) | (b >> 1)))
+            all = false;
+      }
+      CHECK(all, "a pressure is not from its byte, or another report changed it");
+   }
 
    /* nothing waiting */
    ds3->reads = 0;
@@ -390,10 +586,105 @@ int main(void)
    CHECK(connected_port == 0 && ds3->opens == 2,
          "the pad did not come back on port 1");
 
-   /* free */
+   /* free: the node closed, and the pad not said to have left - it is
+    * still plugged in, and the next driver reports it again */
    hidraw_hid.free(hid);
-   CHECK(ds3->closes == 2 && disconnects == 2,
-         "free left the node open or the pad connected");
+   CHECK(ds3->closes == 2 && disconnects == 1,
+         "free left the node open, or said a pad still there had left");
+
+   /* a DualSense where the keyboard was */
+   kbd->uevent = "DRIVER=playstation\nHID_ID=0003:0000054C:00000CE6\n"
+                 "HID_NAME=Sony Interactive Entertainment DualSense Wireless Controller\n";
+   ds3->uevent = nodes[0].uevent;
+   ds3->open_errno = EACCES;
+   kbd->opens = kbd->closes = 0;
+   connected_port = -1;
+   warnings       = 0;
+   hid = hidraw_hid.init();
+   CHECK(kbd->opens == 1 && connected_port == 0 && connected_vid == 0x054c
+         && connected_pid == 0x0ce6,
+         "a DualSense's node was not opened, on port 1 with its ids");
+   {
+      /* the stand-in reads 49 bytes: under USB's 64, so read as
+       * Bluetooth's short report - cross, the hat at rest */
+      memset(kbd->queue[0], 0, sizeof(kbd->queue[0]));
+      kbd->queue[0][0] = 0x01;
+      kbd->queue[0][1] = kbd->queue[0][2] = kbd->queue[0][3] = kbd->queue[0][4] = 0x80;
+      kbd->queue[0][5] = 0x08 | 0x20;
+      kbd->queued      = 1;
+      hidraw_hid.poll(hid);
+      hidraw_hid.get_buttons(hid, 0, &bits);
+      CHECK(BIT256_GET(bits, RETRO_DEVICE_ID_JOYPAD_B)
+            && !BIT256_GET(bits, RETRO_DEVICE_ID_JOYPAD_A),
+            "the DualSense's report was not read through its handler");
+      /* the PS button held: the menu toggle, past the first 32 */
+      memset(kbd->queue[0], 0, sizeof(kbd->queue[0]));
+      kbd->queue[0][0] = 0x01;
+      kbd->queue[0][1] = kbd->queue[0][2] = kbd->queue[0][3] = kbd->queue[0][4] = 0x80;
+      kbd->queue[0][5] = 0x08 | 0x20;
+      kbd->queue[0][7] = 0x01;
+      kbd->queued      = 1;
+      hidraw_hid.poll(hid);
+      CHECK(hidraw_hid.button(hid, 0, RARCH_MENU_TOGGLE),
+            "the DualSense's PS button is not the menu toggle through button()");
+      CHECK(!bridge_check(hid),
+            "the DualSense: the reads say what the bridge would not");
+   }
+   hidraw_hid.free(hid);
+   CHECK(kbd->closes == 1, "the DualSense's node was not closed");
+
+   /* a Switch Pro Controller: on USB it is greeted; on Bluetooth, which
+    * the bus tells, asked for its full reports at once */
+   kbd->uevent = "DRIVER=nintendo\nHID_ID=0003:0000057E:00002009\n"
+                 "HID_NAME=Nintendo Co., Ltd. Pro Controller\n";
+   kbd->writes = 0;
+   hid = hidraw_hid.init();
+   CHECK(kbd->writes == 1 && kbd->out[0] == 0x80 && kbd->out[1] == 0x02,
+         "a Switch Pro Controller on USB was not greeted");
+   hidraw_hid.free(hid);
+   kbd->uevent = "DRIVER=nintendo\nHID_ID=0005:0000057E:00002009\n"
+                 "HID_NAME=Pro Controller\n";
+   kbd->writes = 0;
+   hid = hidraw_hid.init();
+   CHECK(kbd->writes == 1 && kbd->out[0] == 0x01 && kbd->out[10] == 0x03
+         && kbd->out[11] == 0x30,
+         "a Switch Pro Controller on Bluetooth was not asked for full reports");
+   hidraw_hid.free(hid);
+
+   /* a pad with no handler where the DualSense was */
+   kbd->uevent   = "DRIVER=hid-generic\nHID_ID=0003:00001234:00005678\n"
+                   "HID_NAME=Generic USB Joystick\n";
+   kbd->desc     = pad_desc;
+   kbd->desc_len = (int)sizeof(pad_desc);
+   kbd->opens    = kbd->closes = 0;
+   connected_port = -1;
+   hid = hidraw_hid.init();
+   CHECK(kbd->opens == 1 && connected_port == 0 && connected_vid == 0x1234,
+         "a pad with no handler was not opened from its descriptor");
+   CHECK(!strcmp(hidraw_hid.name(hid, 0), "Generic USB Joystick"),
+         "a pad with no handler is not known by its name");
+   memset(kbd->queue[0], 0, sizeof(kbd->queue[0]));
+   kbd->queue[0][0] = 0xff;                 /* X: right */
+   kbd->queue[0][4] = 0x00;                 /* Y: up */
+   kbd->queue[0][5] = 0x06 | (0x02 << 4);   /* hat left, button 2 */
+   kbd->queued      = 1;
+   hidraw_hid.poll(hid);
+   CHECK(   hidraw_hid.axis(hid, 0, AXIS_POS(0)) == 32767
+         && hidraw_hid.axis(hid, 0, AXIS_NEG(1)) == -32767,
+         "a pad with no handler: its axes are not read");
+   CHECK(   hidraw_hid.button(hid, 0, 1) && !hidraw_hid.button(hid, 0, 0)
+         && hidraw_hid.button(hid, 0, HAT_MAP(0, HAT_LEFT_MASK))
+         && !hidraw_hid.button(hid, 0, HAT_MAP(0, HAT_RIGHT_MASK)),
+         "a pad with no handler: its buttons or hat are not read");
+   {
+      const input_pad_view_t *v = hidraw_hid.view(hid, 0);
+      CHECK(v && v->hats == 4 && v->axes[0] == 32767
+            && BIT256_GET(v->buttons, 1) && !BIT256_GET(v->buttons, 0),
+            "a pad with no handler: its state, hat and all, is not lent");
+      CHECK(!bridge_check(hid),
+            "a pad with no handler: the reads say what the bridge would not");
+   }
+   hidraw_hid.free(hid);
 
    if (failures)
    {

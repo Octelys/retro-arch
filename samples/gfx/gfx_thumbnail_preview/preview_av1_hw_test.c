@@ -6,16 +6,22 @@
 #include <formats/video_player.h>
 #include <formats/rav1_hw.h>
 #include <features/features_cpu.h>
+#ifdef HAVE_THREADS
+#include <rthreads/rthreads.h>
+#endif
 #include "../../../gfx/gfx_anim_preview.h"
 #include "../../../libretro-common/samples/formats/av1/rav1_webm_fixture.h"
 
 static const char *fixture_path;
-static unsigned failures, opens, closes, exports, abandons, shown;
-static int busy, threaded;
+static unsigned failures, opens, closes, exports, abandons, shown, decoded_count;
+static int busy, threaded, known_movie;
 static gfx_anim_preview_t *preview;
 static video_hw_frame_t held;
 static uint64_t offered;
 static rav1_hw_backend_t factory;
+#ifdef HAVE_THREADS
+static uintptr_t first_open_thread;
+#endif
 #define CHECK(x)                                                               \
    do                                                                          \
    {                                                                           \
@@ -62,6 +68,10 @@ static bool open_backend(void *user, const rav1_sequence_t *seq, unsigned slots,
    ops->decoder = &factory;
    ops->decode = decode;
    ops->output = output;
+#ifdef HAVE_THREADS
+   if (!first_open_thread)
+      first_open_thread = sthread_get_current_thread_id();
+#endif
    opens++;
    return true;
 }
@@ -96,6 +106,18 @@ static bool feed(void *user)
    return gfx_anim_preview_feed(preview);
 }
 
+/* Timestamp queries belong to the decode owner, including the hardware
+ * path. A BUSY presentation retry must not decode or advance this again. */
+static void decoded(void *user, enum video_player_how how)
+{
+   (void)user;
+   CHECK(how == VIDEO_PLAYER_DIRECT);
+   if (preview->type == IMAGE_TYPE_WEBM)
+      CHECK(image_transfer_anim_stream_frame_time_ns(preview->stream,
+            preview->type) == (int64_t)(decoded_count % 2) * 40000000);
+   decoded_count++;
+}
+
 static enum video_player_present present(void *user,
                                          const video_player_frame_t *frame)
 {
@@ -109,9 +131,10 @@ static enum video_player_present present(void *user,
       busy = 0;
       return VIDEO_PLAYER_PRESENT_BUSY;
    }
-   /* Inline playback abandons BUSY exports; worker playback retries them. */
+   /* Decode-ahead retains BUSY exports, including inline movies with a
+    * declared period. Legacy unknown-duration inline streams drop them. */
    CHECK(!offered ||
-         (threaded ? frame->hw->image == offered : frame->hw->image > offered));
+         ((threaded || known_movie) ? frame->hw->image == offered : frame->hw->image > offered));
    offered = 0;
    video_hw_frame_abandon(&held);
    held = *frame->hw;
@@ -125,18 +148,29 @@ static void playback(unsigned flags, int loops)
    video_player_t *player;
    int state = VIDEO_PLAYER_PLAYING;
    int64_t deadline;
+   unsigned before = opens;
+#ifdef HAVE_THREADS
+   uintptr_t owner = sthread_get_current_thread_id();
+   first_open_thread = 0;
+#endif
    shown = 0;
+   decoded_count = 0;
    busy = 1;
    offered = 0;
    preview = gfx_anim_preview_open_hw(fixture_path, 0);
    CHECK(preview != NULL);
    if (!preview)
       return;
+   CHECK(opens == before);
+   CHECK(preview->seekable);
+   known_movie = image_transfer_anim_stream_duration_ns(preview->stream,
+         preview->type) > 0;
    memset(&sink, 0, sizeof(sink));
    sink.start = start;
    sink.start_hw = start_hw;
    sink.present = present;
    sink.feed = feed;
+   sink.decoded = decoded;
    player =
        video_player_new(preview->stream, preview->type, loops, &sink, flags);
    CHECK(player != NULL);
@@ -145,9 +179,13 @@ static void playback(unsigned flags, int loops)
           cpu_features_get_time_usec() < deadline)
       state = video_player_poll(player, cpu_features_get_time_usec());
    CHECK(state == VIDEO_PLAYER_ENDED &&
-         shown == (unsigned)(2 * loops - (threaded ? 0 : 1)));
+         shown == (unsigned)(2 * loops - ((threaded || known_movie) ? 0 : 1)));
    video_player_free(player);
    video_player_worker_deinit();
+#ifdef HAVE_THREADS
+   CHECK(first_open_thread && first_open_thread != owner);
+#endif
+   CHECK(decoded_count == (unsigned)(2 * loops));
    gfx_anim_preview_close(preview);
    preview = NULL;
    CHECK(held.image != 0 && opens == closes);
@@ -179,7 +217,18 @@ static void test_container(unsigned container)
    CHECK(!image_transfer_anim_stream_new_avail(bytes, used, used, type, &more,
                                                NULL, NULL) &&
          !more);
-   CHECK(!gfx_anim_preview_open_hw(fixture_path, 0));
+   CHECK(!image_transfer_anim_stream_new_hw_avail(bytes, used, used, type,
+         &more, NULL, NULL) && !more && opens == before);
+   /* A GPU player's metadata open must not depend on native availability
+    * or construct a decoder on the polling owner. */
+   preview = gfx_anim_preview_open_hw(fixture_path, 0);
+   CHECK(preview && opens == before);
+   if (preview)
+   {
+      CHECK(preview->seekable);
+      gfx_anim_preview_close(preview);
+      preview = NULL;
+   }
    factory.user = &factory;
    factory.open = open_backend;
    factory.close = close_backend;

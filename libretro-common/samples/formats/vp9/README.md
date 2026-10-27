@@ -33,6 +33,17 @@ Backends protect actual GPU reads/writes and leases with their existing fences.
 `discard_output` avoids exporting a surface when a display frame is dropped.
 No session operation waits, allocates, copies pixels, or reads GPU pixels.
 
+An opaque bitstream factory sets `rvp9_hw_backend_t.packet_decoder` to true;
+WebM copies this immutable choice into the session. Direct callers use
+`rvp9_hw_session_init_mode`. The default initializer and surface factories keep
+the existing output-only repeat path. Packet mode submits every repeated-display
+packet through `decode`, retaining its bytes on BUSY and preserving the reference
+map, previous picture and coded-header state across retry or cancellation.
+Only an accepted repeat publishes display output. Hidden coded pictures still
+update references without producing display output. Session and WebM tests cover
+both modes, including superframes, lacing, backpressure and held output at close.
+This contract does not register or implement a native MediaCodec VP9 backend.
+
 The initial session supports fixed-size profile 0 8-bit and profile 2 10-bit
 4:2:0 sequences beginning with a keyframe. Profile, depth or geometry changes
 return unsupported without submitting: cancel/retire and reopen resources or
@@ -42,7 +53,7 @@ animation stream opts into it through image_transfer and the shared video_player
 including the thumbnail animation path. The primary media_core WebM path
 also adopts this stream; its host tests cover GPU sink ownership, transport
 and software fallback in
-`samples/cores/webm_player`. Vulkan VP9 submission remains pending.
+`samples/cores/webm_player`. Vulkan VP9 submission is also registered.
 
 Reference: [Vulkan VP9 reference management and show-existing behavior](https://docs.vulkan.org/features/latest/features/proposals/VK_KHR_video_decode_vp9.html).
 
@@ -67,3 +78,11 @@ export or software color conversion. Retry the same next/skip operation while
 it reports waiting. The movie core latches that choice across BUSY and input
 retries, so seek/catch-up frames avoid the DPB-to-output copy. Presented frames
 still require the backend's independent shared-output lease.
+
+Hardware seeks rewind to a keyframe and discard preroll without exporting
+GPU frames. Each seek step submits at most one container packet and retains
+pending submission state across BUSY responses. The target packet is kept for
+the next displayed frame. The stream test covers forward/backward seeks,
+partial input, superframes, show-existing frames, seek replacement while BUSY,
+and a held frame surviving decoder reset and close. These mock checks establish
+sequencing and ownership, not native GPU pixels or seek performance.
