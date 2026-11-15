@@ -100,6 +100,23 @@ void ws_server_notify_user_changed(void);
 void ws_server_notify_achievement_progress(uint32_t id,
       const char *measured_progress);
 
+/* Main thread: a read the core made of its input, with what it was
+ * given; the RetroPad's are sent with the frame. */
+void ws_server_memory_input(unsigned port, unsigned device,
+      unsigned idx, unsigned id, int16_t state);
+
+/* Main thread, once per frame the core ran: hands the core's RAM regions
+ * and the buttons it read to "retroarch-memory" clients. */
+void ws_server_memory_frame(void);
+
+/* Main thread, every iteration, paused or not: hands the service thread
+ * websocket_ram_stream_enable. */
+void ws_server_memory_setting_poll(bool enabled);
+
+/* Main thread: the content was unloaded, so the next frames start a
+ * new session. */
+void ws_server_memory_content_unloaded(void);
+
 
 #ifdef __cplusplus
 }

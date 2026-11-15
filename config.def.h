@@ -1822,6 +1822,9 @@
 /* The MCP server: off, and only on this machine, unless chosen. */
 #define DEFAULT_MCP_SERVER_ENABLE false
 #define DEFAULT_MCP_SERVER_PORT 55357
+
+/* Core RAM to "retroarch-memory" WebSocket clients: off unless chosen. */
+#define DEFAULT_WEBSOCKET_RAM_STREAM_ENABLE false
 #define DEFAULT_NETWORK_REMOTE_BASE_PORT 55400
 #define DEFAULT_STDIN_CMD_ENABLE false
 

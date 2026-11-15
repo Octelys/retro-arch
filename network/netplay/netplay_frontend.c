@@ -63,6 +63,9 @@
 
 #include "../../tasks/tasks_internal.h"
 #include "../../input/input_driver.h"
+#ifdef HAVE_WEBSOCKET_SERVER
+#include "../ws_server.h"
+#endif
 #ifdef HAVE_BSV_MOVIE
 #include "../../input/bsv/bsvmovie.h"
 #endif
@@ -10363,6 +10366,9 @@ int16_t input_state_net(unsigned port, unsigned device,
          int16_t result = netplay_input_state(netplay, port, device, idx, id);
 #ifdef HAVE_BSV_MOVIE
          netplay_bsv_input(netplay, port, device, idx, id, result);
+#endif
+#ifdef HAVE_WEBSOCKET_SERVER
+         ws_server_memory_input(port, device, idx, id, result);
 #endif
          return result;
       }

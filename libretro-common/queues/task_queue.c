@@ -1265,7 +1265,6 @@ static bool task_is_main_thread_task(retro_task_t *task)
          & RETRO_TASK_FLG_MAIN_THREAD) != 0;
 }
 
-#ifndef HAVE_GCD
 /* A task an extra worker may take.  Set before the push and never
  * changed. */
 static bool task_is_parallel(retro_task_t *task)
@@ -1274,7 +1273,6 @@ static bool task_is_parallel(retro_task_t *task)
    return (flags & RETRO_TASK_FLG_PARALLEL)
       && !(flags & RETRO_TASK_FLG_MAIN_THREAD);
 }
-#endif
 
 /* After a handler returned: a finished task moves to the finished
  * list, an unfinished one to the back of the running list.  Called
@@ -1891,11 +1889,23 @@ typedef struct
 
 static void gcd_worker(retro_task_t *task);
 
+/* Made once and never released, like task_gcd_key. */
+static dispatch_queue_t gcd_serial_queue = NULL;
+
+/* As on the threaded runner, only a parallel task runs beside others:
+ * the rest share one serial queue, which net_http and other callers
+ * that keep state for a single driving thread rely on. */
+static dispatch_queue_t gcd_queue_for(retro_task_t *task)
+{
+   if (task_is_parallel(task))
+      return dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+   return gcd_serial_queue;
+}
+
 static void gcd_dispatch_locked(retro_task_t *task)
 {
    ((gcd_sched_t*)task->sched)->state = GCD_RUN_DISPATCHED;
-   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
-         ^{ gcd_worker(task); });
+   dispatch_async(gcd_queue_for(task), ^{ gcd_worker(task); });
 }
 
 static void gcd_timer_fired(gcd_sched_t *sched)
@@ -1943,8 +1953,7 @@ static void gcd_schedule_locked(retro_task_t *task)
    if (!sched->timer)
    {
       if (!(sched->timer = dispatch_source_create(
-            DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-            dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0))))
+            DISPATCH_SOURCE_TYPE_TIMER, 0, 0, gcd_queue_for(task))))
       {
          /* No timer to wait on: run it, and it waits again. */
          gcd_dispatch_locked(task);
@@ -2131,6 +2140,14 @@ static bool retro_task_gcd_init(void)
 {
    retro_task_t *task = NULL;
 
+   if (!gcd_serial_queue)
+   {
+      dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(
+            DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);
+      if (!(gcd_serial_queue = dispatch_queue_create(
+            "com.libretro.task_queue", attr)))
+         return false;
+   }
    if (!retro_task_sync_primitives_new())
       return false;
 #ifdef TASK_PUSH_DEFER

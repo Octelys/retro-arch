@@ -11437,6 +11437,12 @@ unsigned menu_displaylist_build_list(
                   count++;
             }
 #endif
+#ifdef HAVE_WEBSOCKET_SERVER
+            if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                  MENU_ENUM_LABEL_WEBSOCKET_RAM_STREAM_ENABLE,
+                  PARSE_ONLY_BOOL, false) == 0)
+               count++;
+#endif
 
             if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                   MENU_ENUM_LABEL_NETWORK_REMOTE_ENABLE,
@@ -11773,6 +11779,7 @@ unsigned menu_displaylist_build_list(
       case DISPLAYLIST_RETRO_ACHIEVEMENTS_SETTINGS_LIST:
          {
             bool cheevos_enable       = settings->bools.cheevos_enable;
+            bool cheevos_debug_enable = settings->bools.cheevos_debug_enable;
             static menu_displaylist_build_info_selective_t build_list[] = {
                {MENU_ENUM_LABEL_CHEEVOS_ENABLE,                                        PARSE_ONLY_BOOL,   true   },
                {MENU_ENUM_LABEL_CHEEVOS_USERNAME,                                      PARSE_ONLY_STRING, false  },
@@ -11791,6 +11798,8 @@ unsigned menu_displaylist_build_list(
                {MENU_ENUM_LABEL_CHEEVOS_AUTO_SCREENSHOT,                               PARSE_ONLY_BOOL,   false  },
 #endif
                {MENU_ENUM_LABEL_CHEEVOS_START_ACTIVE,                                  PARSE_ONLY_BOOL,   false  },
+               {MENU_ENUM_LABEL_CHEEVOS_DEBUG_ENABLE,                                  PARSE_ONLY_BOOL,   false  },
+               {MENU_ENUM_LABEL_CHEEVOS_DEBUG_HOST,                                    PARSE_ONLY_STRING, false  },
             };
 
             for (i = 0; i < ARRAY_SIZE(build_list); i++)
@@ -11801,6 +11810,10 @@ unsigned menu_displaylist_build_list(
                 * always shown; everything else is gated on it. */
                if (build_list[i].enum_idx == MENU_ENUM_LABEL_CHEEVOS_ENABLE)
                   build_list[i].checked = true;
+               else if (build_list[i].enum_idx == MENU_ENUM_LABEL_CHEEVOS_HARDCORE_MODE_ENABLE)
+                  build_list[i].checked = cheevos_enable && !cheevos_debug_enable;
+               else if (build_list[i].enum_idx == MENU_ENUM_LABEL_CHEEVOS_DEBUG_HOST)
+                  build_list[i].checked = cheevos_enable && cheevos_debug_enable;
                else
                   build_list[i].checked = cheevos_enable;
             }

@@ -2097,6 +2097,7 @@ static struct config_array_setting *populate_settings_array(
 
 #ifdef HAVE_CHEEVOS
    SETTING_ARRAY("cheevos_custom_host",                   settings->arrays.cheevos_custom_host, false, NULL, true);
+   SETTING_ARRAY("cheevos_debug_host",                    settings->arrays.cheevos_debug_host, false, NULL, true);
    SETTING_ARRAY_SENSITIVE("cheevos_username",            settings->arrays.cheevos_username, false, NULL, true);
    SETTING_ARRAY_SENSITIVE("cheevos_password",            settings->arrays.cheevos_password, false, NULL, true);
    SETTING_ARRAY_SENSITIVE("cheevos_token",               settings->arrays.cheevos_token, false, NULL, true);

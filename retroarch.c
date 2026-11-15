@@ -3717,6 +3717,7 @@ static void command_event_finish_content_deinit(void)
           * stale data from the previous game. */
          game_state_clear();
          ws_server_notify_game_changed();
+         ws_server_memory_content_unloaded();
 #endif
 #ifdef HAVE_NETWORKING
          /* The core may have registered a netpacket interface

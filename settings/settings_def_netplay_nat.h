@@ -37,3 +37,10 @@ S_STRING(mcp_server_token, MCP_SERVER_TOKEN,
       "MCP Server Token",
       "The bearer token an MCP client must send. Created when the server first starts; enter it in the client's configuration.")
 #endif
+#if defined(HAVE_WEBSOCKET_SERVER) || defined(SETTINGS_DEF_STRINGS_PASS)
+S_BOOL_EX(websocket_ram_stream_enable, WEBSOCKET_RAM_STREAM_ENABLE,
+      "websocket_ram_stream_enable",
+      DEFAULT_WEBSOCKET_RAM_STREAM_ENABLE, SD_FLAG_ADVANCED, 0, 0, setting_bool_action_left_with_refresh, NULL, NULL, NULL, setting_bool_action_left_with_refresh, setting_bool_action_right_with_refresh, 0,
+      "WebSocket RAM Stream",
+      "Send the core's system RAM, every frame, to programs on this machine that connect to the WebSocket server with the \"retroarch-memory\" protocol, such as a memory debugger. Off in achievements hardcore mode.")
+#endif

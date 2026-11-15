@@ -1063,6 +1063,7 @@ typedef struct settings
       /* Cheevos */
       bool cheevos_enable;
       bool cheevos_test_unofficial;
+      bool cheevos_debug_enable;
       bool cheevos_hardcore_mode_enable;
       bool cheevos_richpresence_enable;
       bool cheevos_badges_enable;
@@ -1153,6 +1154,7 @@ typedef struct settings
       bool savestate_file_compression;
       bool network_cmd_enable;
       bool mcp_server_enable;
+      bool websocket_ram_stream_enable;
       bool stdin_cmd_enable;
       bool keymapper_enable;
       bool network_remote_enable;
@@ -1328,6 +1330,7 @@ typedef struct settings
 #endif
       char input_keyboard_layout[64];
       char cheevos_custom_host[64];
+      char cheevos_debug_host[64];
 
 #ifdef HAVE_LAKKA
       char timezone[TIMEZONE_LENGTH];

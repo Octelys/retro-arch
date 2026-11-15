@@ -2056,6 +2056,25 @@ static rc_clock_t rcheevos_client_get_time_millisecs(const rc_client_t* client)
    return cpu_features_get_time_usec() / 1000;
 }
 
+static void rcheevos_client_set_host(const settings_t *settings)
+{
+   const char* host = settings->arrays.cheevos_custom_host;
+
+   if (settings->bools.cheevos_debug_enable
+         && settings->arrays.cheevos_debug_host[0])
+      host = settings->arrays.cheevos_debug_host;
+   else if (!host[0])
+   {
+#ifdef HAVE_SSL
+      host = "https://retroachievements.org";
+#else
+      host = "http://retroachievements.org";
+#endif
+   }
+
+   rc_client_set_host(rcheevos_locals.client, host);
+}
+
 bool rcheevos_load(const void *data)
 {
    const struct retro_game_info *info = (const struct retro_game_info*)data;
@@ -2106,7 +2125,10 @@ bool rcheevos_load(const void *data)
    runloop_frame_work_set(RUNLOOP_WORK_CHEEVOS, true);
 
    if (rcheevos_locals.client)
+   {
       rc_client_unload_game(rcheevos_locals.client);
+      rcheevos_client_set_host(settings);
+   }
    else
    {
       rcheevos_locals.client = rc_client_create(rcheevos_client_read_memory, rcheevos_client_server_call);
@@ -2114,25 +2136,15 @@ bool rcheevos_load(const void *data)
       rc_client_set_event_handler(rcheevos_locals.client, rcheevos_client_event_handler);
       rc_client_set_get_time_millisecs_function(rcheevos_locals.client, rcheevos_client_get_time_millisecs);
 
-      {
-         const char* host = settings->arrays.cheevos_custom_host;
-         if (!host[0])
-         {
-#ifdef HAVE_SSL
-            host = "https://retroachievements.org";
-#else
-            host = "http://retroachievements.org";
-#endif
-         }
-
-         rc_client_set_host(rcheevos_locals.client, host);
-      }
+      rcheevos_client_set_host(settings);
 
       rcheevos_client_download_placeholder_badge();
    }
 
    rcheevos_locals.has_unsupported_achievements = false;
    rcheevos_locals.hash_error = NULL;
+   if (settings->bools.cheevos_debug_enable)
+      settings->bools.cheevos_hardcore_mode_enable = false;
    rc_client_set_hardcore_enabled(rcheevos_locals.client, settings->bools.cheevos_hardcore_mode_enable);
    rc_client_set_unofficial_enabled(rcheevos_locals.client, settings->bools.cheevos_test_unofficial);
    rc_client_set_encore_mode_enabled(rcheevos_locals.client, settings->bools.cheevos_start_active);

@@ -132,6 +132,9 @@ bool android_get_vfs_authorized_locations(
 #ifdef HAVE_DISCORD
 #include "network/discord.h"
 #endif
+#ifdef HAVE_WEBSOCKET_SERVER
+#include "network/ws_server.h"
+#endif
 
 #include "config.def.h"
 
@@ -6458,6 +6461,8 @@ static INLINE void runloop_driver_pacing_input_sampled(void)
 static int16_t core_input_state_cb(unsigned port,
       unsigned device, unsigned idx, unsigned id)
 {
+   int16_t state;
+
    if (     !(runloop_state.current_core.flags & RETRO_CORE_FLAG_INPUT_POLLED)
          && core_poll_type_current() == POLL_TYPE_LATE)
    {
@@ -6466,7 +6471,11 @@ static int16_t core_input_state_cb(unsigned port,
       runloop_state.current_core.flags |= RETRO_CORE_FLAG_INPUT_POLLED;
    }
 
-   return input_driver_state_wrapper(port, device, idx, id);
+   state = input_driver_state_wrapper(port, device, idx, id);
+#ifdef HAVE_WEBSOCKET_SERVER
+   ws_server_memory_input(port, device, idx, id, state);
+#endif
+   return state;
 }
 
 static void core_input_state_poll_maybe(void)
@@ -9780,6 +9789,10 @@ int runloop_iterate(void)
    if (runloop_st->frame_work & RUNLOOP_WORK_DISCORD)
       discord_poll(current_time);
 #endif
+#ifdef HAVE_WEBSOCKET_SERVER
+   ws_server_memory_setting_poll(
+         settings->bools.websocket_ram_stream_enable);
+#endif
 
 #ifdef HAVE_BSV_MOVIE
    if (input_st->bsv_movie_state_next_handle)
@@ -10144,6 +10157,10 @@ int runloop_iterate(void)
 #ifdef HAVE_CHEEVOS
    if (runloop_st->frame_work & RUNLOOP_WORK_CHEEVOS)
       rcheevos_test();
+#endif
+#ifdef HAVE_WEBSOCKET_SERVER
+   if (frame_advanced)
+      ws_server_memory_frame();
 #endif
 #ifdef HAVE_CHEATS
    if (runloop_st->frame_work & RUNLOOP_WORK_CHEATS)

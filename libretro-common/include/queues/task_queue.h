@@ -184,9 +184,8 @@ enum retro_task_flags
     * task is never in two handlers at once either way, but its calls
     * may each be on a different worker.  Ignored with
     * \c RETRO_TASK_FLG_MAIN_THREAD and by the unthreaded runner.  The
-    * GCD runner (Apple) already hands
-    * every task to the system's concurrent queue, one run of it at a
-    * time, a run on any thread; there the flag changes nothing.  Not
+    * GCD runner (Apple) runs the other tasks on one serial queue and
+    * hands a parallel one to the system's concurrent queue.  Not
     * changed after the push.
     */
    RETRO_TASK_FLG_PARALLEL         = (1 << 6)
