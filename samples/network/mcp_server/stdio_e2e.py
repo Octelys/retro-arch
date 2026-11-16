@@ -7,17 +7,24 @@ notifications/message, and quitting when stdin closes.
 The harness core, from samples/network/command_frames, maps memory, which
 the tools that read it need.
 
-Usage: stdio_e2e.py <retroarch> <video_views_libretro.so> <harness_core.so>
-"""
-import json, os, shutil, subprocess, sys, tempfile, time, select
+The same core built with HARNESS_NO_MAP publishes no memory map and hands
+its RAM over through retro_get_memory_data alone, as snes9x does.
 
-ra, core, mem_core = sys.argv[1], sys.argv[2], sys.argv[3]
+Usage: stdio_e2e.py <retroarch> <video_views_libretro.so> <harness_core.so>
+                    <harness_core_nomap.so>
+"""
+import base64, json, os, shutil, subprocess, sys, tempfile, time, select
+
+ra, core, mem_core, nomap_core = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 cfgdir = tempfile.mkdtemp()
 cfg = os.path.join(cfgdir, 'retroarch.cfg')
 # a cores directory for LIST_CORES, and a playlist for the playlist tools
 coredir = os.path.join(cfgdir, 'cores')
 listdir = os.path.join(cfgdir, 'playlists')
 os.mkdir(coredir)
+# GET_FRAME writes nothing: this stays empty
+shotdir = os.path.join(cfgdir, 'screenshots')
+os.mkdir(shotdir)
 os.mkdir(listdir)
 shutil.copy(core, coredir)
 rom = os.path.join(cfgdir, 'blank.bin')
@@ -33,8 +40,11 @@ with open(cfg, 'w') as f:
             'menu_driver = "rgui"\nlog_verbosity = "true"\nfrontend_log_level = "1"\n'
             'pause_nonactive = "false"\nconfig_save_on_exit = "false"\n'
             'video_shader_enable = "false"\n'
+            # no first-run download prompt over the menu it drives
+            'rgui_show_start_screen = "false"\n'
             'libretro_directory = "%s"\nplaylist_directory = "%s"\n'
-            % (coredir, listdir))
+            'screenshot_directory = "%s"\n'
+            % (coredir, listdir, shotdir))
 p = subprocess.Popen([ra, '--mcp-stdio', '-v', '-c', cfg, '-L', core],
                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                      stderr=open(os.path.join(cfgdir, 'stderr.log'), 'wb'))
@@ -143,7 +153,7 @@ check('a tool has a title for people: %s' % titles.get('RUN_FRAMES'),
       titles.get('RUN_FRAMES') == 'Run frames')
 for n in ('RUN_FRAMES', 'INPUT', 'OPTION', 'GET_LOG',
           'CORE_OPTION', 'GET_MEMORY_MAP', 'PRESS', 'RUN_UNTIL',
-          'WATCH', 'MENU', 'DISK', 'REINIT', 'STATE',
+          'WATCH', 'MENU', 'DISK', 'REINIT', 'STATE', 'GET_FRAME',
           'REPLAY', 'STEPS', 'CORE'):
     check('tool %s listed' % n, n in names)
 # A family of hotkeys is one tool with a choice, not a tool apiece.
@@ -172,9 +182,9 @@ check('the rows commands declare an outputSchema: %d' % len(schemas),
       and 'GET_PLAYLIST' in schemas)
 # What a model is handed of each tool is its name, description and
 # input schema: that is context a client pays for before it does
-# anything, 11607 bytes at 29 tools, held under 15000. Titles,
+# anything, 12055 bytes at 30 tools, held under 15000. Titles,
 # annotations and output schemas are for the client and cost the model
-# nothing, so the whole list has a looser ceiling, 25000 (21340 now),
+# nothing, so the whole list has a looser ceiling, 25000 (21844 now),
 # and the 1800 on each tool catches prose an average would not.
 seen = sum(len(json.dumps({'name': t['name'],
                            'description': t.get('description', ''),
@@ -475,6 +485,33 @@ call(303, 'MENU', {'action': 'close'})
 msg, t, _ = call(304, 'OPTION', {'action': 'show', 'option': 'menu'})
 check('menu is no longer an option', msg and msg['result']['isError'])
 
+# GET_FRAME: the frame as an image, scaled down, and no file written.
+def frame_of(msg):
+    """(width, height) of a reply's PNG image, or None."""
+    for c in (msg or {}).get('result', {}).get('content', []):
+        if c.get('type') == 'image' and c.get('mimeType') == 'image/png':
+            png = base64.b64decode(c['data'])
+            if png[:8] == b'\x89PNG\r\n\x1a\n':
+                return (int.from_bytes(png[16:20], 'big'),
+                        int.from_bytes(png[20:24], 'big'))
+    return None
+
+
+msg, t, _ = call(310, 'GET_FRAME', {})
+wh = frame_of(msg)
+check('GET_FRAME answers with the frame as a PNG: %s, %s' % (wh, t),
+      wh and max(wh) <= 320 and t == 'GET_FRAME %dx%d' % wh
+      and not msg['result']['isError'])
+msg, t, _ = call(311, 'GET_FRAME', {'size': 64})
+wh = frame_of(msg)
+check('and scaled down to fit the size asked for: %s' % (wh,),
+      wh and max(wh) <= 64)
+msg, t, _ = call(312, 'GET_FRAME', {'size': 1000})
+check('a size past 640 is refused: ' + (t or '').strip(),
+      msg and msg['result']['isError'] and '64 to 640' in t)
+check('and nothing was written: %s' % os.listdir(shotdir),
+      not os.listdir(shotdir))
+
 _, t, _ = call(230, 'WATCH', {})
 check('WATCH starts empty: ' + (t or '').strip(), t and 'none' in t)
 _, t, _ = call(231, 'WATCH', {'watches': 'x 1000'})
@@ -575,6 +612,29 @@ msg, t, _ = call(278, 'RUN_UNTIL', {'address': '1007', 'condition': '!=',
 sc = msg and msg['result'].get('structuredContent') or {}
 check('RUN_UNTIL waits on a byte: %s' % sc,
       'met' in sc and sc.get('value', 0) != 0)
+
+# A core with no memory map: its RAM, as it hands it over - system RAM
+# from 0, save RAM straight after - is what every memory tool reads.
+msg, t, _ = call(279, 'LOAD_CONTENT', {'core': nomap_core, 'content': rom,
+                                       'paused': 'on'})
+msg, t, _ = call(280, 'GET_MEMORY_MAP', {})
+rows = (msg and msg['result'].get('structuredContent') or {}).get('rows', [])
+check('a core with no map lists the RAM it hands over: %s'
+      % [(r['start'], r['length'], r['kind'], r['space']) for r in rows],
+      [(r['start'], r['length'], r['kind'], r['space']) for r in rows]
+      == [('0', '10', 'system', 'core'), ('10', '10', 'save', 'core')])
+msg, t, _ = call(281, 'READ_CORE_MEMORY', {'address': 'e', 'bytes': 4})
+sc = msg and msg['result'].get('structuredContent') or {}
+check('and reads it, across into save RAM: %s' % sc,
+      sc == {'address': 'e', 'bytes': '0E 0F 10 11'})
+msg, t, _ = call(282, 'WATCH', {'watches': 'f 7'})
+check('WATCH watches it: ' + (t or '').strip().replace('\n', ' | '),
+      msg and not msg['result']['isError'])
+msg, t, _ = call(283, 'RUN_UNTIL', {'address': '7', 'condition': '!=',
+                                    'value': 7})
+sc = msg and msg['result'].get('structuredContent') or {}
+check('and a condition waits on it: %s' % sc, 'met' in sc)
+call(284, 'WATCH', {'watches': 'f off'})
 
 missing = sorted(set(out_schemas) - schema_checked)
 check('every tool with an outputSchema was checked: %s' % (missing or 'all'),

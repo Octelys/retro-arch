@@ -7,11 +7,18 @@ LIBRETRO_COMM_DIR := ../../..
 SOURCES := \
 	rjpeg_test.c \
 	$(LIBRETRO_COMM_DIR)/formats/jpeg/rjpeg.c \
+	$(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
 	$(LIBRETRO_COMM_DIR)/features/features_cpu.c
 
 OBJS := $(call sample_objs,$(SOURCES:.c=.o))
 
 CFLAGS  += -Wall -pedantic -std=gnu99 -g1 -I$(LIBRETRO_COMM_DIR)/include
+
+# The decoder's allocations counted, where the linker can wrap malloc
+ifeq ($(shell uname -s),Linux)
+   CFLAGS  += -DRJPEG_TEST_COUNT_ALLOCS
+   LDFLAGS += -Wl,--wrap=malloc,--wrap=calloc
+endif
 
 # The samples workflow passes SANITIZER=address,undefined to every
 # sample dir.  Without this block the variable was accepted and

@@ -443,6 +443,7 @@ static const struct
    char s_61213f1d[19];
    char s_caf61308[22];
    char s_c7a27b20[22];
+   char s_d6611158[4];
    char s_57665cff[7];
    char s_0e2c0fca[38];
    char s_93ac5ec8[38];
@@ -468,6 +469,7 @@ static const struct
    char s_8f37930f[46];
    char s_8f379310[46];
    char s_6c52dfb1[33];
+   char s_334daaaa[8];
    char s_84c46931[35];
    char s_ebf10493[14];
    char s_a64b3a0b[31];
@@ -704,6 +706,7 @@ static const struct
    char s_c0cae103[28];
    char s_71d52dde[61];
    char s_c6615fcf[34];
+   char s_c52621db[6];
    char s_a7ae1b42[22];
 } msg_hash_val_blob =
 {
@@ -1147,6 +1150,7 @@ static const struct
    "\303\215ndex del monitor",
    "Selecci\303\263 autom\303\240tica",
    "Selecci\303\263 autom\303\240tica",
+   "Cap",
    "Eixida",
    "Correcci\303\263 de sobreescalat (inferior)",
    "Correcci\303\263 de sobreescalat (superior)",
@@ -1172,6 +1176,7 @@ static const struct
    "Relaci\303\263 d'aspecte personalitzat (posici\303\263 X)",
    "Relaci\303\263 d'aspecte personalitzat (posici\303\263 Y)",
    "Sincronitzaci\303\263 vertical (VSync)",
+   "Sistema",
    "Mode pantalla completa en finestra",
    "Mode finestra",
    "Al\303\247ada m\303\240xima en la finestra",
@@ -1511,6 +1516,7 @@ static const struct
    "Desconnectat %s del port %u",
    "No ha sigut configurat %s (%u/%u) usant l'opci\303\263 secund\303\240ria",
    "No ha sigut configurat %s (%u/%u)",
+   "Men\303\272",
    "Esperant al client...",
 };
 
@@ -1518,7 +1524,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_val_blob_check[
-      (sizeof(msg_hash_val_blob) == (25414u
+      (sizeof(msg_hash_val_blob) == (25432u
 #ifdef HAVE_MIST
        + 20u
 #endif
@@ -2044,6 +2050,7 @@ static const msg_hash_id_t msg_hash_val_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_MONITOR_INDEX,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_AUTO,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_REFRESH_AUTO,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_HANDS_NONE,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OUTPUT_SETTINGS,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OVERSCAN_CORRECTION_BOTTOM,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OVERSCAN_CORRECTION_TOP,
@@ -2069,6 +2076,7 @@ static const msg_hash_id_t msg_hash_val_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_CUSTOM_X,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_CUSTOM_Y,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VSYNC,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VULKAN_DRIVER_PATH_SYSTEM,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOWED_FULLSCREEN,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOWED_MODE_SETTINGS,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_AUTO_HEIGHT_MAX,
@@ -2305,5 +2313,6 @@ static const msg_hash_id_t msg_hash_val_ids[] =
    (msg_hash_id_t)MSG_DEVICE_DISCONNECTED_FROM_PORT_NR,
    (msg_hash_id_t)MSG_DEVICE_NOT_CONFIGURED_FALLBACK_NR,
    (msg_hash_id_t)MSG_DEVICE_NOT_CONFIGURED_NR,
+   (msg_hash_id_t)MSG_OPENXR_EDIT_TAG_MENU,
    (msg_hash_id_t)MSG_WAITING_FOR_CLIENT,
 };

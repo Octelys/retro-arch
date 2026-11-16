@@ -3,6 +3,7 @@
 #include "../../gfx/d3d11_video_decode/rh265_hw_stream_test.c"
 #undef main
 #include "../../../cores/libretro-media/media_core.c"
+static int64_t last_sink_ordinal;
 static unsigned sink_calls, sink_busy, sink_taken, ticks, stopped;
 static unsigned cpu_ticks, expect_software, sink_ready = 1;
 static video_hw_frame_t held;
@@ -21,6 +22,7 @@ static bool sink(void *user, const video_hw_frame_t *frame)
    }
    memset(&held, 0, sizeof(held));
    video_hw_frame_abandon(frame);
+   last_sink_ordinal = media_player.vshown;
    sink_taken++;
    return true;
 }
@@ -67,9 +69,159 @@ static bool start_core(int hardware)
    return true;
 }
 
+static void check_seek_state_busy(void)
+{
+   uint8_t state[40];
+   unsigned i;
+   memset(state, 0x5a, sizeof(state));
+   CHECK(!retro_serialize(state, sizeof(state)));
+   for (i = 0; i < sizeof(state); i++) CHECK(state[i] == 0x5a);
+}
+
+static void check_prefetch(void)
+{
+   unsigned i, before, released;
+   int64_t shown, pts;
+   uint8_t state[40], after[40];
+   sink_busy = decode_busy = output_busy = 0;
+   CHECK(start_core(1));
+   media_video_hw_ready();
+   for (i = 0; i < 40 && !media_player.mp4_prefetched; i++) retro_run();
+   CHECK(media_player.mp4_prefetched && media_player.hw_frame.image);
+   shown = media_player.vshown;
+   pts = media_player.vpts_ns;
+   CHECK(shown == 1 && last_sink_ordinal == shown);
+   CHECK(rmp4_video_stream_frame_index(media_player.mp4vs) == shown + 1);
+   CHECK(retro_serialize(state, sizeof(state)));
+   CHECK(state[16] == shown);
+   before = sink_taken;
+   /* Hold the current picture through a long presentation interval. */
+   media_player.play_ns = pts - media_player.frame_ns * 3;
+   retro_run();
+   CHECK(sink_taken == before && media_player.mp4_prefetched
+         && media_player.vshown == shown && media_player.vpts_ns == pts);
+   released = abandoned;
+   CHECK(retro_unserialize(state, sizeof(state)));
+   CHECK(!media_player.mp4_prefetched && abandoned > released);
+   CHECK(retro_serialize(after, sizeof(after)));
+   CHECK(!memcmp(state, after, sizeof(state)));
+   for (i = 0; i < 40 && sink_taken == before; i++) retro_run();
+   CHECK(sink_taken == before + 1 && last_sink_ordinal == shown);
+   for (i = 0; i < 40 && !media_player.mp4_prefetched; i++) retro_run();
+   CHECK(media_player.mp4_prefetched && media_player.hw_frame.image);
+   released = abandoned;
+   media_suspend_video_hw();
+   CHECK(!media_player.mp4_prefetched && !media_player.hw_frame.image
+         && abandoned > released);
+   CHECK(opened == closed && exported == abandoned);
+   retro_unload_game();
+   CHECK(start_core(1));
+   media_video_hw_ready();
+   for (i = 0; i < 40 && !media_player.mp4_prefetched; i++) retro_run();
+   CHECK(media_player.mp4_prefetched);
+   released = abandoned;
+   retro_reset();
+   CHECK(!media_player.mp4_prefetched && !media_player.hw_frame.image
+         && !media_player.vshown && abandoned > released);
+   retro_unload_game();
+   CHECK(opened == closed && exported == abandoned);
+}
+
+static void check_prefetch_catchup(void)
+{
+   unsigned i, before;
+   sink_busy = decode_busy = output_busy = 0;
+   CHECK(start_core(1));
+   media_video_hw_ready();
+   for (i = 0; i < 40 && !media_player.mp4_prefetched; i++) retro_run();
+   CHECK(media_player.mp4_prefetched && media_player.vshown == 1);
+   before = sink_taken;
+   media_player.play_ns = 3 * media_player.frame_ns;
+   retro_run();
+   CHECK(sink_taken == before + 1 && last_sink_ordinal == 3);
+   CHECK(media_player.vshown == 3);
+   retro_unload_game();
+   CHECK(opened == closed && exported == abandoned);
+}
+
+static void check_prefetch_cancel(unsigned action)
+{
+   unsigned i, before, released;
+   int64_t shown, pts;
+   uint8_t state[40], after[40];
+   sink_busy = decode_busy = output_busy = 0;
+   CHECK(start_core(1));
+   media_video_hw_ready();
+   for (i = 0; i < 40 && !media_player.mp4_prefetched; i++) retro_run();
+   CHECK(media_player.mp4_prefetched && media_player.vshown == 1);
+   shown = media_player.vshown;
+   pts = media_player.vpts_ns;
+   before = sink_taken;
+   output_busy = action == 4 ? 0 : 16;
+   media_player.play_ns = 3 * media_player.frame_ns;
+   if (action == 4)
+      media_prefetch_mp4(&media_player,
+            media_player.play_ns + media_player.frame_ns / 2);
+   else retro_run();
+   CHECK(media_player.mp4_prefetching
+         && (media_player.mp4_prefetched != 0) == (action == 4));
+   CHECK(media_player.mp4_prefetch_count > 0
+         && (media_player.hw_frame.image != 0) == (action == 4));
+   CHECK(sink_taken == before && media_player.vshown == shown
+         && media_player.vpts_ns == pts);
+   CHECK(retro_serialize(state, sizeof(state)) && state[16] == shown);
+   released = abandoned;
+   if (!action) retro_reset();
+   else if (action == 1) media_suspend_video_hw();
+   else if (action == 2) media_seek(&media_player, 0);
+   else
+   {
+      CHECK(retro_unserialize(state, sizeof(state)));
+      CHECK(retro_serialize(after, sizeof(after)));
+      CHECK(!memcmp(state, after, sizeof(state)));
+   }
+   CHECK(!media_player.mp4_prefetching && !media_player.mp4_prefetched
+         && !media_player.mp4_prefetch_count && !media_player.mp4_prefetch_ns);
+   if (action == 4) CHECK(abandoned > released);
+   if (action >= 3)
+   {
+      for (i = 0; i < 40 && sink_taken == before; i++) retro_run();
+      CHECK(sink_taken == before + 1 && last_sink_ordinal == shown);
+   }
+   retro_unload_game();
+   output_busy = 0;
+   CHECK(opened == closed && exported == abandoned);
+}
+
+static void check_prefetch_saturated(void)
+{
+   unsigned i;
+   uint64_t clock;
+   uint8_t state[40];
+   sink_busy = decode_busy = output_busy = 0;
+   CHECK(start_core(1));
+   CHECK(rmp4_video_stream_next_end_time_ns(media_player.mp4vs) == 100000000);
+   media_video_hw_ready();
+   for (i = 0; i < 40 && !media_player.mp4_prefetched; i++) retro_run();
+   CHECK(media_player.mp4_prefetched && media_player.vshown == 1);
+   CHECK(retro_serialize(state, sizeof(state)));
+   clock = (uint64_t)(INT64_MAX - media_player.frame_ns);
+   for (i = 0; i < 8; i++)
+   {
+      state[8 + i] = (uint8_t)((uint64_t)INT64_MAX >> (8 * i));
+      state[24 + i] = (uint8_t)(clock >> (8 * i));
+   }
+   CHECK(retro_unserialize(state, sizeof(state)));
+   retro_run();
+   CHECK(media_player.play_ns == INT64_MAX && media_player.vpts_ns == INT64_MAX);
+   CHECK(media_player.vshown == 1);
+   retro_unload_game();
+   CHECK(opened == closed && exported == abandoned);
+}
+
 int main(void)
 {
-   unsigned i, before, decoded;
+   unsigned i, before, decoded, seek_phases = 0;
    int64_t restart_clock, restart_pts, restart_ordinal;
    uint8_t state[40];
    hevc_stream_checks_main();
@@ -81,10 +233,15 @@ int main(void)
    if (!start_core(1)) return 1;
    media_video_hw_ready();
    CHECK(media_player.hw_video && media_player.hw_started);
-   decode_busy = output_busy = 1; sink_busy = 2;
+   decode_busy = 1; output_busy = 16; sink_busy = 2;
+   restart_clock = media_player.play_ns;
    retro_run();
    CHECK(!media_player.eof && !sink_calls
          && rmp4_video_stream_wait_reason(media_player.mp4vs) == RMP4_VIDEO_WAIT_DECODER);
+   CHECK(media_player.play_ns == restart_clock && !media_player.vshown);
+   retro_run();
+   CHECK(!sink_calls && !media_player.vshown
+         && media_player.play_ns == restart_clock);
    for (i = 0; i < 30 && !stopped; i++)
    {
       decoded = accepted;
@@ -162,7 +319,7 @@ int main(void)
    restart_clock = media_player.play_ns;
    restart_pts = media_player.vpts_ns;
    restart_ordinal = media_player.vshown;
-   decode_busy = output_busy = 1;
+   decode_busy = 2; output_busy = 1;
    media_video_hw_ready();
    CHECK(media_player.hw_restart == 2);
    decoded = opened;
@@ -198,6 +355,151 @@ int main(void)
    media_video_hw_ready();
    CHECK(media_player.hw_video && media_player.hw_started);
    retro_unload_game();
+   expect_software = 0;
+   CHECK(start_core(1));
+   media_video_hw_ready();
+   before = sink_taken;
+   sink_busy = 2;
+   decode_busy = 4;
+   output_busy = 16;
+   media_seek(&media_player, 200000000);
+   CHECK(media_player.seeking && media_player.pending_seek_ns == 200000000);
+   for (i = 0; i < 40 && sink_taken == before; i++)
+   {
+      seek_phases |= 1u << media_player.seeking;
+      if (media_player.seeking == MEDIA_MP4_SEEK_SCAN
+            || media_player.seeking == MEDIA_MP4_SEEK_DECODE)
+         check_seek_state_busy();
+      else if (media_player.seeking == MEDIA_MP4_SEEK_PRESENT)
+         CHECK(retro_serialize(state, sizeof(state)));
+      restart_clock = media_player.play_ns;
+      decoded = media_player.hw_frame.image != 0;
+      retro_run();
+      if (decoded) CHECK(media_player.play_ns == restart_clock);
+   }
+   CHECK(sink_taken == before + 1 && media_player.vshown == 3);
+   CHECK((seek_phases & ((1u << MEDIA_MP4_SEEK_SCAN)
+               | (1u << MEDIA_MP4_SEEK_DECODE) | (1u << MEDIA_MP4_SEEK_PRESENT)))
+         == ((1u << MEDIA_MP4_SEEK_SCAN) | (1u << MEDIA_MP4_SEEK_DECODE)
+            | (1u << MEDIA_MP4_SEEK_PRESENT)));
+   CHECK(!media_player.seeking && media_player.pending_seek_ns < 0);
+   before = sink_taken;
+   media_seek(&media_player, 200000000);
+   media_seek(&media_player, 0);
+   for (i = 0; i < 40 && sink_taken == before; i++) retro_run();
+   CHECK(sink_taken == before + 1 && media_player.vshown == 1);
+   decode_busy = 100;
+   media_seek(&media_player, 200000000);
+   retro_run();
+   CHECK(media_player.seeking);
+   retro_reset();
+   CHECK(!media_player.seeking && media_player.pending_seek_ns < 0);
+   CHECK(!media_player.hw_restart && !media_player.vshown);
+   decode_busy = 0;
+   before = sink_taken;
+   for (i = 0; i < 40 && sink_taken == before; i++) retro_run();
+   CHECK(sink_taken == before + 1 && media_player.vshown == 1);
+   decode_busy = 100;
+   media_seek(&media_player, 200000000);
+   retro_run();
+   CHECK(media_player.seeking);
+   media_suspend_video_hw();
+   decode_busy = 2;
+   before = sink_taken;
+   for (i = 0; i < 40 && sink_taken == before; i++) retro_run();
+   CHECK(sink_taken == before + 1 && media_player.vshown == 3);
+   CHECK(!media_player.seeking && media_player.pending_seek_ns < 0);
+   retro_unload_game();
+   CHECK(opened == closed && exported == abandoned);
+   CHECK(start_core(1));
+   media_video_hw_ready();
+   sink_busy = decode_busy = output_busy = 0;
+   before = sink_taken;
+   for (i = 0; i < 40 && sink_taken == before; i++) retro_run();
+   CHECK(media_player.vshown == 1);
+   CHECK(retro_serialize(state, sizeof(state)));
+   decode_busy = output_busy = 4;
+   before = sink_taken;
+   CHECK(retro_unserialize(state, sizeof(state)));
+   {
+      uint8_t pending[40];
+      CHECK(retro_serialize(pending, sizeof(pending)));
+      CHECK(!memcmp(pending, state, sizeof(state)));
+      for (i = 0; i < 40 && sink_taken == before; i++)
+      {
+         retro_run();
+         if (media_player.mp4_restoring)
+         {
+            CHECK(retro_serialize(pending, sizeof(pending)));
+            CHECK(!memcmp(pending, state, sizeof(state)));
+         }
+      }
+   }
+   CHECK(sink_taken == before + 1 && last_sink_ordinal == 1);
+   media_suspend_video_hw();
+   CHECK(retro_unserialize(state, sizeof(state)));
+   CHECK(media_player.hw_restart == 1 && !media_player.hw_video);
+   decode_busy = 2;
+   for (i = 0; i < 40 && media_player.hw_restart; i++) media_video_hw_ready();
+   CHECK(media_player.hw_video && !media_player.hw_restart);
+   CHECK(media_player.vshown == 1);
+   before = sink_taken;
+   for (i = 0; i < 40 && sink_taken == before; i++) retro_run();
+   CHECK(sink_taken == before + 1 && last_sink_ordinal == 2);
+   decode_busy = 100;
+   CHECK(retro_unserialize(state, sizeof(state)));
+   CHECK(media_player.mp4_restoring);
+   retro_reset();
+   CHECK(!media_player.mp4_restoring && !media_player.seeking);
+   CHECK(media_player.pending_seek_ns < 0);
+   decode_busy = output_busy = 0;
+   before = sink_taken;
+   for (i = 0; i < 40 && sink_taken == before; i++) retro_run();
+   CHECK(sink_taken == before + 1 && last_sink_ordinal == 1);
+   decode_busy = 100;
+   CHECK(retro_unserialize(state, sizeof(state)));
+   CHECK(media_player.mp4_restoring);
+   media_suspend_video_hw();
+   decode_busy = 2;
+   before = sink_taken;
+   for (i = 0; i < 40 && sink_taken == before; i++) retro_run();
+   CHECK(sink_taken == before + 1 && last_sink_ordinal == 1);
+   CHECK(!media_player.mp4_restoring && !media_player.seeking);
+   decode_busy = 100;
+   CHECK(retro_unserialize(state, sizeof(state)));
+   media_seek(&media_player, 200000000);
+   CHECK(!media_player.mp4_restoring && media_player.seeking);
+   decode_busy = 0;
+   before = sink_taken;
+   for (i = 0; i < 40 && sink_taken == before; i++) retro_run();
+   CHECK(sink_taken == before + 1 && last_sink_ordinal == 3);
+   for (i = 0; i < 40 && !media_player.eof; i++) retro_run();
+   CHECK(media_player.eof);
+   CHECK(retro_serialize(state, sizeof(state)));
+   retro_reset();
+   decode_busy = output_busy = 4;
+   before = sink_taken;
+   CHECK(retro_unserialize(state, sizeof(state)));
+   for (i = 0; i < 40 && sink_taken == before; i++) retro_run();
+   CHECK(sink_taken == before + 1 && last_sink_ordinal == 3);
+   CHECK(media_player.eof && !media_player.mp4_restoring);
+   retro_unload_game();
+   CHECK(opened == closed && exported == abandoned);
+   check_prefetch();
+   check_prefetch_catchup();
+   for (i = 0; i < 5; i++) check_prefetch_cancel(i);
+   CHECK(rmp4_video_stream_next_end_time_ns(NULL) == -1);
+   check_prefetch_saturated();
+   media_player.width = 64; media_player.height = 48;
+   media_player.mp4_hw_required = 1;
+   CHECK(!media_make_framebuffer(&media_player, false));
+   CHECK(media_make_framebuffer(&media_player, true));
+   for (i = 0; i < 64 * 48; i++) CHECK(!media_player.fb[i]);
+   media_player.fb[0] = 123;
+   CHECK(media_make_framebuffer(&media_player, true) && !media_player.fb[0]);
+   CHECK(!media_make_framebuffer(&media_player, false));
+   free(media_player.fb); media_player.fb = NULL;
+   media_player.mp4_hw_required = 0;
    CHECK(media_set_video_hw_refresh(NULL, NULL));
    rh265_set_hw_backend(NULL);
    printf("Movie GPU lease handoff: %u failures\n", failures);

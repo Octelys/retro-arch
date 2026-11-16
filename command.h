@@ -188,6 +188,11 @@ enum event_command
    /* Configuration saving. */
    CMD_EVENT_MENU_RESET_TO_DEFAULT_CONFIG,
    CMD_EVENT_MENU_SAVE_CONFIG,
+   /* Starts the first-run asset downloads. */
+   CMD_EVENT_MENU_FIRST_RUN_DOWNLOAD,
+   /* Turns the core signature checks off, after the confirm */
+   CMD_EVENT_CORE_SIGNATURE_CHECK_OFF,
+   CMD_EVENT_CORE_FIRMWARE_DOWNLOAD,
    CMD_EVENT_MENU_SAVE_AS_CONFIG,
    CMD_EVENT_MENU_SAVE_MAIN_CONFIG,
    CMD_EVENT_MENU_SAVE_CURRENT_CONFIG,
@@ -286,6 +291,8 @@ enum event_command
    CMD_EVENT_LASER_POINTER_TOGGLE,
    /* Cycle what a core is told the headset displays: immersive, stereoscopic, flat. */
    CMD_EVENT_HEADSET_VIEW_TOGGLE,
+   /* Start or stop moving the headset's screens with its controllers. */
+   CMD_EVENT_HEADSET_EDIT_SCREENS,
    /* AI service. */
    CMD_EVENT_AI_SERVICE_TOGGLE,
    CMD_EVENT_AI_SERVICE_CALL,
@@ -616,6 +623,15 @@ struct cmd_action_map
    const struct cmd_rows *rows;
 };
 
+#if defined(HAVE_SCREENSHOTS) && defined(HAVE_RPNG)
+/* GET_FRAME [size]: the frame on screen, as image content where the
+ * interface carries one; a PNG, built in memory */
+#define COMMAND_FRAME_SIZE     320
+#define COMMAND_FRAME_SIZE_MIN 64
+#define COMMAND_FRAME_SIZE_MAX 640
+bool command_get_frame(command_t *cmd, const char *arg);
+#endif
+
 /* GET_OPTION [option] / SET_OPTION <option> on|off */
 bool command_get_option(command_t *cmd, const char *arg);
 bool command_set_option(command_t *cmd, const char *arg);
@@ -644,6 +660,16 @@ void command_menu_closed(void);
 #endif
 void command_run_frames_cancel(const char *why);
 void command_run_frames_forget(void);
+
+/* Achievements in hardcore mode are the player's own, as they forbid
+ * rewind and cheats: tools_refused is why an assistant's tool calls are
+ * refused now, or NULL; hardcore_entered stops what one left running -
+ * a frame job, a queue, held input - as hardcore mode takes effect. */
+const char *command_tools_refused(void);
+void command_hardcore_entered(void);
+/* On the main thread each frame, before commands are read: what other
+ * threads left for it, and a MENU request whose menu closed. */
+void command_frame_start(void);
 void command_run_frames_free_frame(void);
 
 /* SET_INPUT <player> <control> <value> / RELEASE_INPUT [player], and
@@ -930,6 +956,13 @@ static const struct cmd_param cmd_params_playlist[] = {
       CMD_PARAM_INT, false, NULL, NULL, "0" },
    { NULL }
 };
+#if defined(HAVE_SCREENSHOTS) && defined(HAVE_RPNG)
+static const struct cmd_param cmd_params_get_frame[] = {
+   { "size", "The longest side at most, 64 to 640; 320 when left out.",
+      CMD_PARAM_INT, false, NULL, NULL, "320" },
+   { NULL }
+};
+#endif
 static const struct cmd_param cmd_params_message[] = {
    { "message", "The text.",
       CMD_PARAM_STRING, true, NULL, NULL, NULL },
@@ -1214,6 +1247,9 @@ static const struct cmd_action_map action_map[] = {
 #endif
    { "VERSION",          command_version,          "No argument", "Report the RetroArch version.", CMD_INFO_READ_ONLY | CMD_INFO_NO_TOOL, NULL },
    { "GET_STATUS",       command_get_status,       "No argument", "PLAYING, PAUSED or CONTENTLESS, with the system and the content's file name.", CMD_INFO_READ_ONLY, NULL, &cmd_rows_status },
+#if defined(HAVE_SCREENSHOTS) && defined(HAVE_RPNG)
+   { "GET_FRAME",        command_get_frame,        "[size]", "The content's frame on screen now, as an image scaled down to fit size; nothing is written. For what memory cannot say - a game whose RAM is not charted, or checking it.", CMD_INFO_READ_ONLY, cmd_params_get_frame },
+#endif
    { "GET_OPTION",       command_get_option,       "[option]", "Report an option's value, or list every option with its value.", CMD_INFO_READ_ONLY | CMD_INFO_NO_TOOL, cmd_params_option, &cmd_rows_option },
    { "SET_OPTION",       command_set_option,       "<option> on|off", "Turn an option on or off. Asking for the state it is already in changes nothing.", CMD_INFO_NO_TOOL, cmd_params_option_set, &cmd_rows_option },
    /* GET_OPTION reports these and more; this stays for the clients that
@@ -1243,7 +1279,7 @@ static const struct cmd_action_map action_map[] = {
    { "WRITE_CORE_RAM",   command_write_ram,        "<address> <byte1> <byte2> ...", "Write bytes to core memory at an achievement address (needs a game with achievements).", CMD_INFO_DESTRUCTIVE | CMD_INFO_NO_TOOL, cmd_params_write },
 #endif
    { "READ_CORE_MEMORY", command_read_memory,      "<address> <number of bytes>", "Read bytes from core memory at a system address. Answers with the address and the bytes, in hexadecimal.", CMD_INFO_READ_ONLY, cmd_params_read, &cmd_rows_read },
-   { "GET_MEMORY_MAP",   command_get_memory_map,   "No argument", "The core's memory map: start, length, select and disconnect in hexadecimal, as READ_CORE_MEMORY takes them.", CMD_INFO_READ_ONLY, NULL, &cmd_rows_memory },
+   { "GET_MEMORY_MAP",   command_get_memory_map,   "No argument", "The core's memory map: start, length, select and disconnect in hexadecimal, as READ_CORE_MEMORY takes them. A core with none lists the RAM it hands over, in space core: system RAM from 0, save RAM after.", CMD_INFO_READ_ONLY, NULL, &cmd_rows_memory },
    { "WRITE_CORE_MEMORY",command_write_memory,     "<address> <byte1> <byte2> ...", "Write bytes to core memory at a system address. Answers with the address and how many bytes were written.", CMD_INFO_DESTRUCTIVE, cmd_params_write },
 
    { "LOAD_STATE_SLOT",command_load_state_slot, "<slot number>", "Load the save state in the given slot, replacing the current game state.", CMD_INFO_DESTRUCTIVE | CMD_INFO_NO_TOOL, cmd_params_slot },
@@ -1338,6 +1374,7 @@ static const struct cmd_map map[] = {
    { "HEADSET_RECENTER", RARCH_HEADSET_RECENTER, "Recenter the headset's screens in front of where it looks.", CMD_INFO_NO_TOOL },
    { "LASER_POINTER_TOGGLE", RARCH_LASER_POINTER_TOGGLE, "Show or hide the headset's laser pointer.", CMD_INFO_NO_TOOL },
    { "HEADSET_VIEW_TOGGLE", RARCH_HEADSET_VIEW_TOGGLE, "Cycle the headset view between immersive, stereoscopic and flat.", CMD_INFO_NO_TOOL },
+   { "HEADSET_EDIT_SCREENS", RARCH_HEADSET_EDIT_SCREENS, "Start or stop moving the headset's screens and menu with its controllers.", CMD_INFO_NO_TOOL },
    { "FPS_TOGGLE", RARCH_FPS_TOGGLE, "Show or hide the framerate.", CMD_INFO_NO_TOOL },
    { "STATISTICS_TOGGLE", RARCH_STATISTICS_TOGGLE, "Show or hide the technical statistics.", CMD_INFO_NO_TOOL },
    { "AI_SERVICE", RARCH_AI_SERVICE, "Run the AI service (translate or narrate the screen).", CMD_INFO_NO_TOOL },

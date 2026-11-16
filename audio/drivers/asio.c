@@ -63,10 +63,7 @@
 #include "asio_ring.h"
 #include <retro_spsc.h>
 
-#ifdef HAVE_THREADS
-#include <rthreads/rthreads.h>
 #include <rthreads/retro_eventcount.h>
-#endif
 
 #include "../audio_driver.h"
 #include "../../verbosity.h"
@@ -733,7 +730,6 @@ typedef struct ra_asio
     * internally because most callers know their own lifecycle. */
    retro_spsc_t       ring;
    bool               ring_initialized;
-#ifdef HAVE_THREADS
    /* Only the bounded wait a full ring puts the writer into; the ring
     * is a retro_spsc and the callback is a real-time one that must not
     * take a lock, so a lock here could never have guarded the
@@ -741,7 +737,6 @@ typedef struct ra_asio
     * prepare_wait registers before the re-check, so a callback that
     * drains from that point on cannot be slept through. */
    retro_eventcount_t park;
-#endif
    ASIOBufferInfo     buf_info[8];  /* one per output channel played */
    unsigned           channels;     /* how many of them: the layout's */
    uint32_t           layout;       /* the frontend's mask across them */
@@ -939,6 +934,20 @@ static ra_asio_t *g_asio = NULL;
  * inside. Raised after the read, a callback preempted between the
  * two would be invisible to that wait. */
 static retro_atomic_int_t g_asio_in_callback;
+/* Notified by the last callback out. Never freed: a callback that
+ * outlives ASIOStop may notify it at any time up to exit. */
+static retro_eventcount_t g_asio_out;
+static bool               g_asio_out_ready;
+
+static void asio_callback_out(void)
+{
+#ifndef ASIO_TEST_NO_OUT_NOTIFY
+   if (retro_atomic_fetch_sub_int(&g_asio_in_callback, 1) == 1)
+      retro_eventcount_notify(&g_asio_out);
+#else
+   retro_atomic_fetch_sub_int(&g_asio_in_callback, 1);
+#endif
+}
 
 /* Persistent instance that survives free/init cycles (core switches).
  * ASIO4ALL crashes if we destroy and recreate its COM object, so we
@@ -1020,15 +1029,13 @@ static void asio_cb_buffer_switch(long index,
          if (ad->output_ready_supported)
             ASIO_CALL_OUTPUT_READY(ad->iasio);
       }
-      retro_atomic_fetch_sub_int(&g_asio_in_callback, 1);
+      asio_callback_out();
       return;
    }
 
    asio_deinterleave_to_buffers(ad, index, ad->buffer_frames);
 
-#ifdef HAVE_THREADS
    retro_eventcount_notify(&ad->park);
-#endif
 
    /* After the last store to this half, and only on a driver that
     * said it wants it: a driver that copies its buffers to the device
@@ -1038,7 +1045,7 @@ static void asio_cb_buffer_switch(long index,
    if (ad->output_ready_supported)
       ASIO_CALL_OUTPUT_READY(ad->iasio);
 
-   retro_atomic_fetch_sub_int(&g_asio_in_callback, 1);
+   asio_callback_out();
 }
 
 static void asio_cb_sample_rate_changed(ASIOSampleRate rate)
@@ -1234,43 +1241,26 @@ static ASIOCallbacks g_asio_callbacks = {
  * that point there is nothing left to do but proceed and say so. */
 static void asio_wait_callbacks_out(void)
 {
-   /* Yields before it sleeps. A callback in flight is part-way through
-    * one period and finishes in well under one, so yielding to it is
-    * all that is usually needed - and Sleep(1) is not one millisecond
-    * unless something has raised the timer resolution, it is the
-    * scheduler's tick, which is about fifteen. Sleeping first would
-    * have made the common case cost more than the Sleep(20) this
-    * replaces rather than less.
-    *
-    * The deadline is measured in time rather than counted in
-    * iterations, so it means 200 ms whatever either of those costs. */
-   /* cpu_features_get_time_usec(), which is this project's clock and
-    * is QueryPerformanceCounter on Windows: microseconds, monotonic,
-    * no wrap to reason about, and the same call the WASAPI pump
-    * already measures its lateness with. The tick counters are the
-    * wrong reach here - GetTickCount64 is Vista and not in the 32-bit
-    * mingw import library at all, and GetTickCount resolves to the
-    * scheduler tick, some fifteen milliseconds, which is most of a
-    * period. */
-   retro_time_t started = cpu_features_get_time_usec();
-   unsigned     yields  = 1000;
+   /* cpu_features_get_time_usec() is QueryPerformanceCounter here. */
+   retro_time_t deadline = cpu_features_get_time_usec() + 200 * 1000;
 
-   while (retro_atomic_load_acquire_int(&g_asio_in_callback) > 0)
+   for (;;)
    {
-      if (yields)
+      retro_time_t now;
+      int key = retro_eventcount_prepare_wait(&g_asio_out);
+      if (retro_atomic_load_seq_cst_int(&g_asio_in_callback) <= 0)
       {
-         yields--;
-         SwitchToThread();
+         retro_eventcount_cancel_wait(&g_asio_out);
+         return;
       }
-      else
+      if ((now = cpu_features_get_time_usec()) >= deadline)
       {
-         if (cpu_features_get_time_usec() - started >= 200 * 1000)
-         {
-            RARCH_WARN("[ASIO] A callback is still running after 200 ms; tearing down anyway.\n");
-            return;
-         }
-         Sleep(1);
+         retro_eventcount_cancel_wait(&g_asio_out);
+         RARCH_WARN("[ASIO] A callback is still running after 200 ms; tearing down anyway.\n");
+         return;
       }
+      retro_eventcount_commit_wait_timeout(&g_asio_out, key,
+            deadline - now);
    }
 }
 
@@ -1302,9 +1292,7 @@ static void asio_destroy(ra_asio_t *ad)
       ad->scratch = NULL;
    }
 
-#ifdef HAVE_THREADS
    retro_eventcount_free(&ad->park);
-#endif
 
    if (ad->com_initialized)
       CoUninitialize();
@@ -1601,6 +1589,16 @@ static void *ra_asio_init(const char *device, unsigned rate,
       return NULL;
    }
 
+   if (!g_asio_out_ready)
+   {
+      if (!retro_eventcount_init(&g_asio_out))
+      {
+         RARCH_ERR("[ASIO] Failed to create sync primitives.\n");
+         return NULL;
+      }
+      g_asio_out_ready = true;
+   }
+
    /* Reclaim a parked instance from a previous free() call.
     * This avoids destroying and recreating the ASIO COM object,
     * which crashes ASIO4ALL whose audio thread doesn't terminate
@@ -1852,13 +1850,11 @@ static void *ra_asio_init(const char *device, unsigned rate,
       *new_rate = ad->sample_rate;
 
    /* Query buffer size */
-#ifdef HAVE_THREADS
    if (!retro_eventcount_init(&ad->park))
    {
       RARCH_ERR("[ASIO] Failed to create sync primitives.\n");
       goto error;
    }
-#endif
 
    /* g_asio before the buffers: the driver may call back during
     * ASIOCreateBuffers. */
@@ -1899,9 +1895,7 @@ error:
       free(ad->scratch);
       ad->scratch = NULL;
    }
-#ifdef HAVE_THREADS
    retro_eventcount_free(&ad->park);
-#endif
    if (ad->com_initialized)
       CoUninitialize();
    free(ad);
@@ -1915,17 +1909,9 @@ error:
  * and shutdown is not raised for that. */
 #define ASIO_WAIT_LAPS 8
 
-static ssize_t ra_asio_write(void *data, const void *buf, size_t len)
+/* A latency change the driver announced, read from the writer's side */
+static void asio_pick_up_latencies(ra_asio_t *ad)
 {
-   ra_asio_t *ad      = (ra_asio_t *)data;
-   const char *src    = (const char *)buf;
-   size_t written     = 0;
-   int64_t wait_us    = 1000;
-   int laps           = ASIO_WAIT_LAPS;
-
-   if (!ad || retro_atomic_load_acquire_int(&ad->shutdown))
-      return -1;
-
    if (retro_atomic_load_acquire_int(&ad->latencies_changed))
    {
       long in_lat = 0, out_lat = 0;
@@ -1938,6 +1924,53 @@ static ssize_t ra_asio_write(void *data, const void *buf, size_t len)
          audio_driver_set_device_latency(asio_device_frames(ad));
       }
    }
+}
+
+static size_t ra_asio_write_begin(void *data, size_t len, void **region)
+{
+   ra_asio_t *ad = (ra_asio_t *)data;
+   void  *ptr    = NULL;
+   size_t room, span;
+   *region       = NULL;
+   if (!ad || retro_atomic_load_acquire_int(&ad->shutdown))
+      return 0;
+   asio_pick_up_latencies(ad);
+   room = asio_ring_room(ad);
+   span = retro_spsc_write_begin(&ad->ring, &ptr);
+   if (span > room)
+      span = room;
+   if (span > len)
+      span = len;
+   span = asio_ring_align_bytes(span, ad->channels);
+   if (!span || !ptr)
+   {
+      retro_spsc_write_end(&ad->ring, 0);
+      return 0;
+   }
+   *region = ptr;
+   return span;
+}
+
+static ssize_t ra_asio_write_end(void *data, size_t len)
+{
+   ra_asio_t *ad = (ra_asio_t *)data;
+   len = asio_ring_align_bytes(len, ad->channels);
+   retro_spsc_write_end(&ad->ring, len);
+   return (ssize_t)len;
+}
+
+static ssize_t ra_asio_write(void *data, const void *buf, size_t len)
+{
+   ra_asio_t *ad      = (ra_asio_t *)data;
+   const char *src    = (const char *)buf;
+   size_t written     = 0;
+   int64_t wait_us    = 1000;
+   int laps           = ASIO_WAIT_LAPS;
+
+   if (!ad || retro_atomic_load_acquire_int(&ad->shutdown))
+      return -1;
+
+   asio_pick_up_latencies(ad);
 
    /* Bound for the blocking wait below, one device period.  Both
     * operands are fixed for the lifetime of the COM object, so this is
@@ -1982,7 +2015,6 @@ static ssize_t ra_asio_write(void *data, const void *buf, size_t len)
           * the stream is started. */
          if (retro_atomic_load_acquire_int(&ad->is_paused))
             break;
-#ifdef HAVE_THREADS
          /* Registered before the ring and the two flags are read
           * again, so a callback that drains from here on either shows
           * up in the re-check or ends the park at once. The predicate
@@ -2009,9 +2041,6 @@ static ssize_t ra_asio_write(void *data, const void *buf, size_t len)
                retro_eventcount_commit_wait_timeout(&ad->park, key,
                      wait_us);
          }
-#else
-         Sleep(1);
-#endif
          /* And bounded overall: a driver that has stopped calling back
           * without shutting down ends the write with what went. */
          if (--laps < 0)
@@ -2078,9 +2107,7 @@ static void ra_asio_free(void *data)
    retro_atomic_store_release_int(&ad->shutdown, 1);
    retro_atomic_store_release_int(&ad->is_paused, 0);
 
-#ifdef HAVE_THREADS
    retro_eventcount_notify(&ad->park);
-#endif
 
    /* Park the instance for reuse on the next init() call.
     * ASIO4ALL's audio thread does not terminate synchronously
@@ -2164,7 +2191,6 @@ static size_t ra_asio_wait_writable(void *data, size_t len)
        * back, and the pass is handed back rather than waited on. */
       if (--laps < 0)
          return 0;
-#ifdef HAVE_THREADS
       {
          /* Registered before the ring and the flags are read again, so
           * a callback that drains from here on cannot be slept
@@ -2179,12 +2205,6 @@ static size_t ra_asio_wait_writable(void *data, size_t len)
          else
             retro_eventcount_commit_wait_timeout(&ad->park, key, wait_us);
       }
-#else
-      /* Nothing to wait on without threads, and nothing calls this
-       * without them either: the threaded pipeline is the only caller.
-       * Report that no wait is possible rather than spin. */
-      return 0;
-#endif
    }
 }
 
@@ -2290,7 +2310,10 @@ audio_driver_t audio_asio = {
    ra_asio_underruns,
    asio_layout,
    NULL, /* frames_consumed_fallback */
-   ra_asio_device_clock_ppm
+   ra_asio_device_clock_ppm,
+   NULL, /* thread_grant */
+   ra_asio_write_begin,
+   ra_asio_write_end
 };
 
 /* Called from the menu to open the ASIO driver's control panel.

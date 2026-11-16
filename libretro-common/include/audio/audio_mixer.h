@@ -64,7 +64,8 @@ enum audio_mixer_type
     * source may be a window rather than the file.  AUDIO_MIXER_TYPE_WAV
     * remains the right choice for the short sounds - menu clicks and
     * the like - that want their PCM ready before the first mix. */
-   AUDIO_MIXER_TYPE_WAV_STREAM
+   AUDIO_MIXER_TYPE_WAV_STREAM,
+   AUDIO_MIXER_TYPE_WMA
 };
 
 typedef struct audio_mixer_sound audio_mixer_sound_t;
@@ -96,6 +97,7 @@ audio_mixer_sound_t* audio_mixer_load_flac(void *buffer, size_t size);
 audio_mixer_sound_t* audio_mixer_load_mp3(void *buffer, size_t size);
 audio_mixer_sound_t* audio_mixer_load_m4a(void *buffer, size_t size);
 audio_mixer_sound_t* audio_mixer_load_ac3(void *buffer, size_t size);
+audio_mixer_sound_t* audio_mixer_load_wma(void *buffer, size_t size);
 audio_mixer_sound_t* audio_mixer_load_lpcm(void *buffer, size_t size);
 audio_mixer_sound_t* audio_mixer_load_opus(void *buffer, size_t size);
 /* WebM audio (.weba): identifies the track's codec and returns a sound
@@ -132,6 +134,11 @@ void audio_mixer_sound_set_data_owner(audio_mixer_sound_t *sound,
  * No-op for a NULL sound or any non-Opus stream. */
 void audio_mixer_sound_set_end_granule(audio_mixer_sound_t *sound,
       int64_t end_granule);
+
+/* The caller's word for a sound, for its stop callback: set before
+ * the play, read by the callback on the mixing thread. */
+void audio_mixer_sound_set_tag(audio_mixer_sound_t *sound, unsigned tag);
+unsigned audio_mixer_sound_tag(const audio_mixer_sound_t *sound);
 
 /* Resident prefix of a windowed sound's source buffer: bounds the
  * decoder's container header parse at open.  0 = fully resident. */
@@ -217,6 +224,12 @@ void audio_mixer_mix(float* buffer, size_t num_frames, float volume_override, bo
  * every mix call, on the audio thread. */
 void audio_mixer_mix_s16(int16_t* buffer, size_t num_frames,
       int32_t gain_override, bool override);
+
+/* The same, with @base (num_frames * 2 samples) in place of what @dst
+ * holds: the sum lands in @dst, and @base is not copied there first.
+ * @base and @dst may not overlap. */
+void audio_mixer_mix_s16_over(int16_t *dst, const int16_t *base,
+      size_t num_frames, int32_t gain_override, bool override);
 
 bool audio_mixer_has_float_voices(void);
 

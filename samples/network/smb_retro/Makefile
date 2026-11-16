@@ -13,10 +13,15 @@ else
    # file mapping as the shipping build has it (Win32 maps without it)
    MMAP_FLAGS = -DHAVE_MMAP
 endif
-all: smb_test vfs_test smb_idle_test vfs_threads_test
+all: smb_test smb_dir_bounds_test smb_cfg_race_test vfs_test smb_idle_test vfs_threads_test
 
 smb_test: $(SRC)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(SRC) $(LDLIBS) -o $@
+
+# includes net_smb2.c itself to reach its static directory decoder
+BOUNDS_SRC = smb_dir_bounds_test.c $(filter-out smb_test.c $(COMMON)/net/net_smb2.c,$(SRC))
+smb_dir_bounds_test: $(BOUNDS_SRC) $(COMMON)/net/net_smb2.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(BOUNDS_SRC) $(LDLIBS) -o $@
 
 VFS_SRC = vfs_test.c $(COMMON)/vfs/vfs_implementation_smb.c $(COMMON)/vfs/vfs_prefetch.c $(filter-out smb_test.c,$(SRC)) \
       $(COMMON)/lists/string_list.c
@@ -25,6 +30,10 @@ vfs_test: $(VFS_SRC)
 IDLE_SRC = smb_idle_test.c $(filter-out vfs_test.c,$(VFS_SRC))
 smb_idle_test: $(IDLE_SRC)
 	$(CC) $(CPPFLAGS) -DHAVE_RETROSMB -DHAVE_SMBCLIENT -DHAVE_NETWORKING -DRARCH_INTERNAL -I$(ROOT) $(CFLAGS) $(IDLE_SRC) $(LDLIBS) -o $@
+# settings handed over while threads resolve; no server
+RACE_SRC = smb_cfg_race_test.c $(filter-out vfs_test.c,$(VFS_SRC)) $(COMMON)/rthreads/rthreads.c $(COMMON)/rthreads/retro_eventcount.c $(COMMON)/file/retro_dirent.c
+smb_cfg_race_test: $(RACE_SRC) $(COMMON)/vfs/vfs_cfg_snapshot.h
+	$(CC) $(CPPFLAGS) -DHAVE_RETROSMB -DHAVE_SMBCLIENT -DHAVE_NETWORKING -DHAVE_THREADS -DRARCH_INTERNAL -I$(ROOT) $(CFLAGS) $(RACE_SRC) $(LDLIBS) -lpthread -o $@
 THR_SRC = vfs_threads_test.c $(filter-out vfs_test.c,$(VFS_SRC)) $(COMMON)/rthreads/rthreads.c $(COMMON)/rthreads/retro_eventcount.c $(COMMON)/file/retro_dirent.c
 vfs_threads_test: $(THR_SRC)
 	$(CC) $(CPPFLAGS) -DHAVE_RETROSMB -DHAVE_SMBCLIENT -DHAVE_NETWORKING -DHAVE_THREADS $(MMAP_FLAGS) -DRARCH_INTERNAL -I$(ROOT) $(CFLAGS) $(THR_SRC) $(LDLIBS) -lpthread -o $@
@@ -41,7 +50,9 @@ smb_idle_test_libsmb2: smb_idle_test.c $(L2_SRC)
 	$(CC) -I$(COMMON)/include -D_GNU_SOURCE -DHAVE_SMBCLIENT -DHAVE_STDINT_H -DHAVE_NETWORKING -DRARCH_INTERNAL -I$(ROOT) $(LIBSMB2_CFLAGS) $(CFLAGS) smb_idle_test.c $(L2_SRC) $(LIBSMB2_LIBS) $(LDLIBS) -o $@
 vfs_threads_test_libsmb2: vfs_threads_test.c $(L2_SRC)
 	$(CC) -I$(COMMON)/include -D_GNU_SOURCE -DHAVE_SMBCLIENT -DHAVE_STDINT_H -DHAVE_NETWORKING -DHAVE_THREADS $(MMAP_FLAGS) -DRARCH_INTERNAL -I$(ROOT) $(LIBSMB2_CFLAGS) $(CFLAGS) vfs_threads_test.c $(L2_SRC) $(COMMON)/rthreads/rthreads.c $(COMMON)/rthreads/retro_eventcount.c $(COMMON)/file/retro_dirent.c $(LIBSMB2_LIBS) $(LDLIBS) -lpthread -o $@
+cloud_sync_test_libsmb2: cloud_sync_test.c $(L2_SRC)
+	$(CC) -I$(COMMON)/include -D_GNU_SOURCE -DHAVE_SMBCLIENT -DHAVE_STDINT_H -DHAVE_NETWORKING -DHAVE_CLOUDSYNC -DHAVE_THREADS -DRARCH_INTERNAL -I$(ROOT) $(LIBSMB2_CFLAGS) $(CFLAGS) cloud_sync_test.c $(L2_SRC) $(COMMON)/rthreads/rthreads.c $(COMMON)/rthreads/retro_eventcount.c $(LIBSMB2_LIBS) $(LDLIBS) -lpthread -o $@
 
 clean:
-	rm -f smb_idle_test smb_idle_test.exe smb_idle_test_libsmb2 smb_test smb_test.exe vfs_test vfs_test.exe vfs_threads_test vfs_threads_test.exe vfs_test_libsmb2 vfs_threads_test_libsmb2
+	rm -f smb_dir_bounds_test smb_dir_bounds_test.exe smb_cfg_race_test smb_cfg_race_test.exe smb_idle_test smb_idle_test.exe smb_idle_test_libsmb2 smb_test smb_test.exe vfs_test vfs_test.exe vfs_threads_test vfs_threads_test.exe vfs_test_libsmb2 vfs_threads_test_libsmb2 cloud_sync_test_libsmb2
 .PHONY: all clean

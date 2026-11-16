@@ -36,7 +36,36 @@
  * retro_common_api only.  The compiler never opens a file, never takes
  * a lock, never touches process-global mutable state, and is re-entrant:
  * any number of rslc_compile calls may run on different threads at once
- * with their own opts and result. */
+ * with their own opts and result.
+ *
+ * A build with RSLC_EXTENDED defined also takes what an emulator's own
+ * shaders need and the frontend's never do: sampler2DArray,
+ * sampler2DMSArray and samplerBuffer (each with its i and u forms),
+ * sized arrays of samplers, gl_SampleID, more than one uniform block
+ * (each at its own set and binding; the reflection tables still
+ * describe only the first and the push block), dual-source fragment
+ * outputs (layout index), layout(early_fragment_tests), and a vertex
+ * stage's gl_ClipDistance / gl_CullDistance (sized by the highest
+ * constant element written; HLSL and MSL refuse them yet), in / out
+ * interface blocks, RSLC_STAGE_GEOMETRY (SPIR-V and GLSL only), and
+ * storage buffers with the atomic builtins (SPIR-V and GLSL only),
+ * and what a generated stage says: #version 420 to 440 for the same
+ * dialect, gl_WorkGroupSize, and a uniform block that says std430
+ * (placed as glslang places it under GL_EXT_scalar_block_layout) or
+ * ends in an array of unstated length
+ * (GL_EXT_uniform_buffer_unsized_array; SPIR-V only), a block member
+ * that says its layout(offset) (SPIR-V only),
+ * gl_FragStencilRefARB (SPIR-V only), and one multisampled image read
+ * and written a sample at a time: sampler2DMS and image2DMS with their
+ * i and u forms (SPIR-V only), the two-channel and 16-bit image
+ * formats, and a write-only image that leaves its format out (SPIR-V
+ * only).
+ * Without it
+ * none of that is accepted, nothing is compiled in for it, and every
+ * destination is word for word what it was. RSLC_NO_DXBC omits the
+ * Direct3D bytecode backend from an extended build; other destinations
+ * are unchanged. MSL has no form of the
+ * extended samplers or of a third block yet and refuses them. */
 
 #include <stdint.h>
 #include <stddef.h>
@@ -48,7 +77,9 @@ RETRO_BEGIN_DECLS
 enum rslc_stage
 {
    RSLC_STAGE_VERTEX = 0,
-   RSLC_STAGE_FRAGMENT
+   RSLC_STAGE_FRAGMENT,
+   RSLC_STAGE_GEOMETRY,  /* RSLC_EXTENDED; SPIR-V and GLSL only */
+   RSLC_STAGE_COMPUTE    /* RSLC_EXTENDED; SPIR-V and GLSL only */
 };
 
 enum rslc_dst
@@ -61,7 +92,10 @@ enum rslc_dst
    RSLC_DST_GLSL_CAFE,   /* GLSL for the Wii U's offline CafeGLSL: version
                             150, the push block as a second uniform block,
                             a location on every in and out */
-   RSLC_DST_REFLECT      /* tables only */
+   RSLC_DST_REFLECT,     /* tables only */
+   RSLC_DST_DXBC         /* RSLC_EXTENDED: a Direct3D bytecode container of
+                            shader model opts.version = 40 / 41 / 50, in
+                            the result's spirv / spirv_len words */
 };
 
 /* Scalar base of a reflected member or I/O slot. */
@@ -71,7 +105,8 @@ enum rslc_base
    RSLC_BASE_BOOL,
    RSLC_BASE_INT,
    RSLC_BASE_UINT,
-   RSLC_BASE_FLOAT
+   RSLC_BASE_FLOAT,
+   RSLC_BASE_DOUBLE   /* RSLC_EXTENDED: a 64-bit scalar, never a constant; SPIR-V only */
 };
 
 #define RSLC_MAX_SAMPLERS 16
@@ -296,6 +331,18 @@ struct rslc_names
  * version: GLSL #version, HLSL shader model or MSL version per dst.
  * es / fixup_clipspace / flip_vert_y: the flags slang_process passes
  *   into the printers today; honoured at print time, never in the IR. */
+/* RSLC_EXTENDED, GLSL: how an input attachment, the colour attachment's
+ * value on entry, is read */
+enum rslc_fb_fetch
+{
+   RSLC_FB_FETCH_NONE = 0,   /* refused */
+   RSLC_FB_FETCH_EXT,        /* GL_EXT_shader_framebuffer_fetch: the colour
+                                output at the attachment's index is inout
+                                and read where the input is */
+   RSLC_FB_FETCH_ARM         /* GL_ARM_shader_framebuffer_fetch:
+                                gl_LastFragColorARM */
+};
+
 struct rslc_opts
 {
    void *(*alloc)(void *ud, size_t len);
@@ -313,6 +360,10 @@ struct rslc_opts
    bool es;
    bool fixup_clipspace;
    bool flip_vert_y;
+   unsigned fb_fetch;   /* enum rslc_fb_fetch */
+   /* RSLC_EXTENDED, GLSL: early fragment tests as conservative depth's
+    * depth_unchanged, for a context without image load / store */
+   bool early_z_depth_unchanged;
 };
 
 #define RSLC_ARENA_CHUNK        (64u * 1024u)

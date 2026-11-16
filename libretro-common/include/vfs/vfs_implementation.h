@@ -59,6 +59,29 @@ int64_t retro_vfs_file_read_impl(libretro_vfs_implementation_file *stream, void 
 
 int64_t retro_vfs_file_write_impl(libretro_vfs_implementation_file *stream, const void *s, uint64_t len);
 
+/* Writes @count pieces of memory, in order, as if each were written
+ * with retro_vfs_file_write_impl: one writev() call for a descriptor-
+ * written stream where the platform has it, else one write per piece.
+ * Returns the bytes written, short at the first piece not written in
+ * full, or -1 if nothing was written. */
+int64_t retro_vfs_file_writev_impl(libretro_vfs_implementation_file *stream,
+      const struct retro_vfs_span *spans, size_t count);
+
+/* Reads @len bytes at @offset without moving the stream's position;
+ * any number of threads may call it on one stream at once. Returns the
+ * bytes read, 0 at or past the end, or -1 on an error or where the
+ * platform or the stream's scheme has no positional I/O (the caller then
+ * seeks and reads, under a lock of its own if it shares the stream). */
+int64_t retro_vfs_file_read_at_impl(libretro_vfs_implementation_file *stream,
+      void *s, uint64_t len, int64_t offset);
+
+/* Writes @len bytes at @offset the same way; with a negative @offset it
+ * appends, each append whole and after the one before it whichever
+ * thread it came from (after the file's end as it was opened, so a
+ * stream appended to is written with this call only). -1 as above. */
+int64_t retro_vfs_file_write_at_impl(libretro_vfs_implementation_file *stream,
+      const void *s, uint64_t len, int64_t offset);
+
 int retro_vfs_file_flush_impl(libretro_vfs_implementation_file *stream);
 
 int retro_vfs_file_remove_impl(const char *path);
@@ -98,6 +121,65 @@ const uint8_t *retro_vfs_file_get_mapped_ptr_impl(
  **/
 int64_t retro_vfs_file_view_impl(libretro_vfs_implementation_file *stream,
       uint64_t len, const uint8_t **ptr);
+
+/* An open hint this implementation honours and the frontend VFS ABI does
+ * not carry: a read-only open of a local file that has to stay the file
+ * it opened, for a caller that checks what it reads (a core's signature).
+ * Implies the descriptor path, with no stdio buffer. The open fails
+ * unless the path names a regular file; it never waits (a FIFO), never
+ * becomes a controlling terminal and is not inherited by a child. On
+ * Windows no other handle can write the file or delete it for as long as
+ * this one is open. Ignored by any other mode or scheme, which open as
+ * before. */
+#define RETRO_VFS_FILE_ACCESS_HINT_IMPL_STABLE (1 << 16)
+
+/* Which file an open stream is, read from the open handle itself rather
+ * than by path, so it describes the file being read even after the path
+ * has been pointed elsewhere. */
+struct retro_vfs_file_identity
+{
+   uint64_t dev;          /* the volume                                 */
+   uint64_t size;
+   int64_t  mtime;        /* last write, seconds since 1970             */
+   int64_t  ctime;        /* last status change (Windows: ChangeTime),
+                           * 0 where the platform has none             */
+   uint32_t mtime_nsec;
+   uint32_t ctime_nsec;
+   uint8_t  id[16];       /* the file on the volume: Windows' 128-bit
+                           * id, else the inode, big-endian, in the
+                           * last 8 octets                              */
+};
+
+/* Fills @id for a plain-file stream opened on the descriptor path
+ * (RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK, ..._FREQUENT_ACCESS or
+ * ..._IMPL_STABLE). One fstat() on POSIX. False for any other stream. */
+bool retro_vfs_file_identity_impl(libretro_vfs_implementation_file *stream,
+      struct retro_vfs_file_identity *id);
+
+/* A stable open (RETRO_VFS_FILE_ACCESS_HINT_IMPL_STABLE) that also
+ * fills @id, from the query the open makes anyway to vouch for the file:
+ * the identity as opened, without retro_vfs_file_identity_impl()'s own
+ * query (one fstat() fewer on POSIX; on Windows the identity's queries
+ * stand in for the size query). NULL, with @id zeroed, unless the stream
+ * is a stable one: a path the VFS opens by another scheme is closed and
+ * refused. Ask retro_vfs_file_identity_impl() for the identity later. */
+libretro_vfs_implementation_file *retro_vfs_file_open_stable_impl(
+      const char *path, struct retro_vfs_file_identity *id);
+
+/* Maps the whole of a descriptor-path stream read-only, on demand, and
+ * returns it; the stream owns the mapping and drops it at close. Reads,
+ * seeks and the position are untouched by it, and a second call returns
+ * the same mapping. NULL where the stream or platform can't map (the
+ * caller then reads), including an empty file or one too big for the
+ * address space.
+ *
+ * Reading the mapping is reading the file: where another process can
+ * shorten the file, a touch past its new end faults (SIGBUS on POSIX),
+ * and a removable or network volume can fail a touch the same way. A
+ * caller maps only a file nothing else can change, on a local fixed
+ * volume. */
+const uint8_t *retro_vfs_file_map_impl(libretro_vfs_implementation_file *stream,
+      int64_t *len);
 
 /**
  * retro_vfs_file_prefetch_impl:

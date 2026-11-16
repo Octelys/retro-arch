@@ -1406,6 +1406,9 @@ static uint32_t gfx_ctx_drm_get_flags(void *data)
    {
 #if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
       BIT32_SET(flags, GFX_CTX_FLAGS_SHADERS_SLANG);
+#elif defined(HAVE_GLSL)
+      /* No slang to draw through: glcore draws through GLSL */
+      BIT32_SET(flags, GFX_CTX_FLAGS_SHADERS_GLSL);
 #endif
    }
    else
@@ -1447,6 +1450,39 @@ static bool gfx_ctx_drm_destroy_surface(void *data)
 #endif
 }
 
+#ifdef HAVE_EGL
+/* A context in the share group, of the window's client API */
+static bool gfx_ctx_drm_shared_context_new(void *data,
+      gfx_ctx_shared_context_t *out)
+{
+   gfx_ctx_drm_data_t *drm = (gfx_ctx_drm_data_t*)data;
+   memset(out, 0, sizeof(*out));
+   if (!drm)
+      return false;
+   switch (drm_api)
+   {
+      case GFX_CTX_OPENGL_API:
+         return egl_shared_context_new(&drm->egl, EGL_OPENGL_API, out);
+      case GFX_CTX_OPENGL_ES_API:
+         return egl_shared_context_new(&drm->egl, EGL_OPENGL_ES_API, out);
+      default:
+         break;
+   }
+   return false;
+}
+#endif
+
+/* As gfx_ctx_drm_queue_flip() chooses an async page flip */
+static bool gfx_ctx_drm_present_immediate(void *data)
+{
+   gfx_ctx_drm_data_t *drm = (gfx_ctx_drm_data_t*)data;
+   return drm
+      && drm->interval == 0
+      && drm->async_flip
+      && !drm->async_flip_refused
+      && !drm->video_vsync;
+}
+
 const gfx_ctx_driver_t gfx_ctx_drm = {
    gfx_ctx_drm_init,
    gfx_ctx_drm_destroy,
@@ -1484,5 +1520,19 @@ const gfx_ctx_driver_t gfx_ctx_drm = {
    NULL,
    NULL,
    gfx_ctx_drm_create_surface,
-   gfx_ctx_drm_destroy_surface
+   gfx_ctx_drm_destroy_surface,
+   NULL, /* presentable */
+   NULL, /* last_present_time */
+   NULL, /* release_current */
+#ifdef HAVE_EGL
+   gfx_ctx_drm_shared_context_new,
+   egl_shared_context_bind,
+   egl_shared_context_free,
+#else
+   NULL, /* shared_context_new */
+   NULL, /* shared_context_bind */
+   NULL, /* shared_context_free */
+#endif
+   NULL, /* windows */
+   gfx_ctx_drm_present_immediate
 };

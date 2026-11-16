@@ -11,6 +11,7 @@
 #define AUDIO_PAUSE_TAIL_FRAMES 512
 static audio_driver_state_t audio_driver_st;
 #include "audio_tap_fragment.c"
+uint64_t cpu_features_get(void) { return 0; }
 static retro_atomic_int_t entered, release_pass;
 static unsigned pushes;
 static int submit(
@@ -81,7 +82,7 @@ int main(void)
    }
 #endif
    assert(audio_driver_record_tap_remove(t));
-   assert(!audio_driver_st.record_tap);
+   assert(!AUDIO_DRIVER_PTR_GET(&audio_driver_st.record_tap));
    assert(record_audio_tap_end(t, &end) && end == 32);
    assert(record_audio_tap_free(t) && record_audio_tap_free(other));
 #ifdef HAVE_THREADS

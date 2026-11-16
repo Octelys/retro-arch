@@ -24,18 +24,16 @@ video_thread_frame               0
 video_thread_loop                2
 # Parks and handshakes ride an eventcount and atomic words; nothing here.
 audio_thread_loop                0
-# Taken once it has something to retire; returns on two atomic loads
-# before any of them on a frame with nothing in flight.  The progress
-# walk also counts the due main-thread tasks; picking one (inlined
-# here) takes the lock only when such a task is due, and settling it
-# reads the task's flags, which are atomic.
-retro_task_threaded_gather       6
+# The task lists hand over through atomics and lock-free stacks, and a
+# task's title and error are read inside a read epoch.
+retro_task_threaded_gather       0
 # A job is handed over through a ring of slots and takes no lock, and
 # a worker takes none at its exit either: tpool_destroy() joins it.
-# Jobs posted past the ring's size wait on a list under the lock
-# (tpool_take, a call of its own). Finishing an item retires it on the
-# outstanding count and wakes tpool_wait() through an eventcount,
-# without the lock.
+# Jobs posted past the ring's size go on a lock-free stack that the
+# worker holding the drain token moves on. Finishing an item retires
+# it on the outstanding count and wakes tpool_wait() through an
+# eventcount.
+tpool_add_work                   0
 tpool_worker                     0
 tpool_help                       0
 tpool_wait                       0

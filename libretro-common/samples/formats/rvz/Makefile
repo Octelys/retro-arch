@@ -11,6 +11,7 @@ SOURCES := \
 	$(LIBRETRO_COMM_DIR)/crypto/crypto.c \
 	$(LIBRETRO_COMM_DIR)/hash/lrc_hash.c \
 	$(LIBRETRO_COMM_DIR)/encodings/encoding_rzstd.c \
+	$(LIBRETRO_COMM_DIR)/encodings/encoding_xxh64.c \
 	$(LIBRETRO_COMM_DIR)/encodings/encoding_rbzip2.c \
 	$(LIBRETRO_COMM_DIR)/formats/7z/r7z_lzma_stream.c \
 	$(LIBRETRO_COMM_DIR)/formats/7z/r7z_lzma2.c \
@@ -30,6 +31,8 @@ SOURCES := \
 OBJS := $(call sample_objs,$(SOURCES:.c=.o))
 
 CFLAGS += -Wall -pedantic -std=gnu99 -g1 -O2 -I$(LIBRETRO_COMM_DIR)/include -DHAVE_RZSTD
+# the test counts the allocations reads make
+LDFLAGS += -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc
 
 ifneq ($(SANITIZER),)
    CFLAGS  := -fsanitize=$(SANITIZER) -fno-omit-frame-pointer $(CFLAGS)

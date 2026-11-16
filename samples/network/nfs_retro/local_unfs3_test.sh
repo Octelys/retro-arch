@@ -7,6 +7,11 @@
 # skips, and passes.
 set -e
 cd "$(dirname "$0")"
+# reply parsing against short and hostile replies: needs no server
+make -s nfs_reply_bounds_test nfs_cfg_race_test
+${RUNNER:-} ./nfs_reply_bounds_test${EXE:-}
+# settings handed over while threads resolve: needs no server
+${RUNNER:-} ./nfs_cfg_race_test${EXE:-}
 UNFSD=$(command -v unfsd || true)
 if [ -z "$UNFSD" ]; then
    if command -v git >/dev/null 2>&1 && command -v flex >/dev/null 2>&1 && command -v bison >/dev/null 2>&1; then
@@ -33,7 +38,7 @@ $UNFSD -p -n 20049 -m 20048 -e $D/exports -d > $D/log 2>&1 &
 SRV=$!
 i=0; while [ $i -lt 50 ]; do
    $RUN ./nfs_test$EXE 127.0.0.1 $D/export 20049 20048 > $D/out 2>&1 && break
-   grep -q "connect failed" $D/out || break
+   grep -q "connect to " $D/out || break
    i=$((i + 1)); sleep 0.2
 done
 rm -rf $D/export/*
@@ -65,11 +70,19 @@ fi
 # no open state, so the next call must dial again and go on - the read
 # first, then the write first, since a write builds its arguments where
 # the dial works and must not send what the dial left there.
+# until the idler says its files are open (a slow client under Wine
+# or a sanitizer takes longer to get there), fifteen seconds at most
+idling() {
+   n=0
+   until grep -q "idle for" $1 2>/dev/null || [ $n -ge 150 ]; do
+      n=$((n + 1)); sleep 0.1
+   done
+}
 for order in r w; do
-   rm -rf $D/export/*
-   $RUN ./nfs_idle_test$EXE 127.0.0.1 $D/export 20049 20048 3 10 $order > $D/out 2>&1 &
+   rm -rf $D/export/* $D/out
+   $RUN ./nfs_idle_test$EXE 127.0.0.1 $D/export 20049 20048 3 5 $order > $D/out 2>&1 &
    idler=$!
-   sleep 3
+   idling $D/out
    kill $SRV 2>/dev/null; wait $SRV 2>/dev/null || true
    sleep 1
    $UNFSD -p -n 20049 -m 20048 -e $D/exports -d > $D/log 2>&1 &

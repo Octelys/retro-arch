@@ -20,6 +20,7 @@
 #include <pthread.h>
 
 #include <rthreads/rthreads.h>
+#include <retro_timers.h>
 #include <formats/rac3.h>
 #include <formats/iec61937.h>
 #include "fake_wasapi.h"
@@ -62,7 +63,139 @@ static audio_pipeline_stretch_t *transport_test_new(unsigned rate,
 #define memalign_free transport_test_free
 #define audio_pipeline_stretch_new transport_test_new
 #define realloc canonical_test_realloc
+/* The consumer's bound on an idle wait, a second in the frontend, is
+ * what the scheduler cases run into when they call a pass with nothing
+ * queued: eight of them, eight seconds of nothing. 20 ms is still far
+ * past what any case here waits for. */
+#define AUDIO_PIPE_WAIT_MAX_US       20000
+/* The resamplers the driver makes come from a table cache (below): a
+ * sibling of one parent per configuration, so the hundreds of audio
+ * re-inits here build each set of sinc tables once rather than every
+ * time. The header's prototypes take the new names along. */
+#define retro_resampler_realloc_hq   test_resampler_realloc_hq
+#define retro_resampler_int16_new    test_resampler_int16_new
+/* The driver's clock: real time unless a case steps it itself. */
+#include <features/features_cpu.h>
+static bool fake_clock;
+static retro_time_t fake_now;
+static retro_time_t harness_time_usec(void)
+{
+   return fake_clock ? fake_now : cpu_features_get_time_usec();
+}
+#define cpu_features_get_time_usec   harness_time_usec
 #include "../../../audio/audio_driver.c"
+#undef cpu_features_get_time_usec
+#undef retro_resampler_realloc_hq
+#undef retro_resampler_int16_new
+#undef realloc
+/* the real ones, which the renamed header no longer declares */
+bool retro_resampler_realloc_hq(void **re, const retro_resampler_t **backend,
+      const char *ident, enum resampler_quality quality, double bw_ratio,
+      bool hq_oversampling);
+bool retro_resampler_int16_new(retro_resampler_int16_t *out,
+      const char *short_ident, enum resampler_quality quality,
+      double bw_ratio, bool hq_oversampling);
+
+/* ---- the resampler table cache ----
+ * A parent per (backend, quality, bandwidth ratio, HQ) kept for the
+ * run; what the driver gets is a sibling of it: its own fresh stream
+ * over the parent's tables, freed like any other. A backend without
+ * siblings is made the usual way. */
+typedef struct
+{
+   char                     ident[32];
+   enum resampler_quality   quality;
+   double                   bw_ratio;
+   bool                     hq;
+   void                    *re;
+   const retro_resampler_t *backend;
+   retro_resampler_int16_t  re16;
+   bool                     has16;
+} table_parent_t;
+static table_parent_t table_parents[64];
+static unsigned       table_parents_n;
+
+static table_parent_t *table_parent(const char *ident,
+      enum resampler_quality quality, double bw_ratio, bool hq)
+{
+   unsigned i;
+   table_parent_t *p;
+   if (!ident)
+      ident = "";
+   for (i = 0; i < table_parents_n; i++)
+   {
+      p = &table_parents[i];
+      if (     !strcmp(p->ident, ident) && p->quality == quality
+            && p->bw_ratio == bw_ratio && p->hq == hq)
+         return p;
+   }
+   if (table_parents_n == sizeof(table_parents) / sizeof(table_parents[0]))
+      return NULL;
+   p = &table_parents[table_parents_n++];
+   memset(p, 0, sizeof(*p));
+   strncpy(p->ident, ident, sizeof(p->ident) - 1);
+   p->quality  = quality;
+   p->bw_ratio = bw_ratio;
+   p->hq       = hq;
+   return p;
+}
+
+bool test_resampler_realloc_hq(void **re, const retro_resampler_t **backend,
+      const char *ident, enum resampler_quality quality, double bw_ratio,
+      bool hq_oversampling)
+{
+   table_parent_t *p = table_parent(ident, quality, bw_ratio, hq_oversampling);
+   if (*re && *backend)
+      (*backend)->free(*re);
+   *re = NULL;
+   if (p && !p->re
+         && !retro_resampler_realloc_hq(&p->re, &p->backend, ident, quality,
+               bw_ratio, hq_oversampling))
+      p->re = NULL;
+   if (p && p->re && p->backend->sibling)
+   {
+      *backend = p->backend;
+      *re      = p->backend->sibling(p->re);
+      if (*re)
+         return true;
+   }
+   return retro_resampler_realloc_hq(re, backend, ident, quality, bw_ratio,
+         hq_oversampling);
+}
+
+bool test_resampler_int16_new(retro_resampler_int16_t *out,
+      const char *short_ident, enum resampler_quality quality,
+      double bw_ratio, bool hq_oversampling)
+{
+   table_parent_t *p = table_parent(short_ident, quality, bw_ratio, hq_oversampling);
+   if (p && !p->has16)
+      p->has16 = retro_resampler_int16_new(&p->re16, short_ident, quality,
+            bw_ratio, hq_oversampling);
+   if (p && p->has16 && p->re16.sibling)
+   {
+      *out      = p->re16;
+      out->data = p->re16.sibling(p->re16.data);
+      if (out->data)
+         return true;
+   }
+   return retro_resampler_int16_new(out, short_ident, quality, bw_ratio,
+         hq_oversampling);
+}
+
+static void table_parents_free(void)
+{
+   unsigned i;
+   for (i = 0; i < table_parents_n; i++)
+   {
+      table_parent_t *p = &table_parents[i];
+      if (p->re)
+         p->backend->free(p->re);
+      if (p->has16)
+         p->re16.free(p->re16.data);
+   }
+   table_parents_n = 0;
+}
+#define realloc canonical_test_realloc
 
 /* Pause and resume as the runloop would: the flags drive the publish,
  * so the snapshot keeps carrying the setting bits the fixture set. */
@@ -211,8 +344,9 @@ static bool up(bool core_float, uint32_t layout, bool float_dev)
    st->sink_bias              = 1.0;
    strcpy(st->resampler_ident, "sinc");
    st->resampler_quality      = RESAMPLER_QUALITY_NORMAL;
-   if (!retro_resampler_realloc(&st->resampler_data, &st->resampler,
-            st->resampler_ident, st->resampler_quality, st->src_ratio_orig))
+   if (!test_resampler_realloc_hq(&st->resampler_data, &st->resampler,
+            st->resampler_ident, st->resampler_quality, st->src_ratio_orig,
+            false))
       return false;
    config_get_ptr()->uints.audio_output_sample_rate = 48000;
    st->out_rate               = 48000;
@@ -1491,6 +1625,38 @@ static void canonical_prefix_case(void)
    for (i = 0; i < sizeof(output); i++) CHECK(output[i] == 0xa5, "rejected prefix changed output");
 }
 
+/* A new core rate with the extra lanes up is taken: the lanes, siblings
+ * of the front pair the change replaces, go with it and are remade at
+ * the new ratio by the next pass. */
+static void rate_change_extras_case(bool floating)
+{
+   union { float f[128 * 6]; int16_t i[128 * 6]; } input;
+   audio_driver_state_t *st = &audio_driver_st;
+   void *front;
+   size_t f;
+   bool ready = pipe_up(floating, floating);
+   CHECK(ready, "rate stand-up");
+   if (!ready) return;
+   for (f = 0; f < 128 * 6; f++)
+      if (floating) input.f[f] = (float)(f % 6 + 1) / 16.0f;
+      else input.i[f] = (int16_t)((f % 6 + 1) * 2048);
+   CHECK(audio_driver_multi_pipe(st, &input, 128, 6, AUDIO_LAYOUT_5POINT1, floating),
+         "rate warm publish");
+   audio_driver_pipeline_consume(st);
+   CHECK(st->extra.nres == 2, "rate: no extra lanes to begin with");
+   front = st->resampler_data;
+   CHECK(audio_driver_set_input_rate(32000.0), "a rate change with extra lanes refused");
+   CHECK(     st->extra.nres == 0
+           && st->resampler_data != front
+           && fabs(st->src_ratio_orig - 48000.0 / 32000.0) < 1e-9,
+         "the rate change left the old lanes or ratio: %u lanes, ratio %.4f",
+         st->extra.nres, st->src_ratio_orig);
+   CHECK(audio_driver_multi_pipe(st, &input, 128, 6, AUDIO_LAYOUT_5POINT1, floating),
+         "rate publish");
+   audio_driver_pipeline_consume(st);
+   CHECK(st->extra.nres == 2, "the extra lanes were not remade at the new rate");
+}
+
 static void resampler_discontinuity_case(unsigned backend, bool floating,
       unsigned scenario, bool hq)
 {
@@ -2628,6 +2794,189 @@ static void inline_transport_cases(void)
    printf("inline native transport: 10 cases, %u failures\n", failures - before);
 }
 
+static void inline_hold_frame(const float *input)
+{
+   fake_now += (retro_time_t)(735 * 1000000.0 / 44100.0) / 2;
+   CHECK(audio_driver_sample_batch_float(input, 735) == 735, "hold source accounting");
+   audio_driver_frame_end();
+}
+
+/* A gap inside a fast-forward hold, with Speedup off so only the
+ * stretch follows the measured speed. A pause is not measured at all:
+ * the estimate holds the hold's speed through it. A stall seeds it
+ * again, so the stretch stays on. After a slow spell the stretch is
+ * back within a few frames, not once fast-forward is released. */
+static void inline_hold_gap_case(bool pause, bool slow)
+{
+   static float input[735 * 2];
+   audio_driver_state_t *st = &audio_driver_st;
+   settings_t *settings = config_get_ptr();
+   unsigned before = failures;
+   int i, last_off = -1, drift = -1;
+   double speed;
+   size_t f;
+   for (f = 0; f < 735; f++)
+      input[2 * f] = input[2 * f + 1] = 0.3f * (float)sin(2 * M_PI * 441 * f / 44100.0);
+   CHECK(up(true, AUDIO_LAYOUT_STEREO, true), "hold stand-up");
+   settings->bools.audio_time_stretch = true;
+   settings->bools.audio_time_stretch_lowpass = false;
+   settings->bools.audio_fastforward_speedup = false;
+   settings->floats.fastforward_ratio = 2.0f;
+   CHECK(audio_driver_transport_configure(settings) && st->inline_transport,
+         "hold inline configuration");
+   if (!st->inline_transport)
+   {
+      settings->bools.audio_time_stretch = false;
+      settings->floats.fastforward_ratio = 0.0f;
+      audio_driver_deinit_internal(true);
+      return;
+   }
+   fake_now   = 1000000;
+   fake_clock = true;
+   runloop_state_get_ptr()->flags = RUNLOOP_FLAG_FASTMOTION;
+   audio_driver_publish_runloop();
+   for (i = 0; i < 64; i++)
+      inline_hold_frame(input);
+   CHECK(!st->inline_transport->bypassed, "inline stretch did not follow a 2x hold");
+   speed = (double)st->avg_flush_delta / st->avg_expected_delta;
+   /* A pause shorter than a gap: measured, it would read as a slower
+    * hold without ever leaving the stretch's range. */
+   if (pause)
+   {
+      audio_driver_pause_fade(true);
+      fake_now += 125000;
+      audio_driver_pause_fade(false);
+   }
+   else if (slow)
+   {
+      /* 0.2x, each interval under a gap, until the estimate leaves
+       * the stretch's range. */
+      for (i = 0; i < 64 && !st->inline_transport->bypassed; i++)
+      {
+         fake_now += (retro_time_t)(735 * 1000000.0 / 44100.0) * 9 / 2;
+         inline_hold_frame(input);
+      }
+      CHECK(st->inline_transport->bypassed,
+            "inline slow spell stayed in the stretch's range");
+   }
+   else
+      fake_now += 3 * 1000000;
+   for (i = 0; i < 64; i++)
+   {
+      inline_hold_frame(input);
+      if (st->inline_transport->bypassed)
+         last_off = i;
+      if (fabs((double)st->avg_flush_delta / st->avg_expected_delta - speed)
+            > speed * 0.05)
+         drift = i;
+   }
+   if (pause)
+   {
+      CHECK(last_off < 0, "inline stretch off %d frames after a pause",
+            last_off + 1);
+      CHECK(drift < 0, "inline pause measured: off the hold's speed until %d",
+            drift);
+   }
+   else if (slow)
+      CHECK(last_off < 8, "inline stretch still off %d frames after a slow spell",
+            last_off + 1);
+   else
+      CHECK(last_off < 0, "inline stretch off %d frames after a stall",
+            last_off + 1);
+   fake_clock = false;
+   runloop_state_get_ptr()->flags = 0;
+   settings->bools.audio_time_stretch = false;
+   settings->floats.fastforward_ratio = 0.0f;
+   audio_driver_publish_runloop();
+   audio_driver_deinit_internal(true);
+   printf("inline fast-forward %s: %u failures\n",
+         pause ? "pause" : slow ? "slow spell" : "stall", failures - before);
+}
+
+/* A core that submits from a thread of its own, without the threaded
+ * pipeline, while the main thread ends frames, releases and holds
+ * fast-forward and pauses. The submitting thread measures the hold's
+ * speed (last_flush_time and the averages), so no other thread may
+ * write them: the frame end, a pause and a stop ask for the reset, and
+ * the submitter carries it out before its next measurement. Judged by
+ * ThreadSanitizer; the checks below are what the reset must still do. */
+static float core_thread_input[735 * 2];
+static retro_atomic_int_t core_thread_frames, core_thread_done;
+static void core_thread_hold(void *data)
+{
+   int i;
+   (void)data;
+   for (i = 0; i < 600; i++)
+   {
+      audio_driver_sample_batch_float(core_thread_input, 735);
+      retro_atomic_fetch_add_int(&core_thread_frames, 1);
+      retro_sleep(0);
+   }
+   retro_atomic_store_release_int(&core_thread_done, 1);
+}
+
+static void inline_core_thread_case(void)
+{
+   audio_driver_state_t *st = &audio_driver_st;
+   settings_t *settings     = config_get_ptr();
+   unsigned before          = failures;
+   unsigned step            = 0;
+   sthread_t *th;
+   size_t f;
+   for (f = 0; f < 735; f++)
+      core_thread_input[2 * f] = core_thread_input[2 * f + 1]
+         = 0.3f * (float)sin(2 * M_PI * 441 * f / 44100.0);
+   CHECK(up(true, AUDIO_LAYOUT_STEREO, true), "core thread stand-up");
+   settings->bools.audio_time_stretch         = true;
+   settings->bools.audio_time_stretch_lowpass = false;
+   settings->bools.audio_fastforward_speedup  = false;
+   settings->floats.fastforward_ratio         = 2.0f;
+   CHECK(audio_driver_transport_configure(settings) && st->inline_transport,
+         "core thread inline configuration");
+   fake_clock = false;
+   runloop_state_get_ptr()->flags = RUNLOOP_FLAG_FASTMOTION;
+   audio_driver_publish_runloop();
+   retro_atomic_int_init(&core_thread_frames, 0);
+   retro_atomic_int_init(&core_thread_done, 0);
+   th = sthread_create(core_thread_hold, NULL);
+   CHECK(th != NULL, "core thread started");
+   while (th && !retro_atomic_load_acquire_int(&core_thread_done))
+   {
+      /* Hold, release, hold, pause and resume, a frame end each. */
+      switch (step++ % 5)
+      {
+         case 0: case 2:
+            runloop_state_get_ptr()->flags = RUNLOOP_FLAG_FASTMOTION;
+            break;
+         case 1:
+            runloop_state_get_ptr()->flags = 0;
+            break;
+         case 3:
+            audio_driver_pause_fade(true);
+            runloop_state_get_ptr()->flags = RUNLOOP_FLAG_FASTMOTION
+               | RUNLOOP_FLAG_PAUSED;
+            break;
+         case 4:
+            runloop_state_get_ptr()->flags = RUNLOOP_FLAG_FASTMOTION;
+            audio_driver_pause_fade(false);
+            break;
+      }
+      audio_driver_frame_end();
+      retro_sleep(1);
+   }
+   if (th)
+      sthread_join(th);
+   CHECK(retro_atomic_load_acquire_int(&core_thread_frames) == 600,
+         "the core thread's audio was all taken");
+   CHECK(step > 5, "the main thread ended frames beside it");
+   runloop_state_get_ptr()->flags = 0;
+   settings->bools.audio_time_stretch = false;
+   settings->floats.fastforward_ratio = 0.0f;
+   audio_driver_publish_runloop();
+   audio_driver_deinit_internal(true);
+   printf("inline core thread: %u failures\n", failures - before);
+}
+
 #include "inline_wide.h"
 #include "producer_spans.h"
 
@@ -2653,6 +3002,10 @@ int main(void)
    RUN("inlineformat", inline_format_cases());
    RUN("callbackcontinuity", inline_callback_cases());
    RUN("inline", inline_transport_cases());
+   RUN("inlinehold", inline_hold_gap_case(true, false));
+   RUN("inlinehold", inline_hold_gap_case(false, false));
+   RUN("inlinehold", inline_hold_gap_case(false, true));
+   RUN("inlinethread", inline_core_thread_case());
    RUN("canonicalreserve", canonical_reserve_cases());
    RUN("transportowner", transport_owner_cases());
    RUN("transportdiscard", transport_discard_cases());
@@ -2662,6 +3015,8 @@ int main(void)
    RUN("transportscheduler", transport_scheduler_cases());
    RUN("nativerender", native_render_cases());
    RUN("srcreset", resampler_discontinuity_cases());
+   RUN("ratechange", rate_change_extras_case(true));
+   RUN("ratechange", rate_change_extras_case(false));
    RUN("suspended", suspended_multichannel_case(true, true));
    RUN("suspended", suspended_multichannel_case(false, true));
    RUN("suspended", suspended_multichannel_case(true, false));
@@ -2727,6 +3082,7 @@ int main(void)
    RUN("fold",     large_inline_batch_case(false, true));
    audio_driver_deinit_internal(true);
    owned_free();
+   table_parents_free();
    free(cap); free(rec_cap);
    if (failures) { printf("%u failure(s)\n", failures); return 1; }
    printf("discrete multi-channel: a core's channels reach their speakers as they are\n");

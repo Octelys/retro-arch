@@ -274,7 +274,7 @@ static void x11_set_window_pid(Display *dpy, Window win)
         RARCH_WARN("[X11] Failed to get hostname.\n");
     else
         XChangeProperty(dpy, win, XA_WM_CLIENT_MACHINE, XA_STRING, 8,
-            PropModeReplace, (unsigned char *)hostname, strlen(hostname));
+            PropModeReplace, (unsigned char *)hostname, (int)strlen(hostname));
     free(hostname);
 }
 
@@ -284,10 +284,90 @@ void x11_set_window_attr(Display *dpy, Window win)
    x11_set_window_pid(dpy, win);
 }
 
-#ifdef HAVE_XSCRNSAVER
-#include <X11/extensions/scrnsaver.h>
+#if defined(HAVE_XSCRNSAVER) && defined(HAVE_DYLIB)
+#include <dynamic/dylib.h>
+
+typedef Bool (*xss_query_extension_t)(Display*, int*, int*);
+typedef Status (*xss_query_version_t)(Display*, int*, int*);
+typedef void (*xss_suspend_t)(Display*, Bool);
+
+typedef struct
+{
+   dylib_t lib;
+   xss_query_extension_t query_extension;
+   xss_query_version_t query_version;
+   xss_suspend_t suspend;
+} xss_t;
+
+/* libXss is loaded on first use, so the binary starts where it is
+ * absent. A threaded video driver asks from its own thread; whoever
+ * loads first publishes. */
+#ifdef RETRO_ATOMIC_HAS_PTR
+static retro_atomic_ptr_t xss_published;
+#else
+static xss_t *xss_published;
+#endif
+
+#define XSS_SYM(field, name) \
+   if (!(sym = dylib_proc(t->lib, name))) \
+      goto fail; \
+   memcpy(&t->field, &sym, sizeof(sym))
+
+static xss_t *xss_load(void)
+{
+   function_t sym;
+   xss_t *t = (xss_t*)calloc(1, sizeof(*t));
+
+   if (!t)
+      return NULL;
+   t->lib = dylib_load("libXss.so.1");
+#ifdef __OpenBSD__
+   /* OpenBSD's sonames carry its own version numbers. */
+   if (!t->lib)
+      t->lib = dylib_load("libXss.so");
+#endif
+   if (!t->lib)
+   {
+      free(t);
+      return NULL;
+   }
+
+   XSS_SYM(query_extension, "XScreenSaverQueryExtension");
+   XSS_SYM(query_version,   "XScreenSaverQueryVersion");
+   XSS_SYM(suspend,         "XScreenSaverSuspend");
+   return t;
+
+fail:
+   dylib_close(t->lib);
+   free(t);
+   return NULL;
+}
+
+static const xss_t *xss_get(void)
+{
+   xss_t *t;
+#ifdef RETRO_ATOMIC_HAS_PTR
+   if ((t = (xss_t*)retro_atomic_load_acquire_ptr(&xss_published)))
+      return t;
+   if (!(t = xss_load()))
+      return NULL;
+   if (!retro_atomic_cas_ptr(&xss_published, NULL, t))
+   {
+      dylib_close(t->lib);
+      free(t);
+      return (const xss_t*)retro_atomic_load_acquire_ptr(&xss_published);
+   }
+   return t;
+#else
+   if (!xss_published)
+      xss_published = xss_load();
+   return xss_published;
+#endif
+}
+
 static bool xss_screensaver_inhibit(Display *dpy, bool enable)
 {
+    const xss_t *xss;
     int dummy, min, maj;
     /* Guard against being called with a NULL Display.  This
      * happens with the SDL2 video driver under HAVE_X11 +
@@ -302,14 +382,14 @@ static bool xss_screensaver_inhibit(Display *dpy, bool enable)
      * offset off the NULL display pointer.  Surfaced by the
      * ASan+UBSan CI workflow's headless SDL2 smoke (b9777c8 +
      * d967813), where dbus-1 isn't apt-installed but libXss is. */
-    if (!dpy)
+    if (!dpy || !(xss = xss_get()))
        return false;
-    if (       !XScreenSaverQueryExtension(dpy, &dummy, &dummy)
-            || !XScreenSaverQueryVersion(dpy, &maj, &min)
+    if (       !xss->query_extension(dpy, &dummy, &dummy)
+            || !xss->query_version(dpy, &maj, &min)
             || (maj < 1)
             || (maj == 1 && min < 1))
             return false;
-    XScreenSaverSuspend(dpy, enable);
+    xss->suspend(dpy, enable);
     XResetScreenSaver(dpy);
     return true;
 }
@@ -456,7 +536,7 @@ static void xdg_screensaver_inhibit(Window wnd)
       if (title_len == 0)
          title_len = strlcpy_lit(title, " ", sizeof(title));
       XChangeProperty(g_x11_dpy, g_x11_win, XA_WM_NAME, XA_STRING,
-            8, PropModeReplace, (const unsigned char*) title, title_len);
+            8, PropModeReplace, (const unsigned char*) title, (int)title_len);
 
 #ifdef X_HAVE_UTF8_STRING
       /* Also set the EWMH _NET_WM_NAME (UTF8_STRING). Without this, a
@@ -476,11 +556,11 @@ static void xdg_screensaver_inhibit(Window wnd)
             if (XA_NET_WM_NAME)
                XChangeProperty(g_x11_dpy, g_x11_win, XA_NET_WM_NAME,
                      XA_UTF8_STRING, 8, PropModeReplace,
-                     (const unsigned char*)title, title_len);
+                     (const unsigned char*)title, (int)title_len);
             if (XA_NET_WM_ICON_NAME)
                XChangeProperty(g_x11_dpy, g_x11_win, XA_NET_WM_ICON_NAME,
                      XA_UTF8_STRING, 8, PropModeReplace,
-                     (const unsigned char*)title, title_len);
+                     (const unsigned char*)title, (int)title_len);
          }
       }
 #endif
@@ -808,7 +888,7 @@ static void x11_handle_key_event(unsigned keycode, XEvent *event,
           * which makes mbrtowc a bit impractical.
           *
           * Use custom UTF8 -> UTF-32 conversion. */
-         num = utf8_conv_utf32(chars, ARRAY_SIZE(chars), keybuf, num);
+         num = (int)utf8_conv_utf32(chars, ARRAY_SIZE(chars), keybuf, num);
 #else
          num = XLookupString(&event->xkey, keybuf,
                sizeof(keybuf), &keysym, NULL); /* ASCII only. */
@@ -1250,7 +1330,7 @@ void x11_update_title(void *data)
        * preserved as-is to avoid changing long-standing behaviour for
        * old clients, which is exactly what they receive today. */
       XChangeProperty(g_x11_dpy, g_x11_win, XA_WM_NAME, XA_STRING,
-            8, PropModeReplace, (const unsigned char*)title, _len);
+            8, PropModeReplace, (const unsigned char*)title, (int)_len);
 
 #ifdef X_HAVE_UTF8_STRING
       /* EWMH properties. Window managers that implement EWMH prefer
@@ -1269,11 +1349,11 @@ void x11_update_title(void *data)
             if (XA_NET_WM_NAME)
                XChangeProperty(g_x11_dpy, g_x11_win, XA_NET_WM_NAME,
                      XA_UTF8_STRING, 8, PropModeReplace,
-                     (const unsigned char*)title, _len);
+                     (const unsigned char*)title, (int)_len);
             if (XA_NET_WM_ICON_NAME)
                XChangeProperty(g_x11_dpy, g_x11_win, XA_NET_WM_ICON_NAME,
                      XA_UTF8_STRING, 8, PropModeReplace,
-                     (const unsigned char*)title, _len);
+                     (const unsigned char*)title, (int)_len);
          }
       }
 #endif

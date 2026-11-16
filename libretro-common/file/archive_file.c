@@ -182,6 +182,7 @@ static int file_archive_parse_file_init(file_archive_transfer_t *state,
    char path[PATH_MAX_LENGTH];
    char *last                 = NULL;
 
+   state->torrentzip = false;
    strlcpy(path, file, sizeof(path));
 
    if ((last = (char*)path_get_archive_delim(path)))
@@ -598,52 +599,14 @@ struct string_list *file_archive_get_file_list(const char *path,
 
 
 /* Copies a complete temporary file over a target it could not be
- * renamed onto, and removes it.  Only for filesystems that refuse the
- * rename; an atomic replacement is no longer possible there, which is
- * what writing the member in place always meant. */
+ * renamed onto, with the platform's copy primitive where there is one.
+ * Only for filesystems that refuse the rename; an atomic replacement
+ * is no longer possible there, which is what writing the member in
+ * place always meant. */
 static bool file_archive_pending_copy_in_place(const char *temp_path,
       const char *path)
 {
-   bool ok      = true;
-   uint8_t *buf;
-   RFILE *in;
-   RFILE *out;
-
-   if (!(buf = (uint8_t*)malloc(65536)))
-      return false;
-   if (!(in = filestream_open(temp_path, RETRO_VFS_FILE_ACCESS_READ,
-               RETRO_VFS_FILE_ACCESS_HINT_NONE)))
-   {
-      free(buf);
-      return false;
-   }
-   if (!(out = filestream_open(path, RETRO_VFS_FILE_ACCESS_WRITE,
-               RETRO_VFS_FILE_ACCESS_HINT_NONE)))
-   {
-      filestream_close(in);
-      free(buf);
-      return false;
-   }
-
-   for (;;)
-   {
-      int64_t rd = filestream_read(in, buf, 65536);
-      if (rd < 0)
-         ok = false;
-      if (rd <= 0)
-         break;
-      if (filestream_write(out, buf, rd) != rd)
-      {
-         ok = false;
-         break;
-      }
-   }
-
-   filestream_close(in);
-   if (filestream_close(out) != 0)
-      ok = false;
-   free(buf);
-   return ok;
+   return filestream_copy(temp_path, path) == 0;
 }
 
 /* Puts a completed member in place.  Written beside the file and
@@ -1016,6 +979,13 @@ uint32_t file_archive_get_file_crc32(const char *path)
  **/
 uint32_t file_archive_get_file_crc32_and_size(const char *path, uint64_t *size)
 {
+   return file_archive_get_file_crc32_size_and_ext(path, size, NULL, 0,
+         NULL);
+}
+
+uint32_t file_archive_get_file_crc32_size_and_ext(const char *path,
+      uint64_t *size, char *ext, size_t len, unsigned *entries)
+{
    file_archive_transfer_t state;
    struct archive_extract_userdata userdata        = {0};
    bool returnerr                                  = false;
@@ -1080,6 +1050,8 @@ uint32_t file_archive_get_file_crc32_and_size(const char *path, uint64_t *size)
          break;
    }
 
+   if (entries)
+      *entries = found ? state.step_total : 0;
    file_archive_parse_file_iterate_stop(&state);
 
    /* Report nothing rather than whichever entry the walk stopped on:
@@ -1088,9 +1060,13 @@ uint32_t file_archive_get_file_crc32_and_size(const char *path, uint64_t *size)
    if (!found)
    {
       *size = 0;
+      if (ext && len)
+         *ext = '\0';
       return 0;
    }
 
+   if (ext && len)
+      strlcpy(ext, path_get_extension(userdata.current_file_path), len);
    *size = userdata.size;
    return userdata.crc;
 }

@@ -13,6 +13,8 @@
  *  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdlib.h>
+
 #include <compat/strl.h>
 #include <retro_environment.h>
 #include <retro_atomic.h>
@@ -2517,6 +2519,38 @@ DXGI_FORMAT glslang_format_to_dxgi(glslang_format fmt)
    return DXGI_FORMAT_UNKNOWN;
 }
 
+bool dxgi_chain_flips_fullscreen(DXGISwapChain swap_chain)
+{
+   UINT support        = 0;
+   DXGIOutput output   = NULL;
+   DXGIOutput6 output6 = NULL;
+   if (     !swap_chain
+         || FAILED(DXGIGetContainingOutput(swap_chain, &output))
+         || !output)
+      return false;
+#ifdef __cplusplus
+   if (SUCCEEDED(output->QueryInterface(
+               libretro_IID_IDXGIOutput6, (void**)&output6)))
+   {
+      if (FAILED(output6->CheckHardwareCompositionSupport(&support)))
+         support = 0;
+      output6->Release();
+   }
+   output->Release();
+#else
+   if (SUCCEEDED(output->lpVtbl->QueryInterface(output,
+               &libretro_IID_IDXGIOutput6, (void**)&output6)))
+   {
+      if (FAILED(output6->lpVtbl->CheckHardwareCompositionSupport(
+                  output6, &support)))
+         support = 0;
+      Release(output6);
+   }
+   Release(output);
+#endif
+   return (support & DXGI_HARDWARE_COMPOSITION_SUPPORT_FLAG_FULLSCREEN) != 0;
+}
+
 #ifdef HAVE_DXGI_HDR
 typedef struct display_chromaticities
 {
@@ -2593,6 +2627,16 @@ bool dxgi_check_display_hdr_support(DXGIFactory1 factory, HWND hwnd)
    UINT adapter_idx          = 0;
    bool supported            = false;
    float best_intersect_area = -1;
+
+#ifndef __WINRT__
+   /* RETROARCH_DXGI_HDR=1 takes the display as HDR-capable, so the HDR
+    * path can be drawn and checked where no output reports it (Wine) */
+   {
+      const char *want = getenv("RETROARCH_DXGI_HDR");
+      if (want && want[0] == '1')
+         return true;
+   }
+#endif
 
 #ifdef __WINRT__
 #ifdef __cplusplus
@@ -3010,45 +3054,7 @@ void dxgi_set_hdr_metadata(
 #include <math.h>
 #include <stdint.h>
 #include <formats/rpng.h>
-
-/* IEEE 754 binary16 -> binary32.  Used to decode FP16 scRGB samples. */
-static INLINE float dxgi_half_to_float(uint16_t h)
-{
-   uint32_t sign = (uint32_t)(h >> 15) & 0x1u;
-   uint32_t exp  = (uint32_t)(h >> 10) & 0x1Fu;
-   uint32_t mant = (uint32_t) h        & 0x3FFu;
-   uint32_t f;
-   union { uint32_t u; float f; } u;
-
-   if (exp == 0)
-   {
-      if (mant == 0)
-         f = sign << 31;                     /* signed zero */
-      else
-      {
-         /* Subnormal: normalize. */
-         while (!(mant & 0x400u))
-         {
-            mant <<= 1;
-            exp   -= 1;     /* exp starts at 0, goes negative */
-         }
-         exp  += 1;
-         mant &= ~0x400u;
-         f     = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
-      }
-   }
-   else if (exp == 0x1F)
-   {
-      /* Inf / NaN: propagate to float32 Inf/NaN with the same mantissa
-       * low bits (clamped away later, so exact bit-pattern doesn't matter). */
-      f = (sign << 31) | (0xFFu << 23) | (mant << 13);
-   }
-   else
-      f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
-
-   u.u = f;
-   return u.f;
-}
+#include <math/float16.h>
 
 /* ST.2084 (PQ) EOTF.  Input is the non-linear PQ code value in [0,1];
  * output is linear light normalized so 1.0 == 10000 nits. */
@@ -3210,9 +3216,9 @@ bool dxgi_hdr_readback_to_bgr24(
          const uint16_t* src = (const uint16_t*)src_row + src_x * 4;
          for (x = 0; x < width; x++)
          {
-            float r = dxgi_half_to_float(src[4 * x + 0]) * inv_scale;
-            float g = dxgi_half_to_float(src[4 * x + 1]) * inv_scale;
-            float b = dxgi_half_to_float(src[4 * x + 2]) * inv_scale;
+            float r = retro_half_to_float(src[4 * x + 0]) * inv_scale;
+            float g = retro_half_to_float(src[4 * x + 1]) * inv_scale;
+            float b = retro_half_to_float(src[4 * x + 2]) * inv_scale;
             /* scRGB carries legal negative values for out-of-gamut
              * colours; clamping in LinearToSRGB handles them. */
             dst[3 * x + 0] = dxgi_float_to_unorm8(dxgi_linear_to_srgb(b));
@@ -3309,9 +3315,9 @@ bool dxgi_hdr_readback_to_rgb16(
              * scale to absolute nits, PQ-encode into 16 bit.  Extended
              * range (negatives, >10000 nits) clamps -- unavoidable for
              * a UNORM PNG. */
-            float r = dxgi_half_to_float(src[x * 4 + 0]);
-            float g = dxgi_half_to_float(src[x * 4 + 1]);
-            float b = dxgi_half_to_float(src[x * 4 + 2]);
+            float r = retro_half_to_float(src[x * 4 + 0]);
+            float g = retro_half_to_float(src[x * 4 + 1]);
+            float b = retro_half_to_float(src[x * 4 + 2]);
             float lvl;
             float nr = r * (80.0f / 10000.0f);
             float ng = g * (80.0f / 10000.0f);

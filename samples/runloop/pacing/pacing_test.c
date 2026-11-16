@@ -197,6 +197,97 @@ static void test_driver_pacing(void)
           "scanline sync, never as a clock\n");
 }
 
+/* Driver Pacing on, but nothing that could take it - gl, glcore, a GPU
+ * without the extension: the timer holds the loop where the backend
+ * would have, else vsync off and audio sync off run it unthrottled. */
+static void test_driver_fallback(void)
+{
+   runloop_pace_facts_t m = PACE_FACT_FOCUSED | PACE_FACT_CORE_RAN
+      | PACE_FACT_DRIVER_PACING_MISSING | PACE_FACT_PRESENTABLE;
+
+   DRIVER_ROW(m, RUNLOOP_PACE_TIMER,
+         "no backend, nothing else: the timer at the content's period");
+   DRIVER_ROW(m | PACE_FACT_WRAPPER, RUNLOOP_PACE_TIMER,
+         "no backend, threaded, no display pacing: the timer");
+   DRIVER_ROW(m & ~PACE_FACT_DRIVER_PACING_MISSING, RUNLOOP_PACE_NONE,
+         "Driver Pacing off: unthrottled, as before");
+   DRIVER_ROW(m | PACE_FACT_VSYNC, RUNLOOP_PACE_VSYNC,
+         "no backend, vsync: VSync alone");
+   DRIVER_ROW(m | PACE_FACT_AUDIO_HOLDING, RUNLOOP_PACE_AUDIO,
+         "no backend, audio sync: Audio alone");
+   DRIVER_ROW(m | PACE_FACT_WRAPPER | PACE_FACT_DISPLAY_PACING,
+         RUNLOOP_PACE_DISPLAY,
+         "no backend, display pacing: the hold alone");
+   DRIVER_ROW(m | PACE_FACT_RATE_CONTROL, RUNLOOP_PACE_TIMER,
+         "no backend, rate control: the gap limiter");
+   DRIVER_ROW(m | PACE_FACT_MENU_ALIVE, RUNLOOP_PACE_NONE,
+         "no backend, menu up: the menu's own pacing");
+   DRIVER_ROW(m | PACE_FACT_FASTMOTION | PACE_FACT_NONBLOCKING,
+         RUNLOOP_PACE_NONE,
+         "no backend, fast-forward: unthrottled");
+   DRIVER_ROW(m & ~PACE_FACT_FOCUSED, RUNLOOP_PACE_NONE,
+         "no backend, unfocused: as with a backend");
+
+   printf("   driver pacing without a backend: the timer holds the "
+          "content's period exactly where a backend would have\n");
+}
+
+/* Skip Duplicate Frames: a repeat left unpresented reaches no present,
+ * so VSync and the threaded hold cannot keep the loop on it - with
+ * either alone, 30 fps content on a 60 Hz display ran two core frames
+ * per refresh, double speed. The timer holds the content's period
+ * wherever nothing that blocks without a present (audio, a scanline)
+ * does, and the driver's release, which waits on a present, stands
+ * aside. */
+static void test_dupe_skip(void)
+{
+   runloop_pace_facts_t d = PACE_FACT_FOCUSED | PACE_FACT_CORE_RAN
+      | PACE_FACT_PRESENTABLE | PACE_FACT_DUPE_SKIP;
+
+   DRIVER_ROW(d | PACE_FACT_VSYNC,
+         RUNLOOP_PACE_VSYNC | RUNLOOP_PACE_TIMER,
+         "dupe skip, vsync: the timer, vsync cannot hold a skipped repeat");
+   DRIVER_ROW((d | PACE_FACT_VSYNC) & ~PACE_FACT_DUPE_SKIP,
+         RUNLOOP_PACE_VSYNC,
+         "no repeats skipped: VSync alone, as before");
+   DRIVER_ROW(d | PACE_FACT_WRAPPER | PACE_FACT_DISPLAY_PACING,
+         RUNLOOP_PACE_DISPLAY | RUNLOOP_PACE_TIMER,
+         "dupe skip, display pacing: the timer, the hold needs a push");
+   DRIVER_ROW(d, RUNLOOP_PACE_TIMER,
+         "dupe skip, nothing else: the timer, not unthrottled");
+   DRIVER_ROW(d | PACE_FACT_VSYNC | PACE_FACT_AUDIO_HOLDING,
+         RUNLOOP_PACE_VSYNC | RUNLOOP_PACE_AUDIO,
+         "dupe skip, audio sync: audio alone, never two clocks");
+   DRIVER_ROW(d | PACE_FACT_SCANLINE_SYNC | PACE_FACT_SCANLINE_LOCKED,
+         RUNLOOP_PACE_SCANLINE,
+         "dupe skip, scanline sync: the scanline alone");
+   DRIVER_ROW(d | PACE_FACT_VSYNC | PACE_FACT_VRR | PACE_FACT_FRAME_LIMIT,
+         RUNLOOP_PACE_VSYNC | RUNLOOP_PACE_TIMER,
+         "dupe skip, VRR: its own timer, once");
+   DRIVER_ROW(d | PACE_FACT_VSYNC | PACE_FACT_DRIVER_PACING,
+         RUNLOOP_PACE_VSYNC | RUNLOOP_PACE_TIMER,
+         "dupe skip, driver pacing: no release, which waits on a present");
+   DRIVER_ROW(d | PACE_FACT_DRIVER_PACING_MISSING,
+         RUNLOOP_PACE_TIMER,
+         "dupe skip, Driver Pacing without a backend: one timer");
+   DRIVER_ROW(d | PACE_FACT_VSYNC | PACE_FACT_FASTMOTION
+            | PACE_FACT_NONBLOCKING,
+         RUNLOOP_PACE_NONE,
+         "dupe skip, fast-forward: unthrottled");
+   DRIVER_ROW((d | PACE_FACT_VSYNC) & ~PACE_FACT_PRESENTABLE,
+         RUNLOOP_PACE_VSYNC | RUNLOOP_PACE_TIMER,
+         "dupe skip, no window, vsync: the timer, nothing presents");
+   DRIVER_ROW(d & ~PACE_FACT_PRESENTABLE,
+         RUNLOOP_PACE_NOWINDOW,
+         "dupe skip, no window: the no-window wait alone");
+   check(runloop_pace_dupe_skip_engages(d, RUNLOOP_PACE_NOWINDOW) == false,
+         "dupe skip: the no-window wait is not paced twice");
+
+   printf("   dupe skip: the timer holds the content's period wherever "
+          "only the display would have, never beside audio, a scanline "
+          "or another timer, and the driver's release stands aside\n");
+}
+
 /* The interval each owned release hands the driver, from the whole
  * decision: a release with nothing else holding the loop keeps the
  * content's rate rather than none. */
@@ -445,6 +536,93 @@ static void test_margin(void)
          "240 Hz: the margin follows the timer to the floor");
    check(runloop_pace_margin_update(0, 100000, 555) == 555,
          "a period under the floor caps the margin at the period");
+}
+
+/* --- play time ------------------------------------------------------- */
+
+/* Play time over @n ticks @since apart, each @frame of content time. */
+static retro_time_t play_time(retro_time_t frame, retro_time_t since,
+      unsigned n, retro_time_t *credit)
+{
+   retro_time_t total = 0;
+   unsigned i;
+   for (i = 0; i < n; i++)
+      total += runloop_core_runtime_step(frame, since, credit);
+   return total;
+}
+
+static void test_play_time(void)
+{
+   const retro_time_t frame = 16667;
+   retro_time_t credit, total;
+   unsigned i;
+   bool each;
+
+   credit = 0;
+   each   = true;
+   for (i = 0; i < 600; i++)
+      if (runloop_core_runtime_step(frame, frame, &credit) != frame)
+         each = false;
+   check(each, "even cadence: every tick counts a frame");
+
+   /* A core free-running at 7x, nothing holding the loop. */
+   credit = 0;
+   total  = play_time(frame, frame / 7, 7000, &credit);
+   check(total == 7000 * (frame / 7), "free-run at 7x counts wall time");
+
+   credit = 0;
+   total  = play_time(frame, frame / 4, 4000, &credit);
+   check(total == 4000 * (frame / 4), "fast-forward at 4x counts wall time");
+
+   /* Slow motion counts the slowed frame when something holds the
+    * loop to it, and only wall time when nothing does. */
+   credit = 0;
+   total  = play_time(3 * frame, 3 * frame, 600, &credit);
+   check(total == 600 * 3 * frame,
+         "slow motion held to 3x counts three frames a tick");
+   credit = 0;
+   total  = play_time(3 * frame, frame, 600, &credit);
+   check(total == 600 * frame,
+         "slow motion the loop does not slow counts wall time");
+
+   /* Audio sync running two frames per two-frame interval: a per-tick
+    * min(frame, since) would count about half of it. */
+   credit = 0;
+   total  = 0;
+   for (i = 0; i < 600; i++)
+   {
+      total += runloop_core_runtime_step(frame, 2 * frame, &credit);
+      total += runloop_core_runtime_step(frame, 0, &credit);
+   }
+   check(total == 1200 * frame, "bursts of two frames count in full");
+
+   credit = 0;
+   total  = play_time(frame, 2 * frame, 100, &credit);
+   total += play_time(frame, 0, 100, &credit);
+   check(total == 100 * frame + 3 * frame,
+         "wall time banked over many ticks stops at four frames");
+
+   /* A pause, a menu or a stall: four frames at most, then the
+    * cadence counts as before. */
+   credit = 0;
+   total  = runloop_core_runtime_step(frame, 10000000, &credit);
+   total += play_time(frame, 0, 10, &credit);
+   check(total == 4 * frame, "a 10 s gap counts four frames");
+   check(play_time(frame, frame, 10, &credit) == 10 * frame,
+         "even cadence after a gap counts a frame a tick");
+
+   credit = 0;
+   check(runloop_core_runtime_step(frame, -1000000, &credit) == 0
+         && credit == 0, "a clock that went backwards counts nothing");
+   check(runloop_core_runtime_step(frame, frame, &credit) == frame,
+         "and leaves the next tick a frame");
+
+   credit = 0;
+   check(play_time(0, frame, 10, &credit) == 0 && credit == 0,
+         "a core with no frame rate counts nothing");
+
+   printf("   play time: never ahead of wall time, uneven cadence counted "
+          "in full\n");
 }
 
 /* The limiter as runloop_iterate() runs it, over a sleep that lands
@@ -903,6 +1081,7 @@ int main(void)
    test_sample_filter();
    test_schedule();
    test_margin();
+   test_play_time();
    test_fastforward_ratios();
    test_ff_frameskip();
    test_vsync_blocks();
@@ -911,6 +1090,8 @@ int main(void)
    test_menu_table();
    test_driver_pacing();
    test_driver_interval();
+   test_driver_fallback();
+   test_dupe_skip();
 
    if (failures)
    {

@@ -15,9 +15,20 @@ bool menu_media_queue_step(menu_media_queue_t *queue,
  * background browser's, and keeps its own OK action. */
 bool menu_media_selected_is_viewable(struct menu_state *menu_st);
 
+/* The image of the selected image history row, or NULL */
+const char *menu_media_selected_history_image(struct menu_state *menu_st);
+
+/* Whether the selected row is an image history entry, its file present,
+ * that OK opens in the viewer rather than through its Run action. */
+bool menu_media_selected_in_history(struct menu_state *menu_st);
+
 /* Main-thread image/movie activation, independent of playlist thumbnail settings.
- * Retains a matching preview and removes a duplicate/obsolete second one. */
+ * Retains a matching preview and removes a duplicate/obsolete second one.
+ * @title (@title_len bytes) is the viewer's title: it is rewritten for the
+ * file opened, so the title follows every step to another file - the OK
+ * that opens the viewer, Up/Down/Left/Right, and continuous playback. */
 bool menu_media_open_selected_file(struct menu_state *menu_st,
-      gfx_thumbnail_t *primary, gfx_thumbnail_t *secondary);
+      gfx_thumbnail_t *primary, gfx_thumbnail_t *secondary,
+      char *title, size_t title_len);
 RETRO_END_DECLS
 #endif

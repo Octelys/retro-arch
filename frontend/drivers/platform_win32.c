@@ -58,6 +58,9 @@
 #include "../../gfx/common/win32_common.h"
 
 #include "platform_win32.h"
+#ifdef HAVE_NVDA
+#include "nvda_controller_win32.h"
+#endif
 #ifdef HAVE_THREADS
 #include "../thread_elevation.h"
 #endif
@@ -110,14 +113,12 @@ static char win32_cpu_model_name[64] = {0};
  * it early seems to cause issues on some systems.
  */
 static dylib_t dwm_lib;
-static dylib_t nvda_lib;
 #endif
 
-/* Dynamic loading for Non-Visual Desktop Access support */
-unsigned long (__stdcall *nvdaController_testIfRunning_func)(void);
-unsigned long (__stdcall *nvdaController_cancelSpeech_func)(void);
-unsigned long (__stdcall *nvdaController_brailleMessage_func)(wchar_t*);
-unsigned long (__stdcall *nvdaController_speakText_func)(wchar_t*);
+#ifdef HAVE_NVDA
+/* Bound to NVDA's controller endpoint */
+static bool nvda_bound;
+#endif
 
 #if defined(HAVE_LANGEXTRA) && !defined(_XBOX)
 #if (defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0500) || !defined(_MSC_VER)
@@ -1141,30 +1142,16 @@ static void frontend_win32_init(void *data)
 
 
 #ifdef HAVE_NVDA
+/* Runs on each accessibility speak event: binds once, and where there
+ * is no NVDA to bind to, PowerShell speaks instead */
 static void init_nvda(void)
 {
-#ifdef HAVE_DYLIB
-   if (     (g_plat_win32_flags & PLAT_WIN32_FLAG_USE_NVDA)
-         && !nvda_lib)
-   {
-      if ((nvda_lib = dylib_load("nvdaControllerClient64.dll")))
-      {
-         nvdaController_testIfRunning_func  = (unsigned long (__stdcall*)(void))dylib_proc(nvda_lib, "nvdaController_testIfRunning");
-         nvdaController_cancelSpeech_func   = (unsigned long(__stdcall *)(void))dylib_proc(nvda_lib, "nvdaController_cancelSpeech");
-         nvdaController_brailleMessage_func = (unsigned long(__stdcall *)(wchar_t*))dylib_proc(nvda_lib, "nvdaController_brailleMessage");
-         nvdaController_speakText_func      = (unsigned long(__stdcall *)(wchar_t*))dylib_proc(nvda_lib, "nvdaController_speakText");
-         return;
-      }
-   }
-#endif
-   /* The above code is executed on each accessibility speak event, so
-    * we should only revert to powershell if nvda_lib wasn't loaded previously,
-    * and we weren't able to load it on this call, or we don't HAVE_DYLIB */
-   if ((g_plat_win32_flags & PLAT_WIN32_FLAG_USE_NVDA) && !nvda_lib)
-   {
-      g_plat_win32_flags &= ~PLAT_WIN32_FLAG_USE_NVDA;
-      g_plat_win32_flags |=  PLAT_WIN32_FLAG_USE_POWERSHELL;
-   }
+   if (!(g_plat_win32_flags & PLAT_WIN32_FLAG_USE_NVDA) || nvda_bound)
+      return;
+   if ((nvda_bound = nvda_controller_init()))
+      return;
+   g_plat_win32_flags &= ~PLAT_WIN32_FLAG_USE_NVDA;
+   g_plat_win32_flags |=  PLAT_WIN32_FLAG_USE_POWERSHELL;
 }
 #endif
 
@@ -1367,7 +1354,11 @@ static void frontend_win32_env_get(int *argc, char *argv[],
 #define RARCH_QUICK_EDIT_MODE 0x0040
 #define RARCH_EXTENDED_FLAGS  0x0080
 
+#define RARCH_ATTACH_PARENT_PROCESS ((DWORD)-1)
+
 typedef HWND (WINAPI *get_console_window_t)(void);
+/* Windows XP on; an SDK targeting older Windows does not declare it */
+typedef BOOL (WINAPI *attach_console_t)(DWORD);
 
 static void frontend_win32_attach_console(void)
 {
@@ -1400,11 +1391,15 @@ static void frontend_win32_attach_console(void)
    if (need_stdout || need_stderr)
    {
       HWND fg = GetForegroundWindow();
-      if (!AttachConsole(ATTACH_PARENT_PROCESS) && AllocConsole())
+      HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+      attach_console_t attach = kernel32
+         ? (attach_console_t)GetProcAddress(kernel32, "AttachConsole")
+         : NULL;
+      if (     !(attach && attach(RARCH_ATTACH_PARENT_PROCESS))
+            && AllocConsole())
       {
          /* A selection in the window would block every log write */
          DWORD mode, pid = 0;
-         HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
          get_console_window_t get_window = kernel32
             ? (get_console_window_t)GetProcAddress(kernel32,
                   "GetConsoleWindow")
@@ -1687,12 +1682,12 @@ static bool create_win32_process(char* cmd, const char * input)
       DWORD dummy;
       HANDLE wr;
       size_t input_len = strlen(input);
-      if (!CreatePipe(&rd, &wr, NULL, input_len))
+      if (!CreatePipe(&rd, &wr, NULL, (DWORD)input_len))
          return false;
 
       SetHandleInformation(rd, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
 
-      WriteFile(wr, input, input_len, &dummy, NULL);
+      WriteFile(wr, input, (DWORD)input_len, &dummy, NULL);
       CloseHandle(wr);
 
       si.dwFlags    |= STARTF_USESTDHANDLES;
@@ -1727,9 +1722,7 @@ static bool is_narrator_running_windows(void)
 #ifdef HAVE_NVDA
    else if (g_plat_win32_flags & PLAT_WIN32_FLAG_USE_NVDA)
    {
-      long res = nvdaController_testIfRunning_func();
-
-      if (res != 0)
+      if (nvda_controller_test_if_running() != 0)
       {
          /* The running nvda service wasn't found, so revert
             back to the powershell method
@@ -1797,9 +1790,8 @@ static bool accessibility_speak_windows(int speed,
    else if (g_plat_win32_flags & PLAT_WIN32_FLAG_USE_NVDA)
    {
       wchar_t        *wc = utf8_to_utf16_string_alloc(speak_text);
-      long res           = nvdaController_testIfRunning_func();
 
-      if (!wc || res != 0)
+      if (!wc || nvda_controller_test_if_running() != 0)
       {
          RARCH_ERR("Error communicating with NVDA.\n");
          /* Fallback on powershell immediately and retry */
@@ -1810,12 +1802,12 @@ static bool accessibility_speak_windows(int speed,
          return accessibility_speak_windows(speed, speak_text, priority);
       }
 
-      nvdaController_cancelSpeech_func();
+      nvda_controller_cancel_speech();
 
       if (g_plat_win32_flags & PLAT_WIN32_FLAG_USE_NVDA_BRAILLE)
-         nvdaController_brailleMessage_func(wc);
+         nvda_controller_braille_message(wc);
       else
-         nvdaController_speakText_func(wc);
+         nvda_controller_speak_text(wc);
       free(wc);
    }
 #endif

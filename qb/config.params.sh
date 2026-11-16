@@ -67,6 +67,8 @@ HAVE_RETROARCH_PLAYLIST_MANAGER=auto # iOS/tvOS + macOS 10.11+ playlist helper (
 
 # Networking and online services
 HAVE_NETWORKING=auto       # Networking features (recommended)
+HAVE_RTMP=auto             # Built-in RTMP/RTMPS publishing (requires networking and crypto)
+HAVE_RFLV=auto             # Built-in FLV muxing for native streaming
 HAVE_IFINFO=yes
 HAVE_NETPLAYDISCOVERY=yes  # Add netplay discovery (room creation, etc.)
 HAVE_NETWORKGAMEPAD=auto   # Networked game pad (plus baked-in core)
@@ -86,6 +88,9 @@ C89_DISCORD=no
 # Crypto, TLS and network filesystems
 HAVE_CRYPTO=yes            # Cleanroom crypto library (libretro-common/crypto)
 HAVE_KEYCHAIN=yes          # Encrypt credentials in retroarch-keychain.cfg (needs HAVE_CRYPTO)
+HAVE_CORE_SIGNATURES=yes   # Check that cores come from libretro (needs HAVE_DYNAMIC and HAVE_CRYPTO)
+HAVE_CORE_LOAD_CHECK=yes   # Check every core as it loads (needs HAVE_CORE_SIGNATURES)
+HAVE_CORE_SIGNING_TEST_KEY=no # Trust the public test signing key, never for a release (needs HAVE_CORE_SIGNATURES)
 HAVE_SSL=auto              # SSL support
 C89_SSL=no
 HAVE_RETROSSL=auto         # Use built-in TLS client on libretro-common/crypto (needs HAVE_CRYPTO)
@@ -213,7 +218,6 @@ HAVE_WGI=auto              # Windows.Gaming.Input for Xbox pads on the HID drive
 HAVE_LIBUSB=auto           # Libusb HID support
 C89_LIBUSB=no
 HAVE_BLISSBOX=auto         # Blissbox support
-HAVE_LIBSHAKE=no           # libShake haptic feedback support
 HAVE_RPILED=auto           # RPI led support
 HAVE_TEST_DRIVERS=yes      # Test input driver
 
@@ -236,8 +240,7 @@ HAVE_MPV=no                # MPV support
 # System integration
 HAVE_DBUS=no               # dbus support
 HAVE_SYSTEMD=auto          # Systemd support
-HAVE_GAMEMODE=yes          # Feral GameMode support (Linux)
-C89_GAMEMODE=no
+HAVE_GAMEMODE=yes          # Game Mode support (Linux)
 
 # Image, audio and video codecs
 HAVE_FREETYPE=auto         # FreeType support
@@ -246,6 +249,7 @@ HAVE_RPNG=yes              # RPNG support
 HAVE_RBMP=yes              # RBMP support
 HAVE_RJPEG=yes             # RJPEG support
 HAVE_RTGA=yes              # RTGA support
+HAVE_RGIF=yes              # RGIF support
 HAVE_RDDS=yes              # DDS (DXT/BCn) support
 HAVE_RWEBP=yes             # RWEBP support
 HAVE_RWAV=yes              # WAV support
@@ -254,10 +258,12 @@ HAVE_ROPUS=yes             # ropus Opus audio support
 HAVE_RAAC=yes              # raac AAC audio support
 HAVE_RMP3=yes              # rmp3 MP3 audio support
 HAVE_RFLAC=yes             # rflac FLAC audio support
+HAVE_RWMA=no               # native XMA and WMA audio support
 HAVE_FLAC=no               # Link against libFLAC (unused by default; FLAC decode is provided by rflac)
 HAVE_RMODTRACKER=yes       # rmodtracker MOD/S3M/XM support
 HAVE_RWEBM=yes             # RWEBM (WebM/Matroska demuxer) support
 HAVE_RMP4=yes              # RMP4 (MP4/ISO-BMFF demuxer) support
+HAVE_VAAPI=auto            # VA-API HEVC decode and Vulkan imports (Linux, optional SDK)
 HAVE_RAV1=yes              # AV1 hardware decoding support
 HAVE_RVP9=yes              # RVP9 (VP9 video decoder) support
 HAVE_RMPEG1=yes            # RMPEG1 (MPEG-1 program stream / video) support

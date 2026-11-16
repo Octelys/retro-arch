@@ -844,8 +844,8 @@ static void task_cloud_sync_update_progress(retro_task_t *task)
    /* Entries of a directory whose sync toggle is off are stepped over
     * in one go, so counting them would leave the bar short of 100 when
     * they sort last - and stuck below the in-scope share otherwise. */
-   val = (sync_state->server_idx - sync_state->server_skipped)
-       + sync_state->current_idx;
+   val = (unsigned long)((sync_state->server_idx - sync_state->server_skipped)
+       + sync_state->current_idx);
 
    if (sync_state->server_manifest)
       count += sync_state->server_manifest->size
@@ -1136,9 +1136,22 @@ static bool task_cloud_sync_backup_file(struct item_file *file,
 
    if (!path_mkdir(new_dir))
       RARCH_ERR(CSPFX "Could not create backup directory \"%s\".\n", new_dir);
-   else if (filestream_rename(file->path, new_path) != 0)
+   else if (filestream_rename(file->path, new_path) == 0)
+      ok = true;
+   /* A rename cannot cross volumes, or leave a SAF tree on Android, and
+    * the backups live under the assets directory wherever saves are.
+    * This runs on the task thread, so a blocking copy holds up nothing. */
+   else if (filestream_copy(file->path, new_path) != 0)
       RARCH_ERR(CSPFX "Could not back \"%s\" up to \"%s\".\n",
             file->path, new_path);
+   /* The caller needs the local file gone; a backup of a file that is
+    * still there would only pile up. */
+   else if (filestream_delete(file->path) != 0)
+   {
+      filestream_delete(new_path);
+      RARCH_ERR(CSPFX "Could not remove \"%s\" after backing it up.\n",
+            file->path);
+   }
    else
       ok = true;
 
@@ -1371,6 +1384,30 @@ static void task_cloud_sync_fetched_take(task_cloud_sync_state_t *sync_state)
    *tail = rev;
 }
 
+/* A download comes back on the stream it was written through, which
+ * cannot lend its bytes, so hashing it would read the whole file back
+ * into the hash buffer.  Opened again to read with the mapping hint it
+ * lends them where they lie, out of the page cache the write just
+ * filled.  Under one hash chunk the file is a single read, cheaper
+ * than another open, so it stays as it is; where the platform has no
+ * mapping the new stream reads as the old one did. */
+static void task_cloud_sync_fetched_lend(tcs_fetched_t *rec)
+{
+   char   tmp[PATH_MAX_LENGTH];
+   RFILE *lent;
+
+   if (     filestream_get_size(rec->file) < CS_HASH_CHUNK
+         || !task_cloud_sync_fetching_path(tmp, sizeof(tmp),
+               rec->fetch_state->local)
+         || filestream_flush(rec->file) != 0)
+      return;
+   if (!(lent = filestream_open(tmp, RETRO_VFS_FILE_ACCESS_READ,
+               RETRO_VFS_FILE_ACCESS_HINT_FREQUENT_ACCESS)))
+      return;
+   filestream_close(rec->file);
+   rec->file = lent;
+}
+
 /* Hashes the downloads handed over, inside @b, finishing each fetch
  * once its file is hashed. */
 static void task_cloud_sync_fetched_run(task_cloud_sync_state_t *sync_state,
@@ -1384,6 +1421,7 @@ static void task_cloud_sync_fetched_run(task_cloud_sync_state_t *sync_state,
 
       if (!sync_state->hash_fetched.file)
       {
+         task_cloud_sync_fetched_lend(rec);
          if (     !sync_state->hash_buf
                && !(sync_state->hash_buf = (uint8_t*)malloc(CS_HASH_CHUNK)))
             hash[0] = '\0';
@@ -2364,16 +2402,36 @@ static void task_cloud_sync_task_handler(retro_task_t *task)
 /* Runs on the main thread before the state is released. A sync that
  * failed, or finished with failures or conflicts, reports its title -
  * the sync's own summary - as the error. */
+/* A sync asked for while one ran, without a pusher waiting on it -
+ * Sync Now, Resolve: Keep Local, Resolve: Keep Server, or a content
+ * load's or close's sync: run once that one is through, with the
+ * conflict resolution asked for last, a resolution winning over a
+ * plain sync. -1: none. Turned away, the menu's choices did nothing
+ * while an automatic sync ran. Frame thread only: every push and this
+ * task's callback run there. */
+static int tcs_followup_mode = -1;
+
+static bool task_push_cloud_sync_with_mode(int conflict_resolution,
+      retro_task_callback_t cb, void *cb_data);
+
 static void task_cloud_sync_cb(retro_task_t *task, void *task_data,
       void *user_data, const char *error)
 {
    task_cloud_sync_state_t *sync_state = (task_cloud_sync_state_t *)task->state;
 
-   if (!sync_state || !sync_state->cb)
-      return;
-   if (!error && (sync_state->failures || sync_state->conflicts))
-      error = task->title ? task->title : "Cloud Sync failed";
-   sync_state->cb(task, NULL, sync_state->cb_data, error);
+   if (sync_state && sync_state->cb)
+   {
+      if (!error && (sync_state->failures || sync_state->conflicts))
+         error = task->title ? task->title : "Cloud Sync failed";
+      sync_state->cb(task, NULL, sync_state->cb_data, error);
+   }
+
+   if (tcs_followup_mode >= 0)
+   {
+      int mode          = tcs_followup_mode;
+      tcs_followup_mode = -1;
+      task_push_cloud_sync_with_mode(mode, NULL, NULL);
+   }
 }
 
 /* Releases the sync's state when the task retires. Every manifest owns
@@ -2442,8 +2500,10 @@ static bool task_cloud_sync_task_finder(retro_task_t *task, void *user_data)
    if (!task)
       return false;
 
-   /* there can be only one */
-   return task->handler == task_cloud_sync_task_handler;
+   /* there can be only one; a finished one, waiting for its callback,
+    * is no longer running and starts the follow-up from there */
+   return     task->handler == task_cloud_sync_task_handler
+          && !(task_get_flags(task) & RETRO_TASK_FLG_FINISHED);
 }
 
 static bool task_push_cloud_sync_with_mode(int conflict_resolution,
@@ -2466,8 +2526,16 @@ static bool task_push_cloud_sync_with_mode(int conflict_resolution,
    find_data.func = task_cloud_sync_task_finder;
    if (task_queue_find(&find_data))
    {
-      RARCH_LOG(CSPFX "Already in progress.\n");
-      return false;
+      /* A pusher waiting on its own sync is told it was not run */
+      if (cb)
+      {
+         RARCH_LOG(CSPFX "Already in progress.\n");
+         return false;
+      }
+      if (conflict_resolution || tcs_followup_mode < 0)
+         tcs_followup_mode = conflict_resolution;
+      RARCH_LOG(CSPFX "In progress: another sync follows it.\n");
+      return true;
    }
 
    sync_state = (task_cloud_sync_state_t *)calloc(1, sizeof(task_cloud_sync_state_t));

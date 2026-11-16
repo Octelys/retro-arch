@@ -45,6 +45,7 @@
 #include <streams/rzip_stream.h>
 #include <vfs/vfs.h>
 #include <libretro.h>
+#include <file/file_path.h>
 
 #include "../../playlist.h"
 #include "../../verbosity.h"
@@ -57,6 +58,7 @@
 
 #include "../../core_info.h"
 #include <compat/strl.h>
+#include <rthreads/rthreads.h>
 
 bool core_info_find(const char *core_path, core_info_t **core_info)
 {
@@ -690,8 +692,13 @@ static void lane_budgeted_autofix(void)
    CHECK(blocking && playlist_size(blocking) == 600,
          "autofix: blocking reference");
    playlist_get_index(blocking, 0, &e);
-   CHECK(e && e->path && strncmp(e->path, "/mnt/newgames/", 14) == 0,
-         "autofix: blocking rewrote paths (got \"%s\")",
+   /* the rest of the path in the local form, as autofix converts it */
+   CHECK(e && e->path && strncmp(e->path, "/mnt/newgames", 13) == 0
+         && (e->path[13] == '/'
+#ifdef _WIN32
+            || e->path[13] == '\\'
+#endif
+         ), "autofix: blocking rewrote paths (got \"%s\")",
          (e && e->path) ? e->path : "(null)");
 
    /* The fixture write above rewrote the file (autofix saves), so
@@ -810,6 +817,209 @@ static void check_cache_reuse(const char *path, bool compressed,
          lane);
 
    playlist_free_cached();
+}
+
+
+/* A task on a worker writes the playlist file the menu has cached.
+ * The writer leaves a note for the main thread rather than touching
+ * the cached playlist, which the main thread frees and installs at
+ * will; the main thread applies the note when it next asks the cache.
+ * The worker's write keeps the file's size, so the note alone must
+ * keep the cache from serving what is on disk no longer.  A stress
+ * round follows: the worker rewrites while the main thread reuses and
+ * frees the cache (under ASan, and TSan with SANITIZER=thread). */
+struct cache_writer
+{
+   const char *path;
+   unsigned    rounds;
+};
+
+static void cache_writer_name(const char *path, const char *name)
+{
+   playlist_config_t config;
+   playlist_t *pl;
+   config_defaults(&config, path);
+   if (!(pl = playlist_init(&config)))
+      return;
+   playlist_set_default_core_name(pl, name);
+   playlist_write_file(pl);
+   playlist_free(pl);
+}
+
+static void cache_writer_run(void *arg)
+{
+   struct cache_writer *w = (struct cache_writer*)arg;
+   unsigned i;
+   for (i = 0; i < w->rounds; i++)
+      cache_writer_name(w->path, (i & 1) ? "Core X" : "Core Y");
+}
+
+static void lane_cache_worker_write(void)
+{
+   char path[512];
+   playlist_config_t config;
+   struct cache_writer w;
+   sthread_t *t;
+   playlist_t *pl;
+   unsigned had = failures;
+   unsigned i;
+
+   snprintf(path, sizeof(path), "%s/worker.lpl", fixture_dir);
+   CHECK(write_whole(path, json_full), "worker lane: fixture write");
+   /* the writer's own form, so every later write has its size */
+   cache_writer_name(path, "Core Z");
+   config_defaults(&config, path);
+
+   playlist_free_cached();
+   CHECK(playlist_init_cached(&config), "worker lane: cached init");
+   pl = playlist_get_cached();
+   CHECK(pl && streq(playlist_get_default_core_name(pl), "Core Z"),
+         "worker lane: cached playlist");
+
+   w.path   = path;
+   w.rounds = 1;
+   CHECK((t = sthread_create(cache_writer_run, &w)) != NULL,
+         "worker lane: writer thread");
+   if (t)
+      sthread_join(t);
+
+   CHECK(playlist_init_cached(&config), "worker lane: cached init after");
+   pl = playlist_get_cached();
+   CHECK(pl && streq(playlist_get_default_core_name(pl), "Core Y"),
+         "worker lane: a same-size write from a worker was served "
+         "from the stale cache");
+
+   /* concurrent: the worker writes while the main thread reuses,
+    * reads and frees */
+   w.rounds = 200;
+   if ((t = sthread_create(cache_writer_run, &w)))
+   {
+      for (i = 0; i < 400; i++)
+      {
+         /* Windows replaces the file with MoveFileExW, and an open
+          * that meets it fails: that read is an empty playlist. */
+         if (playlist_init_cached(&config) && (pl = playlist_get_cached()))
+            CHECK(   playlist_get_default_core_name(pl) != NULL
+#ifdef _WIN32
+                  || !playlist_size(pl)
+#endif
+                  , "worker lane: stress read");
+         if (i & 1)
+            playlist_free_cached();
+      }
+      sthread_join(t);
+   }
+   CHECK(playlist_init_cached(&config), "worker lane: final init");
+   pl = playlist_get_cached();
+   /* the last of 200 writes, round 199, wrote "Core X" */
+   CHECK(pl && streq(playlist_get_default_core_name(pl), "Core X"),
+         "worker lane: the cache missed the worker's last write");
+   playlist_free_cached();
+   if (failures == had)
+      fprintf(stderr, "[pass] worker-write cache lane\n");
+}
+
+/* The whole file, for comparing it before and after; caller frees. */
+static char *slurp(const char *path, long *len)
+{
+   char *buf = NULL;
+   FILE *f   = fopen(path, "rb");
+   *len      = -1;
+   if (!f)
+      return NULL;
+   if (     !fseek(f, 0, SEEK_END)
+         && (*len = ftell(f)) >= 0
+         && !fseek(f, 0, SEEK_SET)
+         && (buf = (char*)malloc((size_t)*len + 1)))
+   {
+      if (fread(buf, 1, (size_t)*len, f) != (size_t)*len)
+      {
+         free(buf);
+         buf = NULL;
+      }
+   }
+   fclose(f);
+   return buf;
+}
+
+static playlist_t *header_read(const playlist_config_t *config)
+{
+   playlist_parse_t *p = playlist_parse_begin_header(config);
+   if (!p)
+      return NULL;
+   if (playlist_parse_step(p, NULL, NULL) < 0)
+   {
+      playlist_parse_abort(p);
+      return NULL;
+   }
+   return playlist_parse_end(p);
+}
+
+/* playlist_parse_begin_header(): what comes ahead of the entries and
+ * nothing after; under a moved base content directory the scan record
+ * moves in memory while the file stays as it was; the result is never
+ * written; the old format, which has no scan settings, reads empty. */
+static void lane_header_only(void)
+{
+   char path[512];
+   playlist_config_t config;
+   playlist_t *pl;
+   char *before, *after;
+   long blen, alen;
+   unsigned had = failures;
+
+   snprintf(path, sizeof(path), "%s/header.lpl", fixture_dir);
+   CHECK(write_whole(path, json_full), "header lane: fixture write");
+   config_defaults(&config, path);
+
+   pl = header_read(&config);
+   CHECK(pl != NULL, "header lane: read");
+   if (pl)
+   {
+      CHECK(playlist_size(pl) == 0, "header lane: %u entries read",
+            (unsigned)playlist_size(pl));
+      CHECK(streq(playlist_get_default_core_name(pl), "Core A"),
+            "header lane: default core name");
+      CHECK(streq(playlist_get_scan_content_dir(pl), "/games/snes"),
+            "header lane: scan content dir");
+      playlist_free(pl);
+   }
+
+   /* a base moved since the save: autofix's move, in memory only */
+   before = slurp(path, &blen);
+   playlist_config_set_base_content_directory(&config, "/moved");
+   pl = header_read(&config);
+   /* the suffix in the local form, as autofix converts it */
+   CHECK(pl && streq(playlist_get_scan_content_dir(pl),
+#ifdef _WIN32
+            "/moved\\snes"
+#else
+            "/moved/snes"
+#endif
+            ), "header lane: scan content dir under the moved base");
+   if (pl)
+   {
+      /* and never written, even when asked */
+      playlist_set_default_core_name(pl, "Core Changed");
+      playlist_write_file(pl);
+      playlist_free(pl);
+   }
+   after = slurp(path, &alen);
+   CHECK(before && after && blen == alen && !memcmp(before, after, (size_t)blen),
+         "header lane: the file changed under a header read");
+   free(before);
+   free(after);
+
+   CHECK(write_whole(path, old_format), "header lane: old format write");
+   config_defaults(&config, path);
+   pl = header_read(&config);
+   CHECK(pl && playlist_size(pl) == 0
+         && !playlist_get_scan_content_dir(pl),
+         "header lane: the old format reads empty");
+   playlist_free(pl);
+
+   if (failures == had)
+      fprintf(stderr, "[pass] header-only lane\n");
 }
 
 static void lane_cache_reuse(void)
@@ -1414,6 +1624,17 @@ char *__wrap_strdup(const char *s)
    return __real_strdup(s);
 }
 
+/* @in as a push stores it: playlist_resolve_path(), which leaves an
+ * absolute POSIX path as it is and makes "/games/x" "C:\games\x" on
+ * Windows.  Returns @s. */
+static const char *pushed_path(char *s, size_t len, const char *in,
+      bool is_core)
+{
+   strlcpy(s, in, len);
+   playlist_resolve_path(PLAYLIST_SAVE, is_core, s, len);
+   return s;
+}
+
 /* playlist_update() used to free an entry's string and then assign the
  * result of strdup(). With no memory to copy into, the field was left
  * NULL and the entry marked modified, so a complete entry became an
@@ -1428,6 +1649,7 @@ static void lane_update_survives_failed_copy(void)
    struct playlist_entry upd;
    const struct playlist_entry *got = NULL;
    char path[512];
+   char want[512];
 
    memset(&cfg, 0, sizeof(cfg));
    snprintf(path, sizeof(path), "%s/oom.lpl", fixture_dir);
@@ -1470,7 +1692,8 @@ static void lane_update_survives_failed_copy(void)
             "a failed copy did not keep the label that was there");
       CHECK(got->core_name != NULL,
             "a failed copy left the core name NULL instead of keeping it");
-      CHECK(got->path && !strcmp(got->path, "/games/game.bin"),
+      CHECK(got->path && !strcmp(got->path,
+               pushed_path(want, sizeof(want), "/games/game.bin", false)),
             "a failed copy disturbed a field it was not replacing");
    }
    /* With memory again, the same update lands. */
@@ -1506,6 +1729,7 @@ static void lane_push_runtime_survives_failed_copy(void)
       struct playlist_entry rt;
       const struct playlist_entry *got = NULL;
       char path[512];
+      char want[512];
       bool ok;
 
       memset(&cfg, 0, sizeof(cfg));
@@ -1543,7 +1767,8 @@ static void lane_push_runtime_survives_failed_copy(void)
                "after %d copies: a failed push changed the number of entries",
                allow);
          playlist_get_index(pl, 0, &got);
-         CHECK(got && got->path && !strcmp(got->path, "/games/first.bin"),
+         CHECK(got && got->path && !strcmp(got->path,
+                  pushed_path(want, sizeof(want), "/games/first.bin", false)),
                "after %d copies: a failed push disturbed the entry on top",
                allow);
       }
@@ -1553,10 +1778,12 @@ static void lane_push_runtime_survives_failed_copy(void)
                "after %d copies: a push that reported success added nothing",
                allow);
          playlist_get_index(pl, 0, &got);
-         CHECK(got && got->path && !strcmp(got->path, "/games/second.bin"),
+         CHECK(got && got->path && !strcmp(got->path,
+                  pushed_path(want, sizeof(want), "/games/second.bin", false)),
                "after %d copies: a push that reported success has no path on top",
                allow);
-         CHECK(got && got->core_path && !strcmp(got->core_path, "/cores/core.so"),
+         CHECK(got && got->core_path && !strcmp(got->core_path,
+                  pushed_path(want, sizeof(want), "/cores/core.so", true)),
                "after %d copies: a push that reported success has no core on top",
                allow);
          CHECK(got && got->runtime_str && !strcmp(got->runtime_str, "00:01:00"),
@@ -1567,7 +1794,8 @@ static void lane_push_runtime_survives_failed_copy(void)
                "after %d copies: a push that reported success lost its last-played",
                allow);
          playlist_get_index(pl, 1, &got);
-         CHECK(got && got->path && !strcmp(got->path, "/games/first.bin"),
+         CHECK(got && got->path && !strcmp(got->path,
+                  pushed_path(want, sizeof(want), "/games/first.bin", false)),
                "after %d copies: the entry that was on top did not move down intact",
                allow);
       }
@@ -1631,6 +1859,186 @@ static void lane_push_starts_without_thumbnail_flags(void)
       fprintf(stderr, "  [pass] a pushed entry starts without thumbnail flags\n");
 }
 
+/* ------------------------------------------------------------------ */
+/* push order: pushes put the newest first, a push of what is there  */
+/* moves it to the top, a full playlist drops its last entry; checked */
+/* against a list kept here through pushes, unchecked pushes, deletes */
+/* and clears, on a playlist that was loaded first and one that grows */
+/* past where its storage started.                                     */
+/* ------------------------------------------------------------------ */
+
+#define ORDER_MAX 4096
+
+static unsigned order_seed = 0x9e3779b9u;
+
+static unsigned order_rnd(unsigned n)
+{
+   order_seed ^= order_seed << 13;
+   order_seed ^= order_seed >> 17;
+   order_seed ^= order_seed << 5;
+   return n ? order_seed % n : 0;
+}
+
+static bool order_push(playlist_t *pl, unsigned id, bool unchecked)
+{
+   char p[64];
+   struct playlist_entry e;
+   memset(&e, 0, sizeof(e));
+   snprintf(p, sizeof(p), "/games/order/%04u.bin", id);
+   e.path      = p;
+   e.label     = p + 13;
+   e.core_path = (char*)"/cores/order_libretro.so";
+   e.core_name = (char*)"Order";
+   return unchecked ? playlist_push_unchecked(pl, &e)
+                    : playlist_push(pl, &e);
+}
+
+/* The playlist holds @model[0..@n), newest first */
+static bool order_matches(playlist_t *pl, const unsigned *model,
+      size_t n, const char *what, unsigned step)
+{
+   size_t i;
+   if (playlist_size(pl) != n)
+   {
+      CHECK(false, "%s: step %u: size %u, wanted %u", what, step,
+            (unsigned)playlist_size(pl), (unsigned)n);
+      return false;
+   }
+   for (i = 0; i < n; i++)
+   {
+      char want[64];
+      const struct playlist_entry *e = NULL;
+      playlist_get_index(pl, i, &e);
+      snprintf(want, sizeof(want), "/games/order/%04u.bin", model[i]);
+      if (!e || !e->path || strcmp(e->path, want))
+      {
+         CHECK(false, "%s: step %u: entry %u is %s, wanted %s", what,
+               step, (unsigned)i, (e && e->path) ? e->path : "(none)",
+               want);
+         return false;
+      }
+   }
+   return true;
+}
+
+static size_t order_find(const unsigned *model, size_t n, unsigned id)
+{
+   size_t i;
+   for (i = 0; i < n; i++)
+      if (model[i] == id)
+         return i;
+   return n;
+}
+
+/* the model's push: to the front, the last out when full */
+static size_t order_model_push(unsigned *model, size_t n, size_t cap,
+      unsigned id)
+{
+   if (n == cap)
+      n--;
+   memmove(model + 1, model, n * sizeof(*model));
+   model[0] = id;
+   return n + 1;
+}
+
+static void lane_push_order(void)
+{
+   unsigned had = failures;
+   static unsigned model[ORDER_MAX];
+   char path[512];
+   char doc[4096];
+   size_t _len = 0, n = 0, cap = 37;
+   unsigned i, step, next_id = 0;
+   playlist_config_t config;
+   playlist_t *pl;
+
+   /* loaded first: ten entries appended where the file lists them */
+   _len += (size_t)snprintf(doc + _len, sizeof(doc) - _len,
+         "{\n  \"version\": \"1.5\",\n  \"items\": [\n");
+   for (i = 0; i < 10; i++)
+      _len += (size_t)snprintf(doc + _len, sizeof(doc) - _len,
+            "    { \"path\": \"/games/order/%04u.bin\", \"label\": \"%04u.bin\","
+            " \"core_path\": \"/cores/order_libretro.so\", \"core_name\": \"Order\" }%s\n",
+            next_id + i, next_id + i, (i < 9) ? "," : "");
+   _len += (size_t)snprintf(doc + _len, sizeof(doc) - _len, "  ]\n}\n");
+   snprintf(path, sizeof(path), "%s/order.lpl", fixture_dir);
+   CHECK(write_whole(path, doc), "fixture write");
+   config_defaults(&config, path);
+   config.capacity = cap;
+   if (!(pl = playlist_init(&config)))
+   {
+      CHECK(false, "push order: init failed");
+      return;
+   }
+   for (i = 0; i < 10; i++)
+      model[n++] = next_id++;
+   order_matches(pl, model, n, "push order: loaded", 0);
+
+   for (step = 1; step <= 3000 && failures == had; step++)
+   {
+      unsigned op = order_rnd(100);
+      if (op < 40)
+      {
+         /* new: either push puts it first */
+         unsigned id = next_id++;
+         CHECK(order_push(pl, id, op < 20), "push order: step %u: new push failed", step);
+         n = order_model_push(model, n, cap, id);
+      }
+      else if (op < 70 && n)
+      {
+         /* there already: to the top, or nothing where it is first */
+         size_t at   = order_rnd((unsigned)n);
+         unsigned id = model[at];
+         bool pushed = order_push(pl, id, false);
+         CHECK(pushed == (at != 0), "push order: step %u: push of entry %u returned %d",
+               step, (unsigned)at, (int)pushed);
+         if (at)
+         {
+            memmove(model + 1, model, at * sizeof(*model));
+            model[0] = id;
+         }
+      }
+      else if (op < 90 && n)
+      {
+         size_t at = order_rnd((unsigned)n);
+         playlist_delete_index(pl, at);
+         memmove(model + at, model + at + 1, (n - at - 1) * sizeof(*model));
+         n--;
+      }
+      else if (op < 92)
+      {
+         playlist_clear(pl);
+         n = 0;
+      }
+      else
+         continue;
+      order_matches(pl, model, n, "push order", step);
+   }
+   playlist_free(pl);
+
+   /* grown: thousands of pushes to the front of one playlist */
+   config_defaults(&config, path);
+   config.capacity = ORDER_MAX;
+   remove(path);
+   if (!(pl = playlist_init(&config)))
+   {
+      CHECK(false, "push order: second init failed");
+      return;
+   }
+   n = 0;
+   for (i = 0; i < ORDER_MAX - 1; i++)
+   {
+      unsigned id = next_id++;
+      CHECK(order_push(pl, id, (i & 1) != 0), "push order: grow push %u failed", i);
+      n = order_model_push(model, n, ORDER_MAX, id);
+   }
+   order_matches(pl, model, n, "push order: grown", 0);
+   playlist_free(pl);
+
+   if (failures == had)
+      printf("  [pass] pushes keep the newest first, bump, evict and delete as a list would\n");
+}
+
 int main(int argc, char *argv[])
 {
    char cmd[600];
@@ -1640,12 +2048,24 @@ int main(int argc, char *argv[])
 
    verbosity_enable();
 
-   snprintf(fixture_dir, sizeof(fixture_dir),
-         "/tmp/playlist_fixture_%ld", (long)getpid());
-   snprintf(cmd, sizeof(cmd), "mkdir -p %s", fixture_dir);
-   if (system(cmd) != 0)
    {
-      fprintf(stderr, "fixture mkdir failed\n");
+      /* The system's temporary folder: a native Windows build has no
+       * /tmp, and system() runs cmd.exe there, not a POSIX shell. */
+#ifdef _WIN32
+      const char *tmp = getenv("TEMP");
+      if (!tmp || !*tmp)
+         tmp = getenv("TMP");
+#else
+      const char *tmp = getenv("TMPDIR");
+#endif
+      if (!tmp || !*tmp)
+         tmp = "/tmp";
+      snprintf(fixture_dir, sizeof(fixture_dir),
+            "%s/playlist_fixture_%ld", tmp, (long)getpid());
+   }
+   if (!path_mkdir(fixture_dir))
+   {
+      fprintf(stderr, "fixture mkdir failed: %s\n", fixture_dir);
       return 1;
    }
 
@@ -1660,6 +2080,8 @@ int main(int argc, char *argv[])
    lane_budgeted_autofix();
    lane_abort_midway();
    lane_cache_reuse();
+   lane_cache_worker_write();
+   lane_header_only();
    lane_switch_playlist_never_shows_previous();
    lane_switch_supersedes_pending();
    lane_saf_slow_reads();
@@ -1668,8 +2090,20 @@ int main(int argc, char *argv[])
    lane_update_survives_failed_copy();
    lane_push_runtime_survives_failed_copy();
    lane_push_starts_without_thumbnail_flags();
+   lane_push_order();
 
-   snprintf(cmd, sizeof(cmd), "rm -rf %s", fixture_dir);
+#ifdef _WIN32
+   {
+      char *c;
+      snprintf(cmd, sizeof(cmd), "rmdir /s /q \"%s\" >nul 2>&1",
+            fixture_dir);
+      for (c = cmd; *c; c++)
+         if (*c == '/')
+            *c = '\\';
+   }
+#else
+   snprintf(cmd, sizeof(cmd), "rm -rf '%s' 2>/dev/null", fixture_dir);
+#endif
    if (system(cmd) != 0) { }
 
    if (failures)

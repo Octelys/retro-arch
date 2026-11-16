@@ -20,15 +20,17 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-/* TLS 1.2 client on the cleanroom crypto (crypto/), behind the
- * ssl_socket_* API. ECDHE over P-256 or P-384, RSA or ECDSA server
- * authentication against net/cacert.h, AES-128/256-GCM or
+/* TLS 1.2 and 1.3 client on the cleanroom crypto (crypto/), behind
+ * the ssl_socket_* API. ECDHE over X25519, P-256 or P-384, RSA or ECDSA
+ * server authentication against net/cacert.h, AES-128/256-GCM or
  * ChaCha20-Poly1305 records, SHA-256 or SHA-384 handshake and PRF as
- * the suite dictates; SNI sent.
- * No renegotiation, no resumption, no client certificates. The
- * handshake runs to completion inside ssl_socket_connect() as the
- * other backends' do. */
+ * the suite dictates; SNI sent. A connection given its own settings
+ * (ssl_socket_retro_configure()) may also trust its own anchors, answer
+ * a 1.2 CertificateRequest with an RSA certificate, and run the RSA key
+ * exchange and AES-CBC suites. No renegotiation. The handshake runs to
+ * completion inside ssl_socket_connect() as the other backends' do. */
 
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -36,6 +38,8 @@
 #include <net/net_compat.h>
 #include <net/net_socket.h>
 #include <retro_atomic.h>
+#include <boolean.h>
+#include <queues/retro_retire.h>
 #include <net/net_socket_ssl.h>
 #include <crypto/crypto.h>
 #include <crypto/kdf.h>
@@ -48,8 +52,12 @@
 #include "cacert.h"
 
 #define TLS_REC_MAX      16384
-#define TLS_REC_OVERHEAD (8 + 16)          /* explicit nonce + tag */
-#define TLS_RX_SIZE      (5 + TLS_REC_MAX + 256)
+/* explicit IV, MAC and padding of a CBC record; an AEAD's explicit
+ * nonce and tag take less */
+#define TLS_REC_OVERHEAD (16 + 48 + 16)
+/* a ciphertext record carries at most 2^14 + 2048 octets */
+#define TLS_REC_IN_MAX   (TLS_REC_MAX + 2048)
+#define TLS_RX_SIZE      (5 + TLS_REC_IN_MAX)
 #define TLS_HS_MAX       (64 * 1024)       /* certificate chains */
 
 #define TLS_CT_CCS       20
@@ -61,6 +69,7 @@
 #define TLS_HS_SERVER_HELLO     2
 #define TLS_HS_CERTIFICATE      11
 #define TLS_HS_SERVER_KEX       12
+#define TLS_HS_CERT_REQUEST     13
 #define TLS_HS_SERVER_DONE      14
 #define TLS_HS_CLIENT_KEX       16
 #define TLS_HS_FINISHED         20
@@ -109,6 +118,7 @@ static retro_atomic_int_t tls_verify_mode_setting;
 
 struct tls_session
 {
+   mpsc_stack_node_t node;   /* lock-free: on the retire list */
    uint8_t *ticket;
    size_t   ticket_len;
    time_t   when;
@@ -124,13 +134,95 @@ struct tls_session
    char     host[256];
 };
 
-static struct tls_session tls_cache[TLS_CACHE_SLOTS];
+/* What a handshake learns for a host: a ticket (TLS 1.2), a master
+ * secret and suite (a full TLS 1.2 handshake), or a TLS 1.3 ticket and
+ * its PSK. */
+#define TLS_PUT_TICKET 1
+#define TLS_PUT_MASTER 2
+#define TLS_PUT_PSK    4
+
+struct tls_session_put
+{
+   const uint8_t *ticket;
+   size_t         ticket_len;
+   const uint8_t *master;
+   const uint8_t *sid;
+   size_t         sid_len;
+   const uint8_t *psk;
+   unsigned       suite;
+   uint32_t       age_add;
+   unsigned       what;
+};
+
+/* @put into @e, whose ticket it takes over when it carries one: false
+ * with @e untouched when the ticket cannot be copied. */
+static bool tls_session_apply(struct tls_session *e,
+      const struct tls_session_put *put)
+{
+   if (put->what & (TLS_PUT_TICKET | TLS_PUT_PSK))
+   {
+      uint8_t *t = (uint8_t*)malloc(put->ticket_len);
+      if (!t)
+         return false;
+      memcpy(t, put->ticket, put->ticket_len);
+      free(e->ticket);
+      e->ticket     = t;
+      e->ticket_len = put->ticket_len;
+   }
+   if (put->what & TLS_PUT_MASTER)
+   {
+      memcpy(e->master, put->master, 48);
+      e->is13    = 0;
+      e->suite   = put->suite;
+      e->sid_len = put->sid_len;
+      if (put->sid_len)
+         memcpy(e->sid, put->sid, put->sid_len);
+   }
+   if (put->what & TLS_PUT_PSK)
+   {
+      e->is13    = 1;
+      e->suite   = put->suite;
+      e->sid_len = 0;
+      e->age_add = put->age_add;
+      memcpy(e->psk, put->psk, 48);
+   }
+   e->when = time(NULL);
+   return true;
+}
 
 /* Connections are made from several threads (updater, achievements,
  * cloud sync); the cache is the one thing they share. */
+#if defined(HAVE_THREADS) && defined(RETRO_RETIRE_LOCK_FREE) \
+      && !defined(TLS_CACHE_TEST_FLAG)
+/* Without a lock. Each slot points at an entry that is never changed
+ * once published: a handshake that learns something builds the host's
+ * entry anew and swaps it in, and a replaced entry goes once no reader
+ * is in (retro_retire.h). */
+#define TLS_CACHE_LOCK_FREE 1
+static retro_atomic_ptr_t tls_cache[TLS_CACHE_SLOTS];
+static retro_retire_t     tls_cache_retire;
+
+static void tls_session_free(mpsc_stack_node_t *node)
+{
+   struct tls_session *e = (struct tls_session*)node;
+   free(e->ticket);
+   crypto_memzero(e, sizeof(*e));
+   free(e);
+}
+
+static struct tls_session *tls_cache_at(unsigned i)
+{
+   return (struct tls_session*)retro_atomic_load_acquire_ptr(&tls_cache[i]);
+}
+
+#define TLS_CACHE_READ_BEGIN() retro_retire_enter(&tls_cache_retire)
+#define TLS_CACHE_READ_END()   retro_retire_leave(&tls_cache_retire, tls_session_free)
+#else
+static struct tls_session tls_cache_store_[TLS_CACHE_SLOTS];
+#define tls_cache_at(i) (&tls_cache_store_[(i)])
+
 #ifdef HAVE_THREADS
 #include <rthreads/rthreads.h>
-#include <retro_atomic.h>
 /* A flag, not an slock: every section it guards is a lookup, a few
  * copies and at most one allocation, nothing that waits on another
  * thread, and with no lock object to make there is none that can fail
@@ -141,49 +233,136 @@ static void tls_cache_lock(void)
    while (!retro_atomic_cas_int(&tls_cache_busy, 0, 1))
       sthread_yield();
 }
-#define TLS_CACHE_LOCK()   tls_cache_lock()
-#define TLS_CACHE_UNLOCK() retro_atomic_store_release_int(&tls_cache_busy, 0)
+#define TLS_CACHE_READ_BEGIN() tls_cache_lock()
+#define TLS_CACHE_READ_END()   retro_atomic_store_release_int(&tls_cache_busy, 0)
 #else
-#define TLS_CACHE_LOCK()   do { } while (0)
-#define TLS_CACHE_UNLOCK() do { } while (0)
+#define TLS_CACHE_READ_BEGIN() do { } while (0)
+#define TLS_CACHE_READ_END()   do { } while (0)
+#endif
 #endif
 
+static bool tls_cache_begin(bool nonblock)
+{
+#if defined(HAVE_THREADS) && !defined(TLS_CACHE_LOCK_FREE)
+   if (nonblock)
+      return retro_atomic_cas_int(&tls_cache_busy, 0, 1);
+#else
+   (void)nonblock;
+#endif
+   TLS_CACHE_READ_BEGIN();
+   return true;
+}
+
+/* Between TLS_CACHE_READ_BEGIN() and _END(): the host's live entry. */
 static struct tls_session *tls_cache_find(const char *host)
 {
    unsigned i;
    if (!host || !*host)
       return NULL;
    for (i = 0; i < TLS_CACHE_SLOTS; i++)
-      if (tls_cache[i].when && strcmp(tls_cache[i].host, host) == 0)
+   {
+      struct tls_session *e = tls_cache_at(i);
+      if (e && e->when && strcmp(e->host, host) == 0)
       {
-         if (time(NULL) - tls_cache[i].when > TLS_CACHE_MAX_AGE)
+#ifdef TLS_CACHE_TEST_HOLD
+         TLS_CACHE_TEST_HOLD();
+#endif
+         if (time(NULL) - e->when > TLS_CACHE_MAX_AGE)
             return NULL;
-         return &tls_cache[i];
+         return e;
       }
+   }
    return NULL;
 }
 
-static struct tls_session *tls_cache_slot(const char *host)
+/* The slot for @host: its own, else an empty one, else the oldest. */
+static unsigned tls_cache_slot_for(const char *host)
 {
-   struct tls_session *e = tls_cache_find(host);
    unsigned i, oldest = 0;
-   if (e)
-      return e;
    for (i = 0; i < TLS_CACHE_SLOTS; i++)
    {
-      if (!tls_cache[i].when)
-      {
-         oldest = i;
-         break;
-      }
-      if (tls_cache[i].when < tls_cache[oldest].when)
+      struct tls_session *e = tls_cache_at(i);
+      if (e && e->when && strcmp(e->host, host) == 0)
+         return i;
+   }
+   for (i = 0; i < TLS_CACHE_SLOTS; i++)
+   {
+      struct tls_session *e = tls_cache_at(i);
+      struct tls_session *o = tls_cache_at(oldest);
+      if (!e || !e->when)
+         return i;
+      if (o && e->when < o->when)
          oldest = i;
    }
-   e = &tls_cache[oldest];
-   free(e->ticket);
-   crypto_memzero(e, sizeof(*e));
-   strlcpy(e->host, host, sizeof(e->host));
-   return e;
+   return oldest;
+}
+
+/* @put into @host's entry, made if it has none. */
+static void tls_cache_put(const char *host, const struct tls_session_put *put,
+      bool nonblock)
+{
+#ifdef TLS_CACHE_LOCK_FREE
+   if (!host || !*host)
+      return;
+   for (;;)
+   {
+      struct tls_session *old, *e;
+      unsigned slot;
+      retro_retire_enter(&tls_cache_retire);
+      slot = tls_cache_slot_for(host);
+      old  = tls_cache_at(slot);
+      if (!(e = (struct tls_session*)calloc(1, sizeof(*e))))
+      {
+         retro_retire_leave(&tls_cache_retire, tls_session_free);
+         return;
+      }
+      if (old && old->when && strcmp(old->host, host) == 0)
+      {
+         /* all but the link, which retiring @old may be writing */
+         memcpy(&e->ticket, &old->ticket,
+               sizeof(*e) - offsetof(struct tls_session, ticket));
+         e->ticket = NULL;
+         if (     old->ticket && !(put->what & (TLS_PUT_TICKET | TLS_PUT_PSK))
+               && (e->ticket = (uint8_t*)malloc(old->ticket_len)))
+            memcpy(e->ticket, old->ticket, old->ticket_len);
+         else
+            e->ticket_len = 0;
+      }
+      else
+         strlcpy(e->host, host, sizeof(e->host));
+      retro_retire_leave(&tls_cache_retire, tls_session_free);
+      if (!tls_session_apply(e, put))
+      {
+         tls_session_free(&e->node);
+         return;
+      }
+      /* the entry we built on, if still the slot's, is ours to replace */
+      if (retro_atomic_cas_ptr(&tls_cache[slot], old, e))
+      {
+         retro_retire(&tls_cache_retire, old ? &old->node : NULL,
+               tls_session_free);
+         return;
+      }
+      tls_session_free(&e->node);
+      if (nonblock)
+         return;
+   }
+#else
+   struct tls_session *e;
+   if (!host || !*host)
+      return;
+   if (!tls_cache_begin(nonblock))
+      return;
+   e = tls_cache_at(tls_cache_slot_for(host));
+   if (!e->when || strcmp(e->host, host))
+   {
+      free(e->ticket);
+      crypto_memzero(e, sizeof(*e));
+      strlcpy(e->host, host, sizeof(e->host));
+   }
+   tls_session_apply(e, put);
+   TLS_CACHE_READ_END();
+#endif
 }
 
 /* The trust bundle is net/cacert.h's DER parts unless a test swapped
@@ -205,10 +384,46 @@ static int tls_trust_load(void)
          CACERT_DER_PARTS);
 }
 
+enum tls_connect_phase
+{
+   TLS_CONNECT_START = 0,
+   TLS_CONNECT_HELLO,
+   TLS_CONNECT_CERT12,
+   TLS_CONNECT_KEX12,
+   TLS_CONNECT_DONE12,
+   TLS_CONNECT_SEND_CERT12,
+   TLS_CONNECT_SEND_KEX12,
+   TLS_CONNECT_SEND_VERIFY12,
+   TLS_CONNECT_SEND_CCS12,
+   TLS_CONNECT_SEND_FIN12,
+   TLS_CONNECT_TICKET12,
+   TLS_CONNECT_CCS12,
+   TLS_CONNECT_FIN12,
+   TLS_CONNECT_COMPLETE12,
+   TLS_CONNECT_KEYS13,
+   TLS_CONNECT_EXT13,
+   TLS_CONNECT_CERT13,
+   TLS_CONNECT_VERIFY13,
+   TLS_CONNECT_FIN13,
+   TLS_CONNECT_SEND_CCS13,
+   TLS_CONNECT_SEND_FIN13,
+   TLS_CONNECT_COMPLETE13,
+   TLS_CONNECT_FAILED
+};
+
+struct tls_handshake_progress
+{
+   struct x509_cert leaf; /* borrows DER in the handshake accumulator */
+   size_t peer_len;
+   enum tls_connect_phase phase;
+   uint8_t peer[97];
+};
+
 struct ssl_state
 {
    uint8_t *rx;             /* raw record buffer */
    uint8_t *hs;             /* handshake message accumulator */
+   uint8_t *connect_message; /* encoded handshake, owned until sealed */
    /* decrypted application data pending: a record's plaintext where
     * it was decrypted, in rx - the next record read comes only once
     * this is drained, so it is handed out with no copy of its own */
@@ -219,12 +434,16 @@ struct ssl_state
    size_t   hs_off;
    size_t   pt_len;
    size_t   pt_off;
+   size_t   connect_length;
+   size_t   connect_offset;
    uint64_t cseq;
    uint64_t sseq;
    struct sha256_state transcript;
    struct sha512_state transcript384;
    int      fd;
-   int      last_err;
+   /* atomic: in duplex mode the receiving and the sending thread can
+    * both fail at once */
+   retro_atomic_int_t last_err;
    unsigned suite;
    unsigned group;          /* 23 P-256, 24 P-384 */
    uint8_t  client_random[32];
@@ -248,13 +467,21 @@ struct ssl_state
    uint8_t  tx_encrypted;
    uint8_t  handshake_done;
    uint8_t  closed;
+   bool connect_nonblock;
+   bool connect_read;
+   bool connect_write;
    /* Handshake flights are corked: the client's records go out in one
     * write, since sending ClientKeyExchange, ChangeCipherSpec and
     * Finished as three small writes trips Nagle against the server's
     * delayed ACK and costs a 40 ms stall per full handshake. */
    uint8_t *cork;
    size_t   cork_len;
+   size_t   cork_off;
    uint8_t  corked;
+   /* A KeyUpdate of ours is owed: set by the receiving side when the
+    * server asks for one, sent and cleared by the sending side (in
+    * duplex mode those are two threads) */
+   retro_atomic_int_t key_update;
    /* One sealed application-data record not yet fully on the wire,
     * for ssl_socket_send_all_nonblocking(): bytes are sealed as they
     * are accepted, and what the socket did not take waits here.
@@ -285,7 +512,56 @@ struct ssl_state
    uint8_t  psk[48];        /* PSK offered in this ClientHello */
    uint8_t  psk_offered;
    uint8_t  psk_accepted;
+   /* ssl_socket_retro_configure() */
+   struct ssl_socket_retro_config cfg;
+   uint8_t  configured;
+   uint8_t  offer13;        /* the ClientHello offers TLS 1.3 */
+   unsigned offered[24];    /* suites offered, for the ServerHello check */
+   unsigned offered_count;
+   unsigned cached_suite;
+   /* CertificateRequest: 1 to answer with our chain, 2 with none */
+   uint8_t  cert_requested;
+   unsigned cv_alg;         /* the scheme our CertificateVerify signs with */
+   struct sha1_state transcript1;   /* for an rsa_pkcs1_sha1 CertificateVerify */
+   size_t   premaster_len;
+   /* CBC suites: MAC keys and the AES schedules for cwk / swk */
+   uint8_t  cmac[48];
+   uint8_t  smac[48];
+   struct tls_cbc_cache
+   {
+      struct aes_ctx a;
+      uint8_t  key[32];
+      unsigned key_len;
+   } wcbc, rcbc;
+   struct tls_handshake_progress connect;
+   /* The blocking mode this connection last gave its socket: 0 not known,
+    * 1 nonblocking, 2 blocking. The socket is the connection's, so it is
+    * set only when it changes, not with two system calls on every
+    * receive and send. */
+   uint8_t  fd_mode;
 };
+
+/* SSL_RETRO_DUPLEX: one thread receives while another sends */
+static INLINE int tls_duplex(const struct ssl_state *s)
+{
+   return s->configured && (s->cfg.flags & SSL_RETRO_DUPLEX);
+}
+
+/* The socket blocking (@block) or not, without a system call when it
+ * already is */
+static bool tls_set_block(struct ssl_state *s, bool block)
+{
+   uint8_t want = block ? 2 : 1;
+   if (s->fd_mode == want)
+      return true;
+   if (!socket_set_block(s->fd, block))
+   {
+      s->fd_mode = 0;
+      return false;
+   }
+   s->fd_mode = want;
+   return true;
+}
 
 /* ---- byte helpers ------------------------------------------------- */
 
@@ -307,24 +583,93 @@ static unsigned tls_get24(const uint8_t *p)
 
 /* ---- PRF ---------------------------------------------------------- */
 
+/* Every suite the client knows: the key exchange, the record cipher,
+ * key and MAC lengths (0: an AEAD), and whether the 1.2 PRF and
+ * transcript run on SHA-384. */
+#define TLS_KX_ECDHE 0
+#define TLS_KX_RSA   1
+#define TLS_KX_13    2
+
+#define TLS_CIPHER_GCM    0
+#define TLS_CIPHER_CHACHA 1
+#define TLS_CIPHER_CBC    2
+
+struct tls_suite_info
+{
+   unsigned id;
+   uint8_t  kx;
+   uint8_t  cipher;
+   uint8_t  key_len;
+   uint8_t  mac_len;
+   uint8_t  sha384;
+};
+
+static const struct tls_suite_info tls_suite_table[] = {
+   { 0x1301, TLS_KX_13,    TLS_CIPHER_GCM,    16, 0,  0 },
+   { 0x1302, TLS_KX_13,    TLS_CIPHER_GCM,    32, 0,  1 },
+   { 0x1303, TLS_KX_13,    TLS_CIPHER_CHACHA, 32, 0,  0 },
+   { 0xc02b, TLS_KX_ECDHE, TLS_CIPHER_GCM,    16, 0,  0 },
+   { 0xc02c, TLS_KX_ECDHE, TLS_CIPHER_GCM,    32, 0,  1 },
+   { 0xc02f, TLS_KX_ECDHE, TLS_CIPHER_GCM,    16, 0,  0 },
+   { 0xc030, TLS_KX_ECDHE, TLS_CIPHER_GCM,    32, 0,  1 },
+   { 0xcca8, TLS_KX_ECDHE, TLS_CIPHER_CHACHA, 32, 0,  0 },
+   { 0xcca9, TLS_KX_ECDHE, TLS_CIPHER_CHACHA, 32, 0,  0 },
+   /* offered only when a connection asks for them */
+   { 0xc013, TLS_KX_ECDHE, TLS_CIPHER_CBC,    16, 20, 0 },
+   { 0xc014, TLS_KX_ECDHE, TLS_CIPHER_CBC,    32, 20, 0 },
+   { 0xc027, TLS_KX_ECDHE, TLS_CIPHER_CBC,    16, 32, 0 },
+   { 0xc028, TLS_KX_ECDHE, TLS_CIPHER_CBC,    32, 48, 1 },
+   { 0x009c, TLS_KX_RSA,   TLS_CIPHER_GCM,    16, 0,  0 },
+   { 0x009d, TLS_KX_RSA,   TLS_CIPHER_GCM,    32, 0,  1 },
+   { 0x002f, TLS_KX_RSA,   TLS_CIPHER_CBC,    16, 20, 0 },
+   { 0x0035, TLS_KX_RSA,   TLS_CIPHER_CBC,    32, 20, 0 },
+   { 0x003c, TLS_KX_RSA,   TLS_CIPHER_CBC,    16, 32, 0 },
+   { 0x003d, TLS_KX_RSA,   TLS_CIPHER_CBC,    32, 32, 0 }
+};
+
+static const struct tls_suite_info *tls_suite(unsigned id)
+{
+   unsigned i;
+   for (i = 0; i < sizeof(tls_suite_table) / sizeof(tls_suite_table[0]); i++)
+      if (tls_suite_table[i].id == id)
+         return &tls_suite_table[i];
+   return NULL;
+}
+
 static int tls_suite_is_13(unsigned suite)
 {
-   return suite == TLS13_AES_128_GCM_SHA256 || suite == TLS13_CHACHA20_POLY1305_SHA256
-      || suite == TLS13_AES_256_GCM_SHA384;
+   const struct tls_suite_info *i = tls_suite(suite);
+   return i && i->kx == TLS_KX_13;
 }
 
 static int tls_suite_is_chacha(unsigned suite)
 {
-   return suite == TLS_SUITE_ECDHE_RSA_CHACHA20
-       || suite == TLS_SUITE_ECDHE_ECDSA_CHACHA20
-       || suite == TLS13_CHACHA20_POLY1305_SHA256;
+   const struct tls_suite_info *i = tls_suite(suite);
+   return i && i->cipher == TLS_CIPHER_CHACHA;
+}
+
+static int tls_suite_is_cbc(unsigned suite)
+{
+   const struct tls_suite_info *i = tls_suite(suite);
+   return i && i->cipher == TLS_CIPHER_CBC;
 }
 
 static int tls_suite_is_aes256(unsigned suite)
 {
-   return suite == TLS_SUITE_ECDHE_RSA_AES256_GCM
-       || suite == TLS_SUITE_ECDHE_ECDSA_AES256_GCM
-       || suite == TLS13_AES_256_GCM_SHA384;
+   const struct tls_suite_info *i = tls_suite(suite);
+   return i && i->cipher != TLS_CIPHER_CHACHA && i->key_len == 32;
+}
+
+static size_t tls_suite_key_len(unsigned suite)
+{
+   const struct tls_suite_info *i = tls_suite(suite);
+   return i ? i->key_len : 16;
+}
+
+static size_t tls_suite_mac_len(unsigned suite)
+{
+   const struct tls_suite_info *i = tls_suite(suite);
+   return i ? i->mac_len : 0;
 }
 
 /* The GCM context for @key (cwk or swk), rebuilt only when the key
@@ -346,10 +691,80 @@ static const struct aes_gcm_ctx *tls_gcm(struct ssl_state *s,
    return &c->g;
 }
 
-/* The AES-256-GCM suites run their PRF and transcript on SHA-384. */
+/* The CBC schedule for @key, built as tls_gcm() builds its own. */
+static const struct aes_ctx *tls_cbc(struct ssl_state *s,
+      struct tls_cbc_cache *c, const uint8_t *key)
+{
+   unsigned klen = (unsigned)tls_suite_key_len(s->suite);
+   if (c->key_len != klen || memcmp(c->key, key, klen) != 0)
+   {
+      if (aes_init(&c->a, key, klen) != 0)
+      {
+         c->key_len = 0;
+         return NULL;
+      }
+      memcpy(c->key, key, klen);
+      c->key_len = klen;
+   }
+   return &c->a;
+}
+
+/* The record MAC of a CBC suite: HMAC(key, seq || type || version ||
+ * length || data), SHA-1, SHA-256 or SHA-384 by the suite. @pad more
+ * octets go through a throwaway hash, so that a record's MAC costs the
+ * same whatever its padding length (Lucky 13). */
+static void tls_cbc_mac(const struct ssl_state *s, const uint8_t *key,
+      const uint8_t *hdr, const uint8_t *data, size_t len, size_t pad,
+      uint8_t *out)
+{
+   static const uint8_t zeros[256] = {0};
+   size_t mlen = tls_suite_mac_len(s->suite);
+   union
+   {
+      struct hmac_sha1_ctx   h1;
+      struct hmac_sha256_ctx h256;
+      struct hmac_sha384_ctx h384;
+   } h;
+   union
+   {
+      struct sha1_state   s1;
+      struct sha256_state s256;
+      struct sha512_state s384;
+   } d;
+
+   if (mlen == 20)
+   {
+      hmac_sha1_init(&h.h1, key, 20);
+      hmac_sha1_update(&h.h1, hdr, 13);
+      hmac_sha1_update(&h.h1, data, len);
+      hmac_sha1_final(&h.h1, out);
+      sha1_stream_init(&d.s1);
+      sha1_stream_update(&d.s1, zeros, pad);
+   }
+   else if (mlen == 32)
+   {
+      hmac_sha256_init(&h.h256, key, 32);
+      hmac_sha256_update(&h.h256, hdr, 13);
+      hmac_sha256_update(&h.h256, data, len);
+      hmac_sha256_final(&h.h256, out);
+      sha256_stream_init(&d.s256, 0);
+      sha256_stream_update(&d.s256, zeros, pad);
+   }
+   else
+   {
+      hmac_sha384_init(&h.h384, key, 48);
+      hmac_sha384_update(&h.h384, hdr, 13);
+      hmac_sha384_update(&h.h384, data, len);
+      hmac_sha384_final(&h.h384, out);
+      sha512_stream_init(&d.s384, 1);
+      sha512_stream_update(&d.s384, zeros, pad);
+   }
+}
+
 static int tls_suite_is_sha384(unsigned suite)
 {
-   return tls_suite_is_aes256(suite);
+   const struct tls_suite_info *i = tls_suite(suite);
+   return i && i->sha384;
 }
 
 /* TLS 1.2 PRF: P_<hash>(secret, label || seed), hash per suite. */
@@ -431,7 +846,7 @@ static size_t tls_transcript(const struct ssl_state *s, uint8_t *out)
 static void tls_cork(struct ssl_state *s)
 {
    s->corked   = 1;
-   s->cork_len = 0;
+   s->cork_len = s->cork_off = 0;
 }
 
 /* Sends what was corked in one write. */
@@ -439,12 +854,14 @@ static int tls_uncork(struct ssl_state *s)
 {
    int ok = 1;
    s->corked = 0;
+   if (s->connect_nonblock)
+      return 0;
    if (s->cork_len)
       ok = socket_send_all_blocking(s->fd, s->cork, s->cork_len, true);
    s->cork_len = 0;
    if (!ok)
    {
-      s->last_err = TLS_ERR_SOCKET;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_SOCKET);
       return -1;
    }
    return 0;
@@ -505,6 +922,33 @@ static int tls_seal_record(struct ssl_state *s, uint8_t type,
       tls_put16(rec + 3, (unsigned)(rec_len - 5));
       s->cseq++;
    }
+   else if (tls_suite_is_cbc(s->suite))
+   {
+      /* MAC-then-encrypt (RFC 5246 6.2.3.2): an explicit random IV,
+       * then data || MAC || padding under AES-CBC */
+      const struct aes_ctx *a = tls_cbc(s, &s->wcbc, s->cwk);
+      size_t   plen = len + tls_suite_mac_len(s->suite);
+      size_t   pad  = 16 - (plen & 15);
+      uint8_t *body = rec + 5 + 16;
+      uint8_t  hdr[13];
+      uint8_t  iv[16];
+
+      if (!a || crypto_random_bytes(rec + 5, 16) != 0)
+         goto fail;
+      crypto_store64_be(hdr, s->cseq);
+      hdr[8]  = type;
+      hdr[9]  = 3;
+      hdr[10] = 3;
+      tls_put16(hdr + 11, (unsigned)len);
+      memcpy(body, data, len);
+      tls_cbc_mac(s, s->cmac, hdr, data, len, 0, body + len);
+      memset(body + plen, (int)(pad - 1), pad);
+      memcpy(iv, rec + 5, 16);
+      aes_cbc_encrypt(a, iv, body, body, plen + pad);
+      rec_len = 5 + 16 + plen + pad;
+      tls_put16(rec + 3, (unsigned)(rec_len - 5));
+      s->cseq++;
+   }
    else
    {
       uint8_t aad[13];
@@ -549,25 +993,106 @@ static int tls_seal_record(struct ssl_state *s, uint8_t type,
    return 0;
 
 fail:
-   s->last_err = TLS_ERR_CIPHER;
+   retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_CIPHER);
    return -1;
 }
 
 /* Put a pending non-blocking record on the wire before anything else
  * goes out, so records leave in sequence order. */
+static int tls_control_push(struct ssl_state *s);
+
 static int tls_tx_drain_blocking(struct ssl_state *s)
 {
-   if (s->tx_off >= s->tx_len)
-      return 0;
-   socket_set_block(s->fd, true);
-   if (!socket_send_all_blocking(s->fd, s->tx + s->tx_off,
-            s->tx_len - s->tx_off, true))
+   int result;
+   while ((result = tls_control_push(s)) == 0)
    {
-      s->last_err = TLS_ERR_SOCKET;
+      bool write = true;
+      if (!socket_wait(s->fd, NULL, &write, SSL_SOCKET_IO_TIMEOUT_MS) || !write)
+      {
+         retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_SOCKET);
+         return -1;
+      }
+   }
+   tls_set_block(s, true);
+   return result < 0 ? -1 : 0;
+}
+
+/* Seal into the cork or the application's reusable record buffer. */
+static int tls_connect_record(struct ssl_state *s, uint8_t type,
+      const uint8_t *data, size_t len)
+{
+   size_t sealed;
+   if (5 + len + TLS_REC_OVERHEAD <= TLS_CORK_MAX - s->cork_len)
+   {
+      if (tls_seal_record(s, type, data, len,
+               s->cork + s->cork_len, &sealed) != 0)
+         return -1;
+      s->cork_len += sealed;
+      return 0;
+   }
+   if (s->tx_off < s->tx_len)
+   {
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_HANDSHAKE);
       return -1;
    }
-   s->tx_off = s->tx_len = 0;
+   if (!s->tx && !(s->tx = (uint8_t*)malloc(5 + TLS_REC_MAX + TLS_REC_OVERHEAD)))
+   {
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_MEMORY);
+      return -1;
+   }
+   if (tls_seal_record(s, type, data, len, s->tx, &s->tx_len) != 0)
+      return -1;
+   s->tx_off = 0;
    return 0;
+}
+
+static int tls_connect_push(struct ssl_state *s, bool cork)
+{
+   uint8_t *data = cork ? s->cork : s->tx;
+   size_t *offset = cork ? &s->cork_off : &s->tx_off;
+   size_t *length = cork ? &s->cork_len : &s->tx_len;
+   ssize_t n = socket_send_all_nonblocking(s->fd, data + *offset,
+         *length - *offset, true);
+   if (n < 0)
+   {
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_SOCKET);
+      return -1;
+   }
+   *offset += (size_t)n;
+   if (*offset == *length)
+      *offset = *length = 0;
+   else
+      s->connect_write = true;
+   return 0;
+}
+
+/* One record is sealed or one pending span is written per call. */
+static int tls_connect_output(struct ssl_state *s)
+{
+   if (s->tx_off < s->tx_len)
+      return tls_connect_push(s, s->cork_off < s->cork_len);
+   if (s->connect_message)
+   {
+      size_t length = s->connect_length - s->connect_offset;
+      if (length > TLS_REC_MAX)
+         length = TLS_REC_MAX;
+      if (s->cork_len && 5 + length + TLS_REC_OVERHEAD > TLS_CORK_MAX - s->cork_len)
+         return tls_connect_push(s, true);
+      if (tls_connect_record(s, TLS_CT_HANDSHAKE,
+               s->connect_message + s->connect_offset, length) != 0)
+         return -1;
+      s->connect_offset += length;
+      if (s->connect_offset == s->connect_length)
+      {
+         free(s->connect_message);
+         s->connect_message = NULL;
+         s->connect_length = s->connect_offset = 0;
+      }
+      return 0;
+   }
+   if (!s->corked && s->cork_off < s->cork_len)
+      return tls_connect_push(s, true);
+   return 1;
 }
 
 static int tls_send_record(struct ssl_state *s, uint8_t type,
@@ -579,12 +1104,14 @@ static int tls_send_record(struct ssl_state *s, uint8_t type,
 
    if (len > TLS_REC_MAX)
       return -1;
+   if (s->connect_nonblock)
+      return tls_connect_record(s, type, data, len);
    if (!s->corked && tls_tx_drain_blocking(s) != 0)
       return -1;
 
    if (!(rec = (uint8_t*)malloc(5 + len + TLS_REC_OVERHEAD)))
    {
-      s->last_err = TLS_ERR_MEMORY;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_MEMORY);
       return -1;
    }
    if (tls_seal_record(s, type, data, len, rec, &rec_len) != 0)
@@ -593,14 +1120,21 @@ static int tls_send_record(struct ssl_state *s, uint8_t type,
       return -1;
    }
 
-   if (s->corked)
+   if (s->corked && s->cork_len + rec_len > TLS_CORK_MAX && s->cork_len)
    {
-      if (s->cork_len + rec_len > TLS_CORK_MAX)
+      /* a flight larger than the cork (a client certificate chain)
+       * goes out in more than one write */
+      ok = socket_send_all_blocking(s->fd, s->cork, s->cork_len, true);
+      s->cork_len = 0;
+      if (!ok)
       {
          free(rec);
-         s->last_err = TLS_ERR_CIPHER;
+         retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_SOCKET);
          return -1;
       }
+   }
+   if (s->corked && rec_len <= TLS_CORK_MAX)
+   {
       memcpy(s->cork + s->cork_len, rec, rec_len);
       s->cork_len += rec_len;
       free(rec);
@@ -610,7 +1144,7 @@ static int tls_send_record(struct ssl_state *s, uint8_t type,
    free(rec);
    if (!ok)
    {
-      s->last_err = TLS_ERR_SOCKET;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_SOCKET);
       return -1;
    }
    return 0;
@@ -637,34 +1171,54 @@ static bool tls_recv_exact(struct ssl_state *s, uint8_t *buf, size_t len)
    return true;
 }
 
-/* Reads one record into s->rx, decrypting in place once the server
- * write keys are in force. On return *type is the content type, and
- * *body / *len the plaintext. */
-/* One record, its body in *body: decrypted in place in s->rx, or -
- * when @dst is given and the record's plaintext fits @dst_cap - into
- * @dst, so application data lands where the caller wants it with no
- * copy. The AEADs check the tag before writing anything. */
+/* Retain incomplete headers and bodies in the record buffer. */
+static int tls_record_part(struct ssl_state *s, size_t target, bool nonblock)
+{
+   if (s->rx_len < target)
+   {
+      if (nonblock)
+      {
+         bool error = false;
+         ssize_t n = socket_receive_all_nonblocking(s->fd, &error,
+               s->rx + s->rx_len, target - s->rx_len);
+         if (n < 0 || error)
+            goto error;
+         s->rx_len += (size_t)n;
+      }
+      else
+      {
+         if (!tls_recv_exact(s, s->rx + s->rx_len, target - s->rx_len))
+            goto error;
+         s->rx_len = target;
+      }
+   }
+   return s->rx_len < target ? 1 : 0;
+error:
+   retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_SOCKET);
+   return -1;
+}
+
+/* One record, decrypted in rx or directly into dst when it fits.
+ * The AEADs verify before writing. 1 retains partial input, 0 opens
+ * a complete record, -1 fails. */
 static int tls_read_record_to(struct ssl_state *s, uint8_t *type,
-      const uint8_t **body, size_t *len, uint8_t *dst, size_t dst_cap)
+      const uint8_t **body, size_t *len, uint8_t *dst, size_t dst_cap,
+      bool nonblock)
 {
    size_t rlen;
-
-   if (!tls_recv_exact(s, s->rx, 5))
-   {
-      s->last_err = TLS_ERR_SOCKET;
-      return -1;
-   }
+   int result = tls_record_part(s, 5, nonblock);
+   if (result)
+      return result;
    rlen = tls_get16(s->rx + 3);
-   if (s->rx[1] != 3 || rlen > TLS_REC_MAX + 256 || rlen == 0)
+   if (s->rx[1] != 3 || rlen > TLS_REC_IN_MAX || rlen == 0)
    {
-      s->last_err = TLS_ERR_RECORD;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_RECORD);
       return -1;
    }
-   if (!tls_recv_exact(s, s->rx + 5, rlen))
-   {
-      s->last_err = TLS_ERR_SOCKET;
-      return -1;
-   }
+   result = tls_record_part(s, 5 + rlen, nonblock);
+   if (result)
+      return result;
+   s->rx_len = 0;
    *type = s->rx[0];
 
    if (!s->rx_encrypted || (s->v13 && *type == TLS_CT_CCS))
@@ -711,6 +1265,50 @@ static int tls_read_record_to(struct ssl_state *s, uint8_t *type,
       *type = o[plen - 1];
       *body = o;
       *len  = plen - 1;
+   }
+   else if (tls_suite_is_cbc(s->suite))
+   {
+      /* The padding is checked over the last 256 octets whatever its
+       * claimed length, and a bad one is taken as none, so that the
+       * MAC is computed and compared either way: a padding error and a
+       * MAC error look the same, in the result and in time. */
+      const struct aes_ctx *a = tls_cbc(s, &s->rcbc, s->swk);
+      size_t   mlen = tls_suite_mac_len(s->suite);
+      uint8_t *c    = s->rx + 5 + 16;
+      size_t   clen = rlen - 16;
+      size_t   dlen, i, maxpad;
+      unsigned pad;
+      unsigned good;
+      uint8_t  hdr[13];
+      uint8_t  mac[48];
+
+      if (!a || rlen < 32 || (clen & 15) || clen < mlen + 1)
+         goto bad;
+      aes_cbc_decrypt(a, s->rx + 5, c, c, clen);
+      pad    = c[clen - 1];
+      maxpad = clen - mlen - 1;
+      if (maxpad > 255)
+         maxpad = 255;
+      good   = 0u - (unsigned)((size_t)pad <= maxpad);
+      for (i = 0; i < 256 && i < clen; i++)
+      {
+         unsigned in  = 0u - (unsigned)(i <= (size_t)pad);
+         unsigned neq = (unsigned)(c[clen - 1 - i] ^ pad);
+         good &= ~in | (0u - (unsigned)(neq == 0));
+      }
+      pad  &= good;
+      dlen  = clen - mlen - 1 - pad;
+      crypto_store64_be(hdr, s->sseq);
+      hdr[8]  = *type;
+      hdr[9]  = 3;
+      hdr[10] = 3;
+      tls_put16(hdr + 11, (unsigned)dlen);
+      tls_cbc_mac(s, s->smac, hdr, c, dlen, pad + 1, mac);
+      if (!(crypto_memeq_ct(mac, c + dlen, mlen) & good & 1))
+         goto bad;
+      s->sseq++;
+      *body = c;
+      *len  = dlen;
    }
    else
    {
@@ -769,20 +1367,23 @@ static int tls_read_record_to(struct ssl_state *s, uint8_t *type,
       /* close_notify is a clean end; anything else is an error. */
       s->closed = 1;
       if (*len < 2 || (*body)[1] != 0)
-         s->last_err = TLS_ERR_ALERT;
+         retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_ALERT);
       return -1;
    }
    return 0;
 
 bad:
-   s->last_err = TLS_ERR_CIPHER;
+   retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_CIPHER);
    return -1;
 }
 
 static int tls_read_record(struct ssl_state *s, uint8_t *type,
       const uint8_t **body, size_t *len)
 {
-   return tls_read_record_to(s, type, body, len, NULL, 0);
+   int result = tls_read_record_to(s, type, body, len, NULL, 0, s->connect_nonblock);
+   if (result > 0)
+      s->connect_read = true;
+   return result;
 }
 
 static int tls_send_alert(struct ssl_state *s, uint8_t level, uint8_t desc)
@@ -800,6 +1401,7 @@ static int tls_send_alert(struct ssl_state *s, uint8_t level, uint8_t desc)
 static int tls_read_handshake(struct ssl_state *s, uint8_t *msg_type,
       const uint8_t **body, size_t *len)
 {
+   bool record_read = false;
    for (;;)
    {
       uint8_t type;
@@ -816,7 +1418,9 @@ static int tls_read_handshake(struct ssl_state *s, uint8_t *msg_type,
             *body     = m + 4;
             *len      = mlen;
             sha256_stream_update(&s->transcript, m, 4 + mlen);
-         sha512_stream_update(&s->transcript384, m, 4 + mlen);
+            sha512_stream_update(&s->transcript384, m, 4 + mlen);
+            if (s->cfg.chain_count)
+               sha1_stream_update(&s->transcript1, m, 4 + mlen);
             s->hs_off += 4 + mlen;
             return 0;
          }
@@ -825,19 +1429,25 @@ static int tls_read_handshake(struct ssl_state *s, uint8_t *msg_type,
       /* Pull another record. Consumed messages stay where they are:
        * the parsed Certificate points into this buffer for the rest
        * of the handshake, and a whole handshake fits in it. */
+      if (s->connect_nonblock && record_read)
+      {
+         s->connect_read = true;
+         return -1;
+      }
       if (tls_read_record(s, &type, &rb, &rl) != 0)
          return -1;
+      record_read = true;
       /* a 1.3 server's compatibility ChangeCipherSpec carries nothing */
       if (s->v13 && type == TLS_CT_CCS)
          continue;
       if (type != TLS_CT_HANDSHAKE)
       {
-         s->last_err = TLS_ERR_HANDSHAKE;
+         retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_HANDSHAKE);
          return -1;
       }
       if (s->hs_len + rl > TLS_HS_MAX)
       {
-         s->last_err = TLS_ERR_HANDSHAKE;
+         retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_HANDSHAKE);
          return -1;
       }
       memcpy(s->hs + s->hs_len, rb, rl);
@@ -849,20 +1459,40 @@ static int tls_send_handshake(struct ssl_state *s, uint8_t msg_type,
       const uint8_t *body, size_t len)
 {
    uint8_t *m;
+   size_t   off;
    int ret;
+   if (len > 0xffffffU || (s->connect_nonblock && s->connect_message))
+   {
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_HANDSHAKE);
+      return -1;
+   }
    if (!(m = (uint8_t*)malloc(4 + len)))
    {
-      s->last_err = TLS_ERR_MEMORY;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_MEMORY);
       return -1;
    }
    m[0] = msg_type;
    m[1] = (uint8_t)(len >> 16);
    m[2] = (uint8_t)(len >> 8);
    m[3] = (uint8_t)len;
-   memcpy(m + 4, body, len);
+   if (len)
+      memcpy(m + 4, body, len);
    sha256_stream_update(&s->transcript, m, 4 + len);
    sha512_stream_update(&s->transcript384, m, 4 + len);
-   ret = tls_send_record(s, TLS_CT_HANDSHAKE, m, 4 + len);
+   if (s->cfg.chain_count)
+      sha1_stream_update(&s->transcript1, m, 4 + len);
+   if (s->connect_nonblock)
+   {
+      s->connect_message = m;
+      s->connect_length = 4 + len;
+      s->connect_offset = 0;
+      return 0;
+   }
+   /* a certificate chain may need more than one record */
+   ret = 0;
+   for (off = 0; ret == 0 && off < 4 + len; off += TLS_REC_MAX)
+      ret = tls_send_record(s, TLS_CT_HANDSHAKE, m + off,
+            4 + len - off < TLS_REC_MAX ? 4 + len - off : TLS_REC_MAX);
    free(m);
    return ret;
 }
@@ -890,16 +1520,20 @@ static int tls_send_client_hello(struct ssl_state *s)
       0xcc, 0xa9, 0xcc, 0xa8, 0xc0, 0x2b, 0xc0, 0x2f, 0xc0, 0x2c, 0xc0, 0x30
    };
    const uint8_t *suites = crypto_aes_hw() ? suites_aes : suites_chacha;
+   size_t   suites_len   = sizeof(suites_aes);
+   uint8_t  own[2 * 24];
    uint8_t *h;
    uint8_t *p;
    uint8_t  iplit[16];
    /* No server_name for an IP address: RFC 6066 3 allows host names
     * only, and the certificate is checked against the address anyway. */
-   size_t   dlen = (s->domain && !x509_parse_ip(s->domain, iplit))
+   size_t   dlen = (s->domain && !(s->cfg.flags & SSL_RETRO_NO_SNI)
+         && !x509_parse_ip(s->domain, iplit))
       ? strlen(s->domain) : 0;
    size_t   ext_len;
    int      ret;
-   const struct tls_session *cached;
+   const struct tls_session *cached = NULL;
+   bool cache_open;
    size_t   ticket_len;
    uint8_t *ticket = NULL;
    size_t   cached_sid_len = 0;
@@ -909,10 +1543,49 @@ static int tls_send_client_hello(struct ssl_state *s)
    size_t   bhlen = 32;          /* binder hash length: the ticket's suite */
    uint32_t obf_age = 0;
 
+   /* the configured suites, or the default set, and whether 1.3 is
+    * among them */
+   s->offer13       = 1;
+   s->offered_count = 0;
+   if (s->cfg.suites)
+   {
+      unsigned i;
+      s->offer13 = 0;
+      for (i = 0; i < s->cfg.suite_count && s->offered_count < 24; i++)
+      {
+         const struct tls_suite_info *si = tls_suite(s->cfg.suites[i]);
+         if (!si || (si->kx == TLS_KX_13 && s->cfg.chain_count))
+            continue;
+         if (si->kx == TLS_KX_13)
+            s->offer13 = 1;
+         tls_put16(own + 2 * s->offered_count, si->id);
+         s->offered[s->offered_count++] = si->id;
+      }
+      suites     = own;
+      suites_len = 2 * s->offered_count;
+   }
+   else
+   {
+      unsigned i;
+      for (i = 0; i < sizeof(suites_aes) / 2; i++)
+         s->offered[s->offered_count++] = tls_get16(suites + 2 * i);
+      if (s->cfg.chain_count)
+      {
+         /* a client certificate runs 1.2: drop the 1.3 suites */
+         suites        += 6;
+         suites_len    -= 6;
+         s->offered_count = 0;
+         for (i = 0; i < suites_len / 2; i++)
+            s->offered[s->offered_count++] = tls_get16(suites + 2 * i);
+         s->offer13 = 0;
+      }
+   }
+
    /* the cache entry is copied out here, so nothing below reads it
     * once another thread may be rewriting the slot */
-   TLS_CACHE_LOCK();
-   cached     = tls_cache_find(s->domain);
+   cache_open = !s->configured && tls_cache_begin(s->connect_nonblock);
+   if (cache_open)
+      cached = tls_cache_find(s->domain);
    ticket_len = (cached && cached->ticket) ? cached->ticket_len : 0;
    if (ticket_len && (ticket = (uint8_t*)malloc(ticket_len)))
       memcpy(ticket, cached->ticket, ticket_len);
@@ -923,14 +1596,21 @@ static int tls_send_client_hello(struct ssl_state *s)
       memcpy(cached_sid, cached->sid, cached->sid_len);
       cached_sid_len = cached->sid_len;
    }
-   if (cached && cached->is13 && ticket_len)
+   s->cached_suite = 0;
+   if (cached && !cached->is13)
+   {
+      memcpy(s->master, cached->master, sizeof(s->master));
+      s->cached_suite = cached->suite;
+   }
+   if (cached && cached->is13 && ticket_len && s->offer13)
    {
       cached_is13 = 1;
       cached_suite13 = cached->suite;
       memcpy(s->psk, cached->psk, 48);
       obf_age = (uint32_t)((time(NULL) - cached->when) * 1000) + cached->age_add;
    }
-   TLS_CACHE_UNLOCK();
+   if (cache_open)
+      TLS_CACHE_READ_END();
    s->psk_offered  = 0;
    s->psk_accepted = 0;
 
@@ -943,13 +1623,13 @@ static int tls_send_client_hello(struct ssl_state *s)
          || crypto_random_bytes(s->xpriv, 32) != 0 || x25519_base(s->xpub, s->xpriv) != 0)
    {
       free(ticket);
-      s->last_err = TLS_ERR_KEX;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_KEX);
       return -1;
    }
    if (!(h = (uint8_t*)malloc(400 + dlen + ticket_len)))
    {
       free(ticket);
-      s->last_err = TLS_ERR_MEMORY;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_MEMORY);
       return -1;
    }
    p = h;
@@ -971,8 +1651,8 @@ static int tls_send_client_hello(struct ssl_state *s)
    }
    *p++ = (uint8_t)s->offered_sid_len;
    memcpy(p, s->offered_sid, s->offered_sid_len); p += s->offered_sid_len;
-   tls_put16(p, sizeof(suites_aes)); p += 2;
-   memcpy(p, suites, sizeof(suites_aes)); p += sizeof(suites_aes);
+   tls_put16(p, (unsigned)suites_len); p += 2;
+   memcpy(p, suites, suites_len); p += suites_len;
    *p++ = 1; *p++ = 0;                             /* null compression */
 
    {
@@ -1003,16 +1683,19 @@ static int tls_send_client_hello(struct ssl_state *s)
       tls_put16(e, 0x0401); e += 2;   /* rsa_pkcs1_sha256 */
       tls_put16(e, 0x0501); e += 2;   /* rsa_pkcs1_sha384 */
       tls_put16(e, 0x0601); e += 2;   /* rsa_pkcs1_sha512 */
-      /* supported_versions: 1.3 then 1.2 */
-      tls_put16(e, 43); e += 2; tls_put16(e, 5); e += 2; *e++ = 4;
-      tls_put16(e, 0x0304); e += 2; tls_put16(e, 0x0303); e += 2;
-      /* key_share: x25519 and secp256r1, so no server needs a retry */
-      tls_put16(e, 51); e += 2; tls_put16(e, 2 + 4 + 32 + 4 + 65); e += 2;
-      tls_put16(e, 4 + 32 + 4 + 65); e += 2;
-      tls_put16(e, 29); e += 2; tls_put16(e, 32); e += 2;
-      memcpy(e, s->xpub, 32); e += 32;
-      tls_put16(e, 23); e += 2; tls_put16(e, 65); e += 2;
-      memcpy(e, s->pub, 65); e += 65;
+      if (s->offer13)
+      {
+         /* supported_versions: 1.3 then 1.2 */
+         tls_put16(e, 43); e += 2; tls_put16(e, 5); e += 2; *e++ = 4;
+         tls_put16(e, 0x0304); e += 2; tls_put16(e, 0x0303); e += 2;
+         /* key_share: x25519 and secp256r1, so no server needs a retry */
+         tls_put16(e, 51); e += 2; tls_put16(e, 2 + 4 + 32 + 4 + 65); e += 2;
+         tls_put16(e, 4 + 32 + 4 + 65); e += 2;
+         tls_put16(e, 29); e += 2; tls_put16(e, 32); e += 2;
+         memcpy(e, s->xpub, 32); e += 32;
+         tls_put16(e, 23); e += 2; tls_put16(e, 65); e += 2;
+         memcpy(e, s->pub, 65); e += 65;
+      }
       /* renegotiation_info: initial, empty */
       tls_put16(e, 0xff01); e += 2; tls_put16(e, 1); e += 2; *e++ = 0;
       /* session_ticket (1.2): the cached ticket, or empty to say we
@@ -1029,7 +1712,10 @@ static int tls_send_client_hello(struct ssl_state *s)
          tls_put16(e, 0); e += 2;
       }
       /* psk_key_exchange_modes: psk_dhe_ke */
-      tls_put16(e, 45); e += 2; tls_put16(e, 2); e += 2; *e++ = 1; *e++ = 1;
+      if (s->offer13)
+      {
+         tls_put16(e, 45); e += 2; tls_put16(e, 2); e += 2; *e++ = 1; *e++ = 1;
+      }
       if (cached_is13)
       {
          /* pre_shared_key, last: one identity (the ticket, obfuscated
@@ -1082,7 +1768,7 @@ static int tls_send_client_hello(struct ssl_state *s)
             || tls13_expand_label_h(bhlen, bkey, "finished", NULL, 0, fkey, bhlen) != 0)
       {
          free(h); free(ticket);
-         s->last_err = TLS_ERR_KEX;
+         retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_KEX);
          return -1;
       }
       tls13_hmac(bhlen, fkey, th, bhlen, h + trunc + 3);
@@ -1092,6 +1778,15 @@ static int tls_send_client_hello(struct ssl_state *s)
    free(h);
    free(ticket);
    return ret;
+}
+
+static int tls_offered(const struct ssl_state *s, unsigned suite)
+{
+   unsigned i;
+   for (i = 0; i < s->offered_count; i++)
+      if (s->offered[i] == suite)
+         return 1;
+   return 0;
 }
 
 static int tls_recv_server_hello(struct ssl_state *s)
@@ -1107,7 +1802,7 @@ static int tls_recv_server_hello(struct ssl_state *s)
       goto bad;
    if (b[0] != 3 || b[1] != 3)
    {
-      s->last_err = TLS_ERR_VERSION;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_VERSION);
       return -1;
    }
    memcpy(s->server_random, b + 2, 32);
@@ -1115,10 +1810,7 @@ static int tls_recv_server_hello(struct ssl_state *s)
    if (len < 35 + sid + 3)
       goto bad;
    suite = tls_get16(b + 35 + sid);
-   if (suite != TLS_SUITE_ECDHE_ECDSA_AES128_GCM && suite != TLS_SUITE_ECDHE_RSA_AES128_GCM
-         && suite != TLS_SUITE_ECDHE_RSA_CHACHA20 && suite != TLS_SUITE_ECDHE_ECDSA_CHACHA20
-         && suite != TLS_SUITE_ECDHE_ECDSA_AES256_GCM && suite != TLS_SUITE_ECDHE_RSA_AES256_GCM
-         && !tls_suite_is_13(suite))
+   if (!tls_offered(s, suite))
       goto bad;
    if (b[35 + sid + 2] != 0)
       goto bad;   /* compression */
@@ -1143,7 +1835,7 @@ static int tls_recv_server_hello(struct ssl_state *s)
          const uint8_t *ed = b + off + 4;
          if (off + 4 + edata > len)
             goto bad;
-         if (etype == 43 && edata == 2 && tls_get16(ed) == 0x0304)
+         if (etype == 43 && edata == 2 && tls_get16(ed) == 0x0304 && s->offer13)
             s->v13 = 1;
          if (etype == 41 && edata == 2 && tls_get16(ed) == 0 && s->psk_offered)
             s->psk_accepted = 1;
@@ -1163,7 +1855,7 @@ static int tls_recv_server_hello(struct ssl_state *s)
       }
       if (memcmp(s->server_random, hrr_random, 8) == 0)
       {
-         s->last_err = TLS_ERR_KEX;
+         retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_KEX);
          return -1;
       }
    }
@@ -1173,6 +1865,8 @@ static int tls_recv_server_hello(struct ssl_state *s)
             || sid != s->offered_sid_len || memcmp(b + 35, s->offered_sid, sid) != 0)
          goto bad;
       s->resumed = 0;
+      crypto_memzero(s->master, sizeof(s->master));
+      s->cached_suite = 0;
       s->expect_ticket = 0;
       return 0;
    }
@@ -1181,20 +1875,16 @@ static int tls_recv_server_hello(struct ssl_state *s)
 
    /* Resumption: the offered id echoed back, and the cached suite. */
    s->resumed = 0;
-   if (sid && sid == s->offered_sid_len && memcmp(b + 35, s->offered_sid, sid) == 0)
+   if (sid && sid == s->offered_sid_len && memcmp(b + 35, s->offered_sid, sid) == 0
+         && !s->configured)
    {
-      const struct tls_session *cached;
-      TLS_CACHE_LOCK();
-      cached = tls_cache_find(s->domain);
-      if (cached && cached->suite == suite)
-      {
-         memcpy(s->master, cached->master, 48);
-         s->resumed = 1;
-      }
-      TLS_CACHE_UNLOCK();
-      if (!s->resumed)
+      if (s->cached_suite != suite)
          goto bad;
+      s->resumed = 1;
    }
+   if (!s->resumed)
+      crypto_memzero(s->master, sizeof(s->master));
+   s->cached_suite = 0;
    /* extensions: session_ticket (35) present means a ticket follows */
    s->expect_ticket = 0;
    if (len > 35 + sid + 3 + 2)
@@ -1223,8 +1913,41 @@ static int tls_recv_server_hello(struct ssl_state *s)
    return 0;
 
 bad:
-   s->last_err = TLS_ERR_HANDSHAKE;
+   retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_HANDSHAKE);
    return -1;
+}
+
+/* The server's chain against the trust anchors - the connection's own
+ * or the bundle - under the connection's verify policy. With an RSA key
+ * exchange the leaf's key enciphers rather than signs. */
+static int tls_verify_peer(struct ssl_state *s, const uint8_t **ders,
+      const size_t *lens, unsigned n)
+{
+   const struct tls_suite_info *si = tls_suite(s->suite);
+   const char *host = (s->cfg.flags & SSL_RETRO_NO_HOSTNAME) ? NULL : s->domain;
+   char info[128];
+
+   if (s->verify_mode == 2 || (s->cfg.flags & SSL_RETRO_NO_VERIFY))
+   {
+      ssl_socket_log_verify_disabled(s->domain);
+      return 0;
+   }
+   if (!s->cfg.trust)
+      tls_trust_load();
+   info[0] = '\0';
+   if (x509_verify_chain_ex(ders, lens, n, host, time(NULL),
+            s->cfg.trust, s->cfg.trust_lens, s->cfg.trust_count,
+            (si && si->kx == TLS_KX_RSA) ? X509_VERIFY_KEY_ENCIPHERMENT : 0,
+            info, sizeof(info)) != 0)
+   {
+      ssl_socket_log_verify_fail(s->verify_mode == 0, s->domain, info);
+      if (s->verify_mode == 0)
+      {
+         retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_CERT);
+         return -1;
+      }
+   }
+   return 0;
 }
 
 /* Certificate: 3-octet total length, then 3-octet length + DER each.
@@ -1238,7 +1961,6 @@ static int tls_recv_certificate(struct ssl_state *s, struct x509_cert *leaf)
    size_t lens[16];
    size_t len, total, off;
    unsigned n = 0;
-   char info[128];
 
    if (tls_read_handshake(s, &type, &b, &len) != 0)
       return -1;
@@ -1263,30 +1985,14 @@ static int tls_recv_certificate(struct ssl_state *s, struct x509_cert *leaf)
       goto bad;
    if (x509_parse(leaf, ders[0], lens[0]) != 0 || leaf->key_type == X509_KEY_NONE)
    {
-      s->last_err = TLS_ERR_CERT;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_CERT);
       return -1;
    }
 
-   if (s->verify_mode == 2)
-   {
-      ssl_socket_log_verify_disabled(s->domain);
-      return 0;
-   }
-   tls_trust_load();
-   info[0] = '\0';
-   if (x509_verify_chain(ders, lens, n, s->domain, time(NULL), info, sizeof(info)) != 0)
-   {
-      ssl_socket_log_verify_fail(s->verify_mode == 0, s->domain, info);
-      if (s->verify_mode == 0)
-      {
-         s->last_err = TLS_ERR_CERT;
-         return -1;
-      }
-   }
-   return 0;
+   return tls_verify_peer(s, ders, lens, n);
 
 bad:
-   s->last_err = TLS_ERR_HANDSHAKE;
+   retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_HANDSHAKE);
    return -1;
 }
 
@@ -1375,14 +2081,46 @@ static int tls_recv_server_kex(struct ssl_state *s, const struct x509_cert *leaf
    }
    if (ok != 0)
    {
-      s->last_err = TLS_ERR_SIGNATURE;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_SIGNATURE);
       return -1;
    }
    return 0;
 
 bad:
-   s->last_err = TLS_ERR_KEX;
+   retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_KEX);
    return -1;
+}
+
+/* CertificateRequest (RFC 5246 7.4.4): certificate types, signature
+ * schemes, CA names. We answer with our chain when it is an RSA one the
+ * server takes and one of its schemes is one we sign with, otherwise
+ * with an empty Certificate and let the server decide. */
+static int tls_parse_cert_request(struct ssl_state *s, const uint8_t *b, size_t len)
+{
+   static const unsigned prefer[3] = { 0x0401, 0x0501, 0x0201 };
+   size_t   nt, ns, i, j;
+   int      rsa_ok = 0;
+
+   if (len < 1 || len < 1 + (nt = b[0]) + 2)
+      return -1;
+   for (i = 0; i < nt; i++)
+      if (b[1 + i] == 1)   /* rsa_sign */
+         rsa_ok = 1;
+   ns = tls_get16(b + 1 + nt);
+   if ((ns & 1) || len < 1 + nt + 2 + ns + 2)
+      return -1;
+   s->cert_requested = 2;
+   if (!rsa_ok || !s->cfg.chain_count || !s->cfg.key)
+      return 0;
+   for (j = 0; j < 3; j++)
+      for (i = 0; i < ns; i += 2)
+         if (tls_get16(b + 1 + nt + 2 + i) == prefer[j])
+         {
+            s->cv_alg         = prefer[j];
+            s->cert_requested = 1;
+            return 0;
+         }
+   return 0;
 }
 
 static int tls_recv_server_done(struct ssl_state *s)
@@ -1392,12 +2130,53 @@ static int tls_recv_server_done(struct ssl_state *s)
    size_t len;
    if (tls_read_handshake(s, &type, &b, &len) != 0)
       return -1;
+   if (type == TLS_HS_CERT_REQUEST)
+   {
+      if (s->cert_requested || tls_parse_cert_request(s, b, len) != 0)
+      {
+         retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_HANDSHAKE);
+         return -1;
+      }
+      return 1;
+   }
    if (type != TLS_HS_SERVER_DONE || len != 0)
    {
-      s->last_err = TLS_ERR_HANDSHAKE;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_HANDSHAKE);
       return -1;
    }
    return 0;
+}
+
+/* RSA key exchange: a 48-octet premaster, client_version first,
+ * encrypted to the server's certificate key. */
+static int tls_send_client_kex_rsa(struct ssl_state *s,
+      const struct x509_cert *leaf)
+{
+   uint8_t msg[2 + 512];
+   size_t  n_len = leaf->rsa_n_len;
+   int     ret;
+
+   if (leaf->key_type != X509_KEY_RSA)
+   {
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_KEX);
+      return -1;
+   }
+   while (n_len && leaf->rsa_n[leaf->rsa_n_len - n_len] == 0)
+      n_len--;
+   s->premaster[0]  = 3;
+   s->premaster[1]  = 3;
+   s->premaster_len = 48;
+   if (n_len > 512 || crypto_random_bytes(s->premaster + 2, 46) != 0
+         || rsa_pkcs1_encrypt(leaf->rsa_n, leaf->rsa_n_len,
+               leaf->rsa_e, leaf->rsa_e_len, s->premaster, 48,
+               msg + 2, n_len) != 0)
+   {
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_KEX);
+      return -1;
+   }
+   tls_put16(msg, (unsigned)n_len);
+   ret = tls_send_handshake(s, TLS_HS_CLIENT_KEX, msg, 2 + n_len);
+   return ret;
 }
 
 static int tls_send_client_kex(struct ssl_state *s, const uint8_t *peer,
@@ -1410,13 +2189,14 @@ static int tls_send_client_kex(struct ssl_state *s, const uint8_t *peer,
    unsigned tries;
    int r;
 
+   s->premaster_len = slen;
    if (s->group == 29)
    {
       /* X25519: the share made with the ClientHello, shared secret
        * straight from the ladder */
       if (peer_len != 32 || x25519(s->premaster, s->xpriv, peer) != 0)
       {
-         s->last_err = TLS_ERR_KEX;
+         retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_KEX);
          return -1;
       }
       crypto_memzero(s->xpriv, sizeof(s->xpriv));
@@ -1428,7 +2208,7 @@ static int tls_send_client_kex(struct ssl_state *s, const uint8_t *peer,
    {
       if (crypto_random_bytes(s->priv, slen) != 0)
       {
-         s->last_err = TLS_ERR_KEX;
+         retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_KEX);
          return -1;
       }
       r = s->group == 23 ? p256_keygen(s->priv, pub) : p384_keygen(s->priv, pub);
@@ -1437,7 +2217,7 @@ static int tls_send_client_kex(struct ssl_state *s, const uint8_t *peer,
    }
    if (tries == 8)
    {
-      s->last_err = TLS_ERR_KEX;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_KEX);
       return -1;
    }
    r = s->group == 23 ? p256_ecdh(s->priv, peer, s->premaster)
@@ -1445,7 +2225,7 @@ static int tls_send_client_kex(struct ssl_state *s, const uint8_t *peer,
    crypto_memzero(s->priv, sizeof(s->priv));
    if (r != 0 || peer_len != plen)
    {
-      s->last_err = TLS_ERR_KEX;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_KEX);
       return -1;
    }
 
@@ -1454,42 +2234,122 @@ static int tls_send_client_kex(struct ssl_state *s, const uint8_t *peer,
    return tls_send_handshake(s, TLS_HS_CLIENT_KEX, msg, 1 + plen);
 }
 
+/* Certificate: our chain, or nothing when we have none to give. */
+static int tls_send_client_cert(struct ssl_state *s)
+{
+   size_t   total = 0, off;
+   unsigned i, n = s->cert_requested == 1 ? s->cfg.chain_count : 0;
+   uint8_t *m;
+   int      ret;
+
+   for (i = 0; i < n; i++)
+   {
+      size_t length = s->cfg.chain_lens[i];
+      if (length > 0xffffffU - 6 || total > 0xffffffU - 6 - length)
+      {
+         retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_MEMORY);
+         return -1;
+      }
+      total += 3 + length;
+   }
+   if (total > 0xffffff - 3 || !(m = (uint8_t*)malloc(3 + total)))
+   {
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_MEMORY);
+      return -1;
+   }
+   m[0] = (uint8_t)(total >> 16);
+   m[1] = (uint8_t)(total >> 8);
+   m[2] = (uint8_t)total;
+   off  = 3;
+   for (i = 0; i < n; i++)
+   {
+      size_t cl = s->cfg.chain_lens[i];
+      m[off]     = (uint8_t)(cl >> 16);
+      m[off + 1] = (uint8_t)(cl >> 8);
+      m[off + 2] = (uint8_t)cl;
+      memcpy(m + off + 3, s->cfg.chain[i], cl);
+      off += 3 + cl;
+   }
+   ret = tls_send_handshake(s, TLS_HS_CERTIFICATE, m, 3 + total);
+   free(m);
+   return ret;
+}
+
+/* CertificateVerify: the transcript so far, signed with our key in the
+ * scheme picked from the server's CertificateRequest. */
+static int tls_send_cert_verify(struct ssl_state *s)
+{
+   uint8_t  msg[4 + 512];
+   uint8_t  digest[48];
+   size_t   dlen, n_len = s->cfg.key->n_len;
+   const uint8_t *n = s->cfg.key->n;
+   enum rsa_hash hash;
+
+   while (n_len && n[0] == 0)
+   {
+      n++;
+      n_len--;
+   }
+   if (s->cv_alg == 0x0201)
+   {
+      struct sha1_state t = s->transcript1;
+      sha1_stream_final(&t, digest);
+      dlen = 20;
+      hash = RSA_HASH_SHA1;
+   }
+   else if (s->cv_alg == 0x0501)
+   {
+      struct sha512_state t = s->transcript384;
+      sha512_stream_final(&t, digest);
+      dlen = 48;
+      hash = RSA_HASH_SHA384;
+   }
+   else
+   {
+      struct sha256_state t = s->transcript;
+      sha256_stream_final(&t, digest);
+      dlen = 32;
+      hash = RSA_HASH_SHA256;
+   }
+   if (n_len > 512 || rsa_pkcs1_sign(s->cfg.key, hash, digest, dlen,
+            msg + 4, n_len) != 0)
+   {
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_SIGNATURE);
+      return -1;
+   }
+   tls_put16(msg, s->cv_alg);
+   tls_put16(msg + 2, (unsigned)n_len);
+   return tls_send_handshake(s, TLS_HS_CERTIFICATE_VERIFY, msg, 4 + n_len);
+}
+
 /* NewSessionTicket (RFC 5077): lifetime, then the opaque ticket. */
 static int tls_recv_new_session_ticket(struct ssl_state *s)
 {
    uint8_t type;
    const uint8_t *b;
    size_t len, tlen;
-   struct tls_session *e;
+   struct tls_session_put put;
 
    if (tls_read_handshake(s, &type, &b, &len) != 0)
       return -1;
    if (type != 4 || len < 6)
    {
-      s->last_err = TLS_ERR_HANDSHAKE;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_HANDSHAKE);
       return -1;
    }
    tlen = tls_get16(b + 4);
    if (6 + tlen != len || tlen == 0 || tlen > 16384)
    {
-      s->last_err = TLS_ERR_HANDSHAKE;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_HANDSHAKE);
       return -1;
    }
-   TLS_CACHE_LOCK();
-   e = tls_cache_slot(s->domain);
-   if (e)
-   {
-      uint8_t *t = (uint8_t*)malloc(tlen);
-      if (t)
-      {
-         memcpy(t, b + 6, tlen);
-         free(e->ticket);
-         e->ticket     = t;
-         e->ticket_len = tlen;
-         e->when       = time(NULL);
-      }
-   }
-   TLS_CACHE_UNLOCK();
+   if (s->configured)
+      return 0;
+   memset(&put, 0, sizeof(put));
+   put.what       = TLS_PUT_TICKET;
+   put.ticket     = b + 6;
+   put.ticket_len = tlen;
+   tls_cache_put(s->domain, &put, s->connect_nonblock);
    return 0;
 }
 
@@ -1497,32 +2357,34 @@ static int tls_recv_new_session_ticket(struct ssl_state *s)
  * finished; the server's session id too, when it gave one. */
 static void tls_cache_store(struct ssl_state *s)
 {
-   struct tls_session *e;
-   TLS_CACHE_LOCK();
-   e = tls_cache_slot(s->domain);
-   if (e)
-   {
-      memcpy(e->master, s->master, 48);
-      e->is13    = 0;
-      e->suite   = s->suite;
-      e->sid_len = s->offered_sid_len;
-      memcpy(e->sid, s->offered_sid, s->offered_sid_len);
-      e->when    = time(NULL);
-   }
-   TLS_CACHE_UNLOCK();
+   struct tls_session_put put;
+   if (s->configured)
+      return;
+   memset(&put, 0, sizeof(put));
+   put.what    = TLS_PUT_MASTER;
+   put.master  = s->master;
+   put.suite   = s->suite;
+   put.sid     = s->offered_sid;
+   put.sid_len = s->offered_sid_len;
+   tls_cache_put(s->domain, &put, s->connect_nonblock);
 }
 
 /* Key block from a master secret already in s->master. */
 static void tls_expand_keys(struct ssl_state *s)
 {
-   uint8_t key_block[2 * 32 + 2 * 12];
-   size_t  key_len = (tls_suite_is_chacha(s->suite) || tls_suite_is_aes256(s->suite)) ? 32 : 16;
-   size_t  iv_len  = tls_suite_is_chacha(s->suite) ? 12 : 4;
+   uint8_t key_block[2 * 48 + 2 * 32 + 2 * 12];
+   size_t  key_len = tls_suite_key_len(s->suite);
+   size_t  mac_len = tls_suite_mac_len(s->suite);
+   /* a CBC record carries its IV; the AEADs take a fixed part here */
+   size_t  iv_len  = tls_suite_is_cbc(s->suite) ? 0
+      : tls_suite_is_chacha(s->suite) ? 12 : 4;
    const uint8_t *p = key_block;
 
    tls_prf(s, s->master, 48, "key expansion",
          s->server_random, 32, s->client_random, 32,
-         key_block, 2 * key_len + 2 * iv_len);
+         key_block, 2 * mac_len + 2 * key_len + 2 * iv_len);
+   memcpy(s->cmac, p, mac_len); p += mac_len;
+   memcpy(s->smac, p, mac_len); p += mac_len;
    memcpy(s->cwk, p, key_len); p += key_len;
    memcpy(s->swk, p, key_len); p += key_len;
    memcpy(s->civ, p, iv_len);  p += iv_len;
@@ -1532,7 +2394,7 @@ static void tls_expand_keys(struct ssl_state *s)
 
 static void tls_derive_keys(struct ssl_state *s)
 {
-   size_t slen = s->group == 24 ? 48 : 32;
+   size_t slen = s->premaster_len;
    tls_prf(s, s->premaster, slen, "master secret",
          s->client_random, 32, s->server_random, 32, s->master, 48);
    crypto_memzero(s->premaster, sizeof(s->premaster));
@@ -1565,7 +2427,7 @@ static int tls_recv_finished(struct ssl_state *s)
       return -1;
    if (type != TLS_HS_FINISHED || len != 12 || !crypto_memeq_ct(b, verify, 12))
    {
-      s->last_err = TLS_ERR_HANDSHAKE;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_HANDSHAKE);
       return -1;
    }
    return 0;
@@ -1758,7 +2620,6 @@ static int tls13_recv_certificate(struct ssl_state *s, struct x509_cert *leaf)
    uint8_t type;
    const uint8_t *b, *ders[16];
    size_t len, off, total, lens[16], n = 0;
-   char info[128];
 
    if (tls_read_handshake(s, &type, &b, &len) != 0)
       return -1;
@@ -1785,29 +2646,13 @@ static int tls13_recv_certificate(struct ssl_state *s, struct x509_cert *leaf)
    }
    if (!n || x509_parse(leaf, ders[0], lens[0]) != 0 || leaf->key_type == X509_KEY_NONE)
    {
-      s->last_err = TLS_ERR_CERT;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_CERT);
       return -1;
    }
-   if (s->verify_mode == 2)
-   {
-      ssl_socket_log_verify_disabled(s->domain);
-      return 0;
-   }
-   tls_trust_load();
-   info[0] = '\0';
-   if (x509_verify_chain(ders, lens, (unsigned)n, s->domain, time(NULL), info, sizeof(info)) != 0)
-   {
-      ssl_socket_log_verify_fail(s->verify_mode == 0, s->domain, info);
-      if (s->verify_mode == 0)
-      {
-         s->last_err = TLS_ERR_CERT;
-         return -1;
-      }
-   }
-   return 0;
+   return tls_verify_peer(s, ders, lens, (unsigned)n);
 
 bad:
-   s->last_err = TLS_ERR_HANDSHAKE;
+   retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_HANDSHAKE);
    return -1;
 }
 
@@ -1833,7 +2678,7 @@ static int tls13_recv_certificate_verify(struct ssl_state *s, const struct x509_
       return -1;
    if (type != TLS_HS_CERTIFICATE_VERIFY || len < 4)
    {
-      s->last_err = TLS_ERR_HANDSHAKE;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_HANDSHAKE);
       return -1;
    }
    alg     = tls_get16(b);
@@ -1841,7 +2686,7 @@ static int tls13_recv_certificate_verify(struct ssl_state *s, const struct x509_
    sig     = b + 4;
    if (4 + sig_len != len)
    {
-      s->last_err = TLS_ERR_HANDSHAKE;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_HANDSHAKE);
       return -1;
    }
    memset(content, 0x20, 64);
@@ -1867,7 +2712,7 @@ static int tls13_recv_certificate_verify(struct ssl_state *s, const struct x509_
    }
    else
    {
-      s->last_err = TLS_ERR_SIGNATURE;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_SIGNATURE);
       return -1;
    }
    if ((alg == 0x0804 || alg == 0x0805) && leaf->key_type == X509_KEY_RSA)
@@ -1878,7 +2723,7 @@ static int tls13_recv_certificate_verify(struct ssl_state *s, const struct x509_
       ok = x509_verify_ecdsa_digest(leaf, digest, dlen, sig, sig_len);
    if (ok != 0)
    {
-      s->last_err = TLS_ERR_SIGNATURE;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_SIGNATURE);
       return -1;
    }
    return 0;
@@ -1896,7 +2741,7 @@ static int tls13_recv_finished(struct ssl_state *s)
       return -1;
    if (type != TLS_HS_FINISHED || len != hlen || !crypto_memeq_ct(b, expect, hlen))
    {
-      s->last_err = TLS_ERR_HANDSHAKE;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_HANDSHAKE);
       return -1;
    }
    return 0;
@@ -1910,78 +2755,11 @@ static int tls13_send_finished(struct ssl_state *s)
    return tls_send_handshake(s, TLS_HS_FINISHED, mac, tls13_hlen(s));
 }
 
-/* The whole 1.3 handshake after the ServerHello has been read and its
- * key share handed over. */
-static int tls13_handshake(struct ssl_state *s, const uint8_t *peer, size_t peer_len)
-{
-   struct x509_cert leaf;
-   uint8_t type;
-   const uint8_t *b;
-   size_t len;
-   static const uint8_t ccs = 1;
-
-   if (tls13_handshake_keys(s, peer, peer_len) != 0)
-   {
-      s->last_err = TLS_ERR_KEX;
-      return -1;
-   }
-   /* EncryptedExtensions: nothing we act on */
-   if (tls_read_handshake(s, &type, &b, &len) != 0)
-      return -1;
-   if (type != TLS_HS_ENCRYPTED_EXTENSIONS)
-   {
-      s->last_err = TLS_ERR_HANDSHAKE;
-      return -1;
-   }
-   if (s->psk_accepted)
-   {
-      /* resumed: the server proves the PSK with its Finished alone */
-      s->resumed = 1;
-      if (tls13_recv_finished(s) != 0)                 return -1;
-   }
-   else
-   {
-      if (tls13_recv_certificate(s, &leaf) != 0)       return -1;
-      if (tls13_recv_certificate_verify(s, &leaf) != 0) return -1;
-      if (tls13_recv_finished(s) != 0)                 return -1;
-   }
-
-   /* application secrets come from the transcript through the server
-    * Finished; our own Finished goes out under the handshake keys */
-   if (tls13_application_secrets(s) != 0)              return -1;
-   tls_cork(s);
-   /* middlebox-compatibility ChangeCipherSpec, in the clear */
-   s->tx_encrypted = 0;
-   if (tls_send_record(s, TLS_CT_CCS, &ccs, 1) != 0)   return -1;
-   if (tls13_traffic_keys(s, s->c_hs, s->cwk, s->civ) != 0) return -1;
-   s->tx_encrypted = 1;
-   s->cseq         = 0;
-   if (tls13_send_finished(s) != 0)                    return -1;
-   if (tls_uncork(s) != 0)                             return -1;
-
-   /* resumption master secret: the transcript through our Finished */
-   if (tls13_derive_secret(s, s->master13, "res master", s->res_master) != 0)
-      return -1;
-   crypto_memzero(s->master13, sizeof(s->master13));
-   crypto_memzero(s->psk, sizeof(s->psk));
-
-   /* both sides on application keys */
-   if (tls13_traffic_keys(s, s->c_app, s->cwk, s->civ) != 0
-         || tls13_traffic_keys(s, s->s_app, s->swk, s->siv) != 0)
-      return -1;
-   s->cseq = s->sseq = 0;
-   crypto_memzero(s->hs_secret, sizeof(s->hs_secret));
-   crypto_memzero(s->c_hs, sizeof(s->c_hs));
-   crypto_memzero(s->s_hs, sizeof(s->s_hs));
-   s->handshake_done = 1;
-   s->hs_len = s->hs_off = 0;
-   return 0;
-}
-
 /* A post-handshake message on the application stream: tickets are
  * dropped (no PSK resumption), a KeyUpdate rotates the server keys and
  * is answered with our own when asked. */
-static int tls13_post_handshake(struct ssl_state *s, const uint8_t *msg, size_t len)
+static int tls13_post_handshake(struct ssl_state *s, const uint8_t *msg, size_t len,
+      bool nonblock)
 {
    if (len < 4)
       return -1;
@@ -1994,7 +2772,7 @@ static int tls13_post_handshake(struct ssl_state *s, const uint8_t *msg, size_t 
          size_t bl = len - 4, nl, tl;
          uint32_t age_add;
          uint8_t psk[48];
-         struct tls_session *e;
+         struct tls_session_put put;
          if (bl < 9)
             return -1;
          age_add = ((uint32_t)b[4] << 24) | ((uint32_t)b[5] << 16) | ((uint32_t)b[6] << 8) | b[7];
@@ -2004,29 +2782,19 @@ static int tls13_post_handshake(struct ssl_state *s, const uint8_t *msg, size_t 
          tl = tls_get16(b + 9 + nl);
          if (!tl || tl > 16384 || bl < 9 + nl + 2 + tl)
             return -1;
+         if (s->configured)
+            return 0;
          /* PSK = Expand-Label(res_master, "resumption", nonce, 32) */
          if (tls13_expand_label(s, s->res_master, "resumption", b + 9, nl, psk, tls13_hlen(s)) != 0)
             return -1;
-         TLS_CACHE_LOCK();
-         e = tls_cache_slot(s->domain);
-         if (e)
-         {
-            uint8_t *t = (uint8_t*)malloc(tl);
-            if (t)
-            {
-               memcpy(t, b + 9 + nl + 2, tl);
-               free(e->ticket);
-               e->ticket     = t;
-               e->ticket_len = tl;
-               e->is13       = 1;
-               e->suite      = s->suite;
-               e->sid_len    = 0;
-               e->age_add    = age_add;
-               memcpy(e->psk, psk, 48);
-               e->when       = time(NULL);
-            }
-         }
-         TLS_CACHE_UNLOCK();
+         memset(&put, 0, sizeof(put));
+         put.what       = TLS_PUT_PSK;
+         put.ticket     = b + 9 + nl + 2;
+         put.ticket_len = tl;
+         put.suite      = s->suite;
+         put.age_add    = age_add;
+         put.psk        = psk;
+         tls_cache_put(s->domain, &put, nonblock);
          crypto_memzero(psk, sizeof(psk));
          return 0;
       }
@@ -2034,7 +2802,7 @@ static int tls13_post_handshake(struct ssl_state *s, const uint8_t *msg, size_t 
       {
          uint8_t next[48];
          size_t  hlen = tls13_hlen(s);
-         if (len != 5)
+         if (len != 5 || msg[4] > 1)
             return -1;
          if (tls13_expand_label(s, s->s_app, "traffic upd", NULL, 0, next, hlen) != 0)
             return -1;
@@ -2046,6 +2814,13 @@ static int tls13_post_handshake(struct ssl_state *s, const uint8_t *msg, size_t 
          {
             /* update_requested: rotate ours too, announcing it first */
             uint8_t ku[1] = {0};
+            /* In duplex mode the sending side owns our keys: it sends
+             * this before its next record, as RFC 8446 4.6.3 asks */
+            if (nonblock || tls_duplex(s))
+            {
+               retro_atomic_store_release_int(&s->key_update, 1);
+               return 0;
+            }
             if (tls_send_handshake(s, TLS_HS_KEY_UPDATE, ku, 1) != 0)
                return -1;
             if (tls13_expand_label(s, s->c_app, "traffic upd", NULL, 0, next, hlen) != 0)
@@ -2062,89 +2837,237 @@ static int tls13_post_handshake(struct ssl_state *s, const uint8_t *msg, size_t 
    }
 }
 
-static int tls_handshake(struct ssl_state *s)
+static int tls_handshake_step(struct ssl_state *s)
 {
-   struct x509_cert leaf;
-   uint8_t peer[97];
-   size_t  peer_len = 0;
+   struct tls_handshake_progress *progress = &s->connect;
    uint8_t type;
    const uint8_t *b;
-   size_t  len;
+   size_t len;
+   int result;
    static const uint8_t ccs = 1;
 
-   sha256_stream_init(&s->transcript, 0);
-   sha512_stream_init(&s->transcript384, 1);
-   if (crypto_random_bytes(s->client_random, 32) != 0)
-   {
-      s->last_err = TLS_ERR_KEX;
+   if (s->handshake_done)
+      return 1;
+   if (progress->phase == TLS_CONNECT_FAILED)
       return -1;
-   }
-
-   if (tls_send_client_hello(s) != 0)                   return -1;
-   if (tls_recv_server_hello(s) != 0)                   return -1;
-
-   if (s->v13)
-      return tls13_handshake(s, s->tls13_peer, s->tls13_peer_len);
-
-   if (s->resumed)
+   s->connect_read = s->connect_write = false;
+   if (s->connect_nonblock)
    {
-      /* Abbreviated: the server goes first with the cached master. */
-      tls_expand_keys(s);
-      if (s->expect_ticket && tls_recv_new_session_ticket(s) != 0)
+      result = tls_connect_output(s);
+      if (result < 0)
+         goto error;
+      if (!result)
+         return 0;
+   }
+   switch (progress->phase)
+   {
+      case TLS_CONNECT_START:
+         sha256_stream_init(&s->transcript, 0);
+         sha512_stream_init(&s->transcript384, 1);
+         sha1_stream_init(&s->transcript1);
+         if (crypto_random_bytes(s->client_random, 32) != 0)
+         {
+            retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_KEX);
+            goto error;
+         }
+         if (tls_send_client_hello(s) != 0)
+            goto error;
+         progress->phase = TLS_CONNECT_HELLO;
+         break;
+      case TLS_CONNECT_HELLO:
+         if (tls_recv_server_hello(s) != 0)
+            goto error;
+         if (s->v13)
+            progress->phase = TLS_CONNECT_KEYS13;
+         else if (s->resumed)
+         {
+            tls_expand_keys(s);
+            progress->phase = s->expect_ticket
+               ? TLS_CONNECT_TICKET12 : TLS_CONNECT_CCS12;
+         }
+         else
+            progress->phase = TLS_CONNECT_CERT12;
+         break;
+      case TLS_CONNECT_CERT12:
+         if (tls_recv_certificate(s, &progress->leaf) != 0)
+            goto error;
+         progress->phase = tls_suite(s->suite)
+               && tls_suite(s->suite)->kx == TLS_KX_RSA
+            ? TLS_CONNECT_DONE12 : TLS_CONNECT_KEX12;
+         break;
+      case TLS_CONNECT_KEX12:
+         if (tls_recv_server_kex(s, &progress->leaf,
+                  progress->peer, &progress->peer_len) != 0)
+            goto error;
+         progress->phase = TLS_CONNECT_DONE12;
+         break;
+      case TLS_CONNECT_DONE12:
+         result = tls_recv_server_done(s);
+         if (result < 0)
+            goto error;
+         if (!result)
+            progress->phase = TLS_CONNECT_SEND_CERT12;
+         break;
+      case TLS_CONNECT_SEND_CERT12:
+         tls_cork(s);
+         if (s->cert_requested && tls_send_client_cert(s) != 0)
+            goto error;
+         progress->phase = TLS_CONNECT_SEND_KEX12;
+         break;
+      case TLS_CONNECT_SEND_KEX12:
+         if (tls_suite(s->suite) && tls_suite(s->suite)->kx == TLS_KX_RSA)
+            result = tls_send_client_kex_rsa(s, &progress->leaf);
+         else
+            result = tls_send_client_kex(s, progress->peer, progress->peer_len);
+         if (result != 0)
+            goto error;
+         progress->phase = TLS_CONNECT_SEND_VERIFY12;
+         break;
+      case TLS_CONNECT_SEND_VERIFY12:
+         if (s->cert_requested == 1 && tls_send_cert_verify(s) != 0)
+            goto error;
+         tls_derive_keys(s);
+         progress->phase = TLS_CONNECT_SEND_CCS12;
+         break;
+      case TLS_CONNECT_SEND_CCS12:
+         if (s->resumed)
+            tls_cork(s);
+         if (tls_send_record(s, TLS_CT_CCS, &ccs, 1) != 0)
+            goto error;
+         s->tx_encrypted = 1;
+         s->cseq = 0;
+         progress->phase = TLS_CONNECT_SEND_FIN12;
+         break;
+      case TLS_CONNECT_SEND_FIN12:
+         if (tls_send_finished(s) != 0 || tls_uncork(s) != 0)
+            goto error;
+         progress->phase = s->resumed ? TLS_CONNECT_COMPLETE12
+            : (s->expect_ticket ? TLS_CONNECT_TICKET12 : TLS_CONNECT_CCS12);
+         break;
+      case TLS_CONNECT_TICKET12:
+         if (tls_recv_new_session_ticket(s) != 0)
+            goto error;
+         progress->phase = TLS_CONNECT_CCS12;
+         break;
+      case TLS_CONNECT_CCS12:
+         if (tls_read_record(s, &type, &b, &len) != 0)
+            goto error;
+         if (type != TLS_CT_CCS || len != 1 || b[0] != 1)
+         {
+            retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_HANDSHAKE);
+            goto error;
+         }
+         s->rx_encrypted = 1;
+         s->sseq = 0;
+         progress->phase = TLS_CONNECT_FIN12;
+         break;
+      case TLS_CONNECT_FIN12:
+         if (tls_recv_finished(s) != 0)
+            goto error;
+         progress->phase = s->resumed
+            ? TLS_CONNECT_SEND_CCS12 : TLS_CONNECT_COMPLETE12;
+         break;
+      case TLS_CONNECT_COMPLETE12:
+         tls_cache_store(s);
+         s->handshake_done = 1;
+         /* duplex: the socket nonblocking now, so that neither side
+          * sets its mode from then on */
+         if (tls_duplex(s))
+            tls_set_block(s, false);
+         break;
+      case TLS_CONNECT_KEYS13:
+         if (tls13_handshake_keys(s, s->tls13_peer, s->tls13_peer_len) != 0)
+         {
+            retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_KEX);
+            goto error;
+         }
+         progress->phase = TLS_CONNECT_EXT13;
+         break;
+      case TLS_CONNECT_EXT13:
+         if (tls_read_handshake(s, &type, &b, &len) != 0)
+            goto error;
+         if (type != TLS_HS_ENCRYPTED_EXTENSIONS)
+         {
+            retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_HANDSHAKE);
+            goto error;
+         }
+         s->resumed = s->psk_accepted ? 1 : 0;
+         progress->phase = s->psk_accepted
+            ? TLS_CONNECT_FIN13 : TLS_CONNECT_CERT13;
+         break;
+      case TLS_CONNECT_CERT13:
+         if (tls13_recv_certificate(s, &progress->leaf) != 0)
+            goto error;
+         progress->phase = TLS_CONNECT_VERIFY13;
+         break;
+      case TLS_CONNECT_VERIFY13:
+         if (tls13_recv_certificate_verify(s, &progress->leaf) != 0)
+            goto error;
+         progress->phase = TLS_CONNECT_FIN13;
+         break;
+      case TLS_CONNECT_FIN13:
+         if (tls13_recv_finished(s) != 0 || tls13_application_secrets(s) != 0)
+            goto error;
+         progress->phase = TLS_CONNECT_SEND_CCS13;
+         break;
+      case TLS_CONNECT_SEND_CCS13:
+         tls_cork(s);
+         s->tx_encrypted = 0;
+         if (tls_send_record(s, TLS_CT_CCS, &ccs, 1) != 0
+               || tls13_traffic_keys(s, s->c_hs, s->cwk, s->civ) != 0)
+            goto error;
+         s->tx_encrypted = 1;
+         s->cseq = 0;
+         progress->phase = TLS_CONNECT_SEND_FIN13;
+         break;
+      case TLS_CONNECT_SEND_FIN13:
+         if (tls13_send_finished(s) != 0 || tls_uncork(s) != 0)
+            goto error;
+         progress->phase = TLS_CONNECT_COMPLETE13;
+         break;
+      case TLS_CONNECT_COMPLETE13:
+         if (tls13_derive_secret(s, s->master13, "res master", s->res_master) != 0)
+            goto error;
+         crypto_memzero(s->master13, sizeof(s->master13));
+         crypto_memzero(s->psk, sizeof(s->psk));
+         if (tls13_traffic_keys(s, s->c_app, s->cwk, s->civ) != 0
+               || tls13_traffic_keys(s, s->s_app, s->swk, s->siv) != 0)
+            goto error;
+         s->cseq = s->sseq = 0;
+         crypto_memzero(s->hs_secret, sizeof(s->hs_secret));
+         crypto_memzero(s->c_hs, sizeof(s->c_hs));
+         crypto_memzero(s->s_hs, sizeof(s->s_hs));
+         s->handshake_done = 1;
+         /* duplex: the socket nonblocking now, so that neither side
+          * sets its mode from then on */
+         if (tls_duplex(s))
+            tls_set_block(s, false);
+         break;
+      case TLS_CONNECT_FAILED:
          return -1;
-      if (tls_read_record(s, &type, &b, &len) != 0)     return -1;
-      if (type != TLS_CT_CCS || len != 1 || b[0] != 1)
-      {
-         s->last_err = TLS_ERR_HANDSHAKE;
-         return -1;
-      }
-      s->rx_encrypted = 1;
-      s->sseq         = 0;
-      if (tls_recv_finished(s) != 0)                    return -1;
-      tls_cork(s);
-      if (tls_send_record(s, TLS_CT_CCS, &ccs, 1) != 0) return -1;
-      s->tx_encrypted = 1;
-      s->cseq         = 0;
-      if (tls_send_finished(s) != 0)                    return -1;
-      if (tls_uncork(s) != 0)                           return -1;
-      tls_cache_store(s);
-      s->handshake_done = 1;
-      s->hs_len = s->hs_off = 0;
+      default:
+         retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_HANDSHAKE);
+         goto error;
+   }
+   if (!s->handshake_done)
       return 0;
-   }
-
-   if (tls_recv_certificate(s, &leaf) != 0)             return -1;
-   if (tls_recv_server_kex(s, &leaf, peer, &peer_len) != 0) return -1;
-   if (tls_recv_server_done(s) != 0)                    return -1;
-   tls_cork(s);
-   if (tls_send_client_kex(s, peer, peer_len) != 0)     return -1;
-   tls_derive_keys(s);
-
-   if (tls_send_record(s, TLS_CT_CCS, &ccs, 1) != 0)    return -1;
-   s->tx_encrypted = 1;
-   s->cseq         = 0;
-   if (tls_send_finished(s) != 0)                       return -1;
-   if (tls_uncork(s) != 0)                              return -1;
-
-   /* NewSessionTicket when announced, then the server's
-    * ChangeCipherSpec and its Finished under the new keys. */
-   if (s->expect_ticket && tls_recv_new_session_ticket(s) != 0)
-      return -1;
-   if (tls_read_record(s, &type, &b, &len) != 0)        return -1;
-   if (type != TLS_CT_CCS || len != 1 || b[0] != 1)
-   {
-      s->last_err = TLS_ERR_HANDSHAKE;
-      return -1;
-   }
-   s->rx_encrypted = 1;
-   s->sseq         = 0;
-   if (tls_recv_finished(s) != 0)                       return -1;
-   tls_cache_store(s);
-
-   s->handshake_done = 1;
-   /* The accumulator is done; application data has its own buffer. */
    s->hs_len = s->hs_off = 0;
-   return 0;
+   memset(progress, 0, sizeof(*progress));
+   return 1;
+error:
+   if (s->connect_read)
+      return 0;
+   progress->phase = TLS_CONNECT_FAILED;
+   return -1;
+}
+
+static int tls_handshake(struct ssl_state *s)
+{
+   int result;
+   do
+      result = tls_handshake_step(s);
+   while (result == 0);
+   return result < 0 ? -1 : 0;
 }
 
 /* ---- public API --------------------------------------------------- */
@@ -2160,6 +3083,8 @@ void* ssl_socket_init(int fd, const char *domain)
    if (!s)
       return NULL;
    s->verify_mode = (unsigned)retro_atomic_load_acquire_int(&tls_verify_mode_setting);
+   retro_atomic_int_init(&s->last_err, 0);
+   retro_atomic_int_init(&s->key_update, 0);
    /* No Nagle on a TLS socket. Everything RetroArch does over TLS is
     * request-then-reply, and with Nagle the first request after a
     * resumed 1.2 handshake waits behind the unacknowledged Finished
@@ -2190,6 +3115,31 @@ void* ssl_socket_init(int fd, const char *domain)
    return s;
 }
 
+int ssl_socket_retro_configure(void *state_data,
+      const struct ssl_socket_retro_config *cfg)
+{
+   struct ssl_state *s = (struct ssl_state*)state_data;
+   unsigned i;
+   int      any = !cfg->suites;
+
+   for (i = 0; !any && i < cfg->suite_count; i++)
+   {
+      const struct tls_suite_info *si = tls_suite(cfg->suites[i]);
+      if (si && !(si->kx == TLS_KX_13 && cfg->chain_count))
+         any = 1;
+   }
+   if (!s || !any || (cfg->chain_count && !cfg->key))
+      return -1;
+   /* A duplex connection's sending side has its record buffer from
+    * the start, rather than taking it on its first send */
+   if ((cfg->flags & SSL_RETRO_DUPLEX) && !s->tx
+         && !(s->tx = (uint8_t*)malloc(5 + TLS_REC_MAX + TLS_REC_OVERHEAD)))
+      return -1;
+   s->cfg        = *cfg;
+   s->configured = 1;
+   return 0;
+}
+
 unsigned ssl_socket_retro_version(void *state_data)
 {
    const struct ssl_state *s = (const struct ssl_state*)state_data;
@@ -2215,7 +3165,39 @@ int ssl_socket_retro_was_resumed(void *state_data)
 int ssl_socket_last_error(void *state_data)
 {
    struct ssl_state *s = (struct ssl_state*)state_data;
-   return s ? s->last_err : 0;
+   return s ? retro_atomic_load_relaxed_int(&s->last_err) : 0;
+}
+
+int ssl_socket_handshake_step(void *state_data, bool *read, bool *write)
+{
+   struct ssl_state *s = (struct ssl_state*)state_data;
+   int result;
+   if (read)
+      *read = false;
+   if (write)
+      *write = false;
+   if (!s || s->closed || s->connect.phase == TLS_CONNECT_FAILED)
+      return -1;
+   if (s->handshake_done)
+      return 1;
+   if (!s->connect_nonblock)
+   {
+      if (!tls_set_block(s, false))
+      {
+         retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_SOCKET);
+         s->connect.phase = TLS_CONNECT_FAILED;
+         return -1;
+      }
+      s->connect_nonblock = true;
+   }
+   result = tls_handshake_step(s);
+   if (result > 0)
+      s->connect_nonblock = false;
+   if (read)
+      *read = s->connect_read;
+   if (write)
+      *write = s->connect_write;
+   return result;
 }
 
 int ssl_socket_connect(void *state_data,
@@ -2228,7 +3210,8 @@ int ssl_socket_connect(void *state_data,
    {
       if (!socket_connect_with_timeout(s->fd, data, 5000))
          return -1;
-      if (!socket_set_block(s->fd, true))
+      s->fd_mode = 0;   /* left nonblocking by the connect */
+      if (!tls_set_block(s, true))
          return -1;
    }
    else if (socket_connect(s->fd, data))
@@ -2245,7 +3228,28 @@ int ssl_socket_connect(void *state_data,
 
 /* Points s->pt at the next application record's plaintext: in @dst
  * when given and the record fits @dst_cap, else in s->rx. */
-static int tls_fill(struct ssl_state *s, uint8_t *dst, size_t dst_cap)
+static int tls_post_step(struct ssl_state *s, bool nonblock)
+{
+   const uint8_t *message = s->hs + s->hs_off;
+   size_t available = s->hs_len - s->hs_off;
+   size_t length;
+   if (available < 4)
+      return 0;
+   length = tls_get24(message + 1);
+   if (length > TLS_HS_MAX - 4)
+      return -1;
+   if (available < length + 4)
+      return 0;
+   if (tls13_post_handshake(s, message, length + 4, nonblock) != 0)
+      return -1;
+   s->hs_off += length + 4;
+   if (s->hs_off == s->hs_len)
+      s->hs_len = s->hs_off = 0;
+   return 1;
+}
+
+static int tls_fill(struct ssl_state *s, uint8_t *dst, size_t dst_cap,
+      bool nonblock)
 {
    uint8_t type;
    const uint8_t *b;
@@ -2253,10 +3257,38 @@ static int tls_fill(struct ssl_state *s, uint8_t *dst, size_t dst_cap)
 
    for (;;)
    {
-      if (tls_read_record_to(s, &type, &b, &len, dst, dst_cap) != 0)
+      int result;
+      /* Sending what is owed, unless another thread does the sending */
+      if (nonblock && !tls_duplex(s))
+      {
+         result = tls_control_push(s);
+         if (result < 0)
+            return -1;
+      }
+      else if (!tls_duplex(s)
+            && (retro_atomic_load_acquire_int(&s->key_update)
+               || s->cork_off < s->cork_len)
+            && tls_tx_drain_blocking(s) != 0)
          return -1;
+      if (s->v13)
+      {
+         result = tls_post_step(s, nonblock);
+         if (result < 0)
+            goto bad_handshake;
+         if (result > 0)
+         {
+            if (nonblock)
+               return 1;
+            continue;
+         }
+      }
+      result = tls_read_record_to(s, &type, &b, &len, dst, dst_cap, nonblock);
+      if (result)
+         return result;
       if (type == TLS_CT_APPDATA)
       {
+         if (s->v13 && s->hs_len != s->hs_off)
+            goto bad_handshake;
          s->pt     = b;
          s->pt_len = len;
          s->pt_off = 0;
@@ -2267,19 +3299,34 @@ static int tls_fill(struct ssl_state *s, uint8_t *dst, size_t dst_cap)
        * CCS) is ignored. Alerts were handled in tls_read_record. */
       if (s->v13 && type == TLS_CT_HANDSHAKE)
       {
-         size_t off = 0;
-         while (off + 4 <= len)
+         if (s->hs_len == s->hs_off && len >= 4)
          {
-            size_t ml = tls_get24(b + off + 1);
-            if (off + 4 + ml > len || tls13_post_handshake(s, b + off, 4 + ml) != 0)
+            size_t length = tls_get24(b + 1);
+            if (length <= len - 4)
             {
-               s->last_err = TLS_ERR_HANDSHAKE;
-               return -1;
+               if (tls13_post_handshake(s, b, length + 4, nonblock) != 0)
+                  goto bad_handshake;
+               b += length + 4;
+               len -= length + 4;
             }
-            off += 4 + ml;
          }
+         if (s->hs_off)
+         {
+            memmove(s->hs, s->hs + s->hs_off, s->hs_len - s->hs_off);
+            s->hs_len -= s->hs_off;
+            s->hs_off = 0;
+         }
+         if (len > TLS_HS_MAX - s->hs_len)
+            goto bad_handshake;
+         memcpy(s->hs + s->hs_len, b, len);
+         s->hs_len += len;
       }
+      if (nonblock)
+         return 1;
    }
+bad_handshake:
+   retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_HANDSHAKE);
+   return -1;
 }
 
 int ssl_socket_receive_all_blocking(void *state_data, void *data_, size_t len)
@@ -2287,13 +3334,13 @@ int ssl_socket_receive_all_blocking(void *state_data, void *data_, size_t len)
    struct ssl_state *s = (struct ssl_state*)state_data;
    uint8_t *data       = (uint8_t*)data_;
 
-   socket_set_block(s->fd, true);
+   tls_set_block(s, true);
    while (len)
    {
       size_t avail = s->pt_len - s->pt_off;
       if (!avail)
       {
-         if (tls_fill(s, data, len) != 0)
+         if (tls_fill(s, data, len, false) != 0)
             return -1;
          if (s->pt == data)
          {
@@ -2317,18 +3364,17 @@ int ssl_socket_receive_all_blocking(void *state_data, void *data_, size_t len)
 ssize_t ssl_socket_receive_all_nonblocking(void *state_data,
       bool *error, void *data_, size_t len)
 {
-   /* Application reads through net_http go a record at a time: hand
-    * back what is already decrypted, and only touch the socket when
-    * it has a whole record waiting. */
+   /* At most one record/message per call; partial input stays in rx. */
    struct ssl_state *s = (struct ssl_state*)state_data;
    uint8_t *data       = (uint8_t*)data_;
    size_t   got        = 0;
-   bool     rd         = true;
-   bool     wr         = false;
 
    *error = false;
+   if (!len)
+      return 0;
    if (s->pt_len == s->pt_off)
    {
+      int result;
       /* The end of the stream - close_notify, or the connection gone -
        * is -1 with *error set, as a plain socket and the library
        * backends report it: net_http ends a body that runs to the close
@@ -2339,14 +3385,20 @@ ssize_t ssl_socket_receive_all_nonblocking(void *state_data,
          *error = true;
          return -1;
       }
-      if (!socket_wait(s->fd, &rd, &wr, 0) || !rd)
-         return 0;
-      socket_set_block(s->fd, true);
-      if (tls_fill(s, data, len) != 0)
+      if (!tls_set_block(s, false))
+      {
+         retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_SOCKET);
+         *error = true;
+         return -1;
+      }
+      result = tls_fill(s, data, len, true);
+      if (result < 0)
       {
          *error = true;
          return -1;
       }
+      if (result > 0)
+         return 0;
       if (s->pt == data)
       {
          /* decrypted in place in the caller's buffer */
@@ -2369,7 +3421,7 @@ int ssl_socket_send_all_blocking(void *state_data, const void *data_,
    const uint8_t *data  = (const uint8_t*)data_;
    (void)no_signal;
 
-   socket_set_block(s->fd, true);
+   tls_set_block(s, true);
    if (tls_tx_drain_blocking(s) != 0)
       return -1;
    while (len)
@@ -2390,15 +3442,89 @@ static int tls_tx_push(struct ssl_state *s)
    ssize_t n;
    if (s->tx_off >= s->tx_len)
       return 1;
-   socket_set_block(s->fd, false);
+   if (!tls_set_block(s, false))
+   {
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_SOCKET);
+      return -1;
+   }
    if ((n = socket_send_all_nonblocking(s->fd, s->tx + s->tx_off,
                s->tx_len - s->tx_off, true)) < 0)
    {
-      s->last_err = TLS_ERR_SOCKET;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_SOCKET);
       return -1;
    }
    s->tx_off += (size_t)n;
    return s->tx_off >= s->tx_len;
+}
+
+/* Reuse the handshake cork for a KeyUpdate, behind any sealed application
+ * record. Rotate client keys only once its old-key announcement is sealed. */
+static int tls_control_push(struct ssl_state *s)
+{
+   int result = tls_tx_push(s);
+   if (result <= 0)
+      return result;
+   if (s->cork_off >= s->cork_len
+         && retro_atomic_load_acquire_int(&s->key_update))
+   {
+      static const uint8_t update[5] = {TLS_HS_KEY_UPDATE, 0, 0, 1, 0};
+      uint8_t next[48];
+      size_t hlen = tls13_hlen(s);
+      if (tls_seal_record(s, TLS_CT_HANDSHAKE, update, sizeof(update),
+               s->cork, &s->cork_len) != 0
+            || tls13_expand_label(s, s->c_app, "traffic upd", NULL, 0,
+               next, hlen) != 0)
+         return -1;
+      memcpy(s->c_app, next, hlen);
+      if (tls13_traffic_keys(s, s->c_app, s->cwk, s->civ) != 0)
+         return -1;
+      s->cseq = 0;
+      s->cork_off = 0;
+      retro_atomic_store_relaxed_int(&s->key_update, 0);
+   }
+   if (s->cork_off < s->cork_len)
+   {
+      ssize_t n;
+      if (!tls_set_block(s, false))
+         goto error;
+      n = socket_send_all_nonblocking(s->fd, s->cork + s->cork_off,
+            s->cork_len - s->cork_off, true);
+      if (n < 0)
+         goto error;
+      s->cork_off += (size_t)n;
+      if (s->cork_off < s->cork_len)
+         return 0;
+      s->cork_off = s->cork_len = 0;
+   }
+   return retro_atomic_load_relaxed_int(&s->key_update) ? 0 : 1;
+error:
+   retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_SOCKET);
+   return -1;
+}
+
+bool ssl_socket_retro_pending(void *state_data, bool *write)
+{
+   const struct ssl_state *s = (const struct ssl_state*)state_data;
+   size_t available;
+   if (!write)
+      return false;
+   *write = false;
+   if (!s)
+      return false;
+   available = s->hs_len - s->hs_off;
+   /* The sending side's state is not this thread's to read in duplex
+    * mode, and nothing is sent from here then */
+   if (!tls_duplex(s))
+      *write = s->tx_off < s->tx_len || s->cork_off < s->cork_len
+            || retro_atomic_load_relaxed_int(&s->key_update);
+   if (s->pt_off < s->pt_len)
+      return true;
+   if (available >= 4)
+   {
+      size_t length = tls_get24(s->hs + s->hs_off + 1);
+      return length > TLS_HS_MAX - 4 || available >= length + 4;
+   }
+   return false;
 }
 
 ssize_t ssl_socket_send_all_nonblocking(void *state_data, const void *data_,
@@ -2411,7 +3537,7 @@ ssize_t ssl_socket_send_all_nonblocking(void *state_data, const void *data_,
 
    if (!s->tx && !(s->tx = (uint8_t*)malloc(5 + TLS_REC_MAX + TLS_REC_OVERHEAD)))
    {
-      s->last_err = TLS_ERR_MEMORY;
+      retro_atomic_store_relaxed_int(&s->last_err, TLS_ERR_MEMORY);
       return -1;
    }
 
@@ -2422,7 +3548,7 @@ ssize_t ssl_socket_send_all_nonblocking(void *state_data, const void *data_,
    for (;;)
    {
       size_t n;
-      int    r = tls_tx_push(s);
+      int    r = tls_control_push(s);
       if (r < 0)
          return -1;
       if (!r || taken == len)
@@ -2441,18 +3567,28 @@ ssize_t ssl_socket_send_all_nonblocking(void *state_data, const void *data_,
 
 int ssl_socket_flush_nonblocking(void *state_data)
 {
-   return tls_tx_push((struct ssl_state*)state_data);
+   return tls_control_push((struct ssl_state*)state_data);
 }
 
 void ssl_socket_close(void *state_data)
 {
    struct ssl_state *s = (struct ssl_state*)state_data;
-   /* Not behind a half-sent record: the alert would have to wait for
-    * it, and a peer that stopped reading is exactly when a transfer is
-    * abandoned mid-upload. */
-   if (s->handshake_done && !s->closed && s->tx_off >= s->tx_len)
-      tls_send_alert(s, 1, 0);   /* warning close_notify */
+   if (!s || s->fd < 0)
+      return;
+   if (s->handshake_done && !s->closed && s->tx_off >= s->tx_len
+         && !retro_atomic_load_relaxed_int(&s->key_update)
+         && s->cork_off >= s->cork_len)
+   {
+      static const uint8_t alert[2] = {1, 0};
+      size_t length;
+      if (tls_set_block(s, false)
+            && tls_seal_record(s, TLS_CT_ALERT, alert, sizeof(alert),
+               s->cork, &length) == 0)
+         socket_send_all_nonblocking(s->fd, s->cork, length, true);
+   }
    socket_close(s->fd);
+   s->fd = -1;
+   s->closed = 1;
 }
 
 void ssl_socket_free(void *state_data)
@@ -2465,6 +3601,7 @@ void ssl_socket_free(void *state_data)
    crypto_memzero(s->swk, sizeof(s->swk));
    crypto_memzero(&s->wgcm, sizeof(s->wgcm));
    crypto_memzero(&s->rgcm, sizeof(s->rgcm));
+   free(s->connect_message);
    free(s->rx);
    free(s->hs);
    free(s->cork);

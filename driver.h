@@ -118,7 +118,15 @@ enum driver_lifetime_flags
     * unloading ends still ends - but a driver that can outlive the
     * video driver may be left running across it, as across a reset.
     */
-   DRIVER_LIFETIME_SESSION_SWITCH = 1 << 1
+   DRIVER_LIFETIME_SESSION_SWITCH = 1 << 1,
+
+   /**
+    * Passed to \c drivers_init along a content switch that left the
+    * audio driver out of the teardown: the running audio is carried
+    * into the new session - its rate set in place once the video
+    * driver has settled the rates - instead of opened again.
+    */
+   DRIVER_LIFETIME_AUDIO_CARRIED = 1 << 2
 };
 
 enum driver_ctl_state
@@ -167,8 +175,9 @@ int driver_find_index(const char *label, const char *drv);
 void driver_set_nonblock_state(void);
 
 /* Carries a new core audio rate to the running audio driver, keeping the
- * device open. Returns false when the drivers need the reinit for it. */
-bool driver_set_audio_input_rate(void);
+ * device open. Only update video pacing when its timing changed.
+ * Returns false when the drivers need the reinit for it. */
+bool driver_set_audio_input_rate(bool video_timing_changed);
 
 /**
  * drivers_init:

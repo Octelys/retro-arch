@@ -68,7 +68,7 @@ S_BOOL(settings_show_onscreen_display, SETTINGS_SHOW_ONSCREEN_DISPLAY,
       "settings_show_onscreen_display",
       DEFAULT_SETTINGS_SHOW_ONSCREEN_DISPLAY, SD_FLAG_NONE, 0, 0,
       "Show 'On-Screen Display'",
-      "Show 'On-Screen Display' settings.")
+      "Show 'On-Screen Display' settings. Affects both 'On-Screen Notifications & Overlay' under 'User Interface'.")
 S_BOOL(settings_show_user_interface, SETTINGS_SHOW_USER_INTERFACE,
       "settings_show_user_interface",
       DEFAULT_SETTINGS_SHOW_USER_INTERFACE, SD_FLAG_NONE, 0, 0,
@@ -94,6 +94,11 @@ S_BOOL(settings_show_achievements, SETTINGS_SHOW_ACHIEVEMENTS,
       DEFAULT_SETTINGS_SHOW_ACHIEVEMENTS, SD_FLAG_NONE, 0, 0,
       "Show 'Achievements'",
       "Show 'Achievements' settings.")
+S_BOOL(settings_show_bluetooth, SETTINGS_SHOW_BLUETOOTH,
+      "settings_show_bluetooth",
+      DEFAULT_SETTINGS_SHOW_BLUETOOTH, SD_FLAG_NONE, 0, 0,
+      "Show 'Bluetooth'",
+      "Show 'Bluetooth' settings.")
 S_BOOL(settings_show_network, SETTINGS_SHOW_NETWORK,
       "settings_show_network",
       DEFAULT_SETTINGS_SHOW_NETWORK, SD_FLAG_NONE, 0, 0,

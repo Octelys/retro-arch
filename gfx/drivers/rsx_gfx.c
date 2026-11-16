@@ -37,6 +37,7 @@
 #include "../../menu/menu_driver.h"
 #endif
 
+#include "../gfx_display.h"
 #ifdef HAVE_GFX_WIDGETS
 #include "../gfx_widgets.h"
 #endif
@@ -52,8 +53,8 @@
 #include <libretro_rsx.h>
 #ifdef HAVE_THREADS
 #include "../video_thread_wrapper.h"
-#include "../display_servers/dispserv_ps3.h"
 #endif
+#include "../display_servers/dispserv_ps3.h"
 
 #define RSX_MAX_BUFFERS 2
 #define RSX_MAX_MENU_BUFFERS 2
@@ -219,6 +220,9 @@ typedef struct
    struct retro_rsx_image hw_image;
    bool hw_render;
    bool hw_image_valid;
+   /* The last presented image carries frontend layers: a duped frame
+    * without any is presented once more to take them off */
+   bool ui_presented;
 } rsx_t;
 
 #include "../font_driver.h"
@@ -394,8 +398,9 @@ typedef struct
    unsigned tex_dims;
    /* Texture memory the atlas outgrew: a frame in flight may still
     * draw from it, and freeing it means waiting for the RSX, so it goes
-    * when the font does - the atlas grows at most twice */
-   u32 *retired[2];
+    * when the font does - the atlas grows at most twice, and when it is
+    * kept in texture memory the last of it goes with the font */
+   u32 *retired[4];
    unsigned retired_count;
    u32 fp_offset;
    u32 pos_offset;
@@ -410,6 +415,9 @@ typedef struct
    float font_vertex[2 * 6 * MAX_MSG_LEN_CHUNK];
    float font_tex_coords[2 * 6 * MAX_MSG_LEN_CHUNK];
    float font_color[4 * 6 * MAX_MSG_LEN_CHUNK];
+   /* The atlas is kept in texture memory (rsx_font_storage) and is the
+    * texture: nothing is copied into it */
+   bool atlas_in_place;
 } rsx_font_t;
 
 static const float rsx_vertexes[8] = {
@@ -655,7 +663,9 @@ static void rsx_font_free(void *data,
     * font scale change or context reset. */
    rsxFinish(font->rsx->context, 0);
 
-   if (font->texture.data)
+   /* Kept in texture memory, the atlas's last buffer went to
+    * rsx_font_storage_free with the font driver's */
+   if (font->texture.data && !font->atlas_in_place)
       rsxFree(font->texture.data);
    {
       unsigned i;
@@ -672,14 +682,13 @@ static void rsx_font_free(void *data,
    free(font);
 }
 
-static bool rsx_font_upload_atlas(rsx_t *rsx, rsx_font_t *font)
+/* Copies the atlas's dirty row band into the texture */
+static void rsx_font_copy_dirty(rsx_font_t *font)
 {
    u8 *texbuffer               = (u8 *)font->texture.data;
    const u8 *atlas_data        = (u8 *)font->atlas->buffer;
-   /* Texture pitch equals the atlas width, so the dirty row band is
-    * contiguous in both buffers and one memcpy of just that band
-    * suffices; the initial upload (dirty rect covering everything
-    * after the renderer pre-cache) still transfers the full atlas. */
+   unsigned tex_w              = VIDEO_SCALE_W(font->tex_dims);
+   unsigned tex_h              = VIDEO_SCALE_H(font->tex_dims);
    unsigned y0                 = VIDEO_SCALE_H(font->atlas->dirty_xy0);
    unsigned y1                 = VIDEO_SCALE_H(font->atlas->dirty_xy1);
    if (y1 > font->atlas->height || y1 <= y0)
@@ -687,9 +696,32 @@ static bool rsx_font_upload_atlas(rsx_t *rsx, rsx_font_t *font)
       y0 = 0;
       y1 = font->atlas->height;
    }
-   memcpy(texbuffer   + (size_t)y0 * font->atlas->width,
-          atlas_data  + (size_t)y0 * font->atlas->width,
-          (size_t)(y1 - y0) * font->atlas->width);
+   if (y1 > tex_h)
+      y1 = tex_h;
+   /* Texture pitch is its width. At the atlas's size the dirty row band
+    * is contiguous in both buffers and one memcpy of just that band
+    * suffices; the initial upload (dirty rect covering everything
+    * after the renderer pre-cache) still transfers the full atlas. An
+    * atlas the texture could not follow is larger than it, and goes
+    * across row by row, as much of each as the texture holds. */
+   if (tex_w == font->atlas->width)
+      memcpy(texbuffer   + (size_t)y0 * tex_w,
+             atlas_data  + (size_t)y0 * tex_w,
+             (size_t)(y1 > y0 ? y1 - y0 : 0) * tex_w);
+   else
+   {
+      unsigned y;
+      unsigned w = (tex_w < font->atlas->width) ? tex_w : font->atlas->width;
+      for (y = y0; y < y1; y++)
+         memcpy(texbuffer  + (size_t)y * tex_w,
+                atlas_data + (size_t)y * font->atlas->width, w);
+   }
+}
+
+static bool rsx_font_upload_atlas(rsx_t *rsx, rsx_font_t *font)
+{
+   if (!font->atlas_in_place)
+      rsx_font_copy_dirty(font);
 
    font->texture.tex.format    = GCM_TEXTURE_FORMAT_B8 | GCM_TEXTURE_FORMAT_LIN;
    font->texture.tex.mipmap    = 1;
@@ -727,6 +759,24 @@ static bool rsx_font_upload_atlas(rsx_t *rsx, rsx_font_t *font)
          GCM_TEXTURE_CLAMP_TO_EDGE, 0, GCM_TEXTURE_ZFUNC_LESS, 0);
 
    return true;
+}
+
+/* Texture memory for the atlas, which the cache rasterizes glyphs
+ * straight into and the RSX samples: the texture is linear B8 with its
+ * pitch its width, the atlas's own layout */
+static void *rsx_font_storage(void *user, size_t size)
+{
+   (void)user;
+   return rsxMemalign(128, (u32)size);
+}
+
+/* Texture memory the atlas moved out of: a frame in flight may still
+ * draw from it, so it goes when the font does */
+static void rsx_font_storage_free(void *user, void *buffer)
+{
+   rsx_font_t *font = (rsx_font_t*)user;
+   if (font->retired_count < sizeof(font->retired) / sizeof(font->retired[0]))
+      font->retired[font->retired_count++] = (u32*)buffer;
 }
 
 static void *rsx_font_init(void *data,
@@ -781,9 +831,19 @@ static void *rsx_font_init(void *data,
 
    /* The atlas may grow; the texture follows it */
    font->atlas->max_dims = VIDEO_SCALE_PACK(2048, 2048);
+   /* Its cells are written where the RSX samples them, and the frame
+    * before may still be drawing: one per buffer the flip waits on */
+   font->atlas->inflight = RSX_MAX_BUFFERS - 1;
    font->tex_dims           = VIDEO_SCALE_PACK(font->atlas->width,
          font->atlas->height);
-   if (!(font->texture.data = (u32*)rsxMemalign(128,
+   /* The atlas kept in texture memory, or copied into it */
+   if (font_atlas_place(font->atlas, rsx_font_storage,
+            rsx_font_storage_free, font))
+   {
+      font->atlas_in_place = true;
+      font->texture.data   = (u32*)font->atlas->buffer;
+   }
+   else if (!(font->texture.data = (u32*)rsxMemalign(128,
          VIDEO_SCALE_AREA(font->tex_dims))))
       goto error;
    rsxAddressToOffset(font->texture.data, &font->texture.offset);
@@ -1059,7 +1119,20 @@ static void rsx_font_render_msg(
    if (font->font_driver && font->font_data)
    {
       font->atlas = font->font_driver->get_atlas(font->font_data);
-      if (     font->retired_count < 2
+      /* Kept in texture memory, the grown atlas is the texture already;
+       * the cache handed the memory it left to rsx_font_storage_free */
+      if (     font->atlas_in_place
+            && font->tex_dims != VIDEO_SCALE_PACK(font->atlas->width,
+               font->atlas->height))
+      {
+         font->texture.data = (u32*)font->atlas->buffer;
+         rsxAddressToOffset(font->texture.data, &font->texture.offset);
+         font->tex_dims     = VIDEO_SCALE_PACK(font->atlas->width,
+               font->atlas->height);
+         font->atlas->dirty = true;
+      }
+      else if (!font->atlas_in_place
+            && font->retired_count < 2
             && font->tex_dims != VIDEO_SCALE_PACK(font->atlas->width,
                font->atlas->height))
       {
@@ -1408,11 +1481,10 @@ error:
 
 static int rsx_flip(gcmContextData *context, s32 buffer)
 {
+   gcmResetFlipStatus();
    if (gcmSetFlip(context, buffer) == 0)
    {
       rsxFlushBuffer (context);
-      /* Prevent the RSX from continuing until the flip has finished. */
-      gcmSetWaitFlip (context);
       return 1;
    }
    return 0;
@@ -1448,7 +1520,6 @@ static void rsx_wait_flip(void)
 {
   while(gcmGetFlipStatus() != 0)
     usleep(200);  /* Sleep, to not stress the cpu. */
-  gcmResetFlipStatus();
 }
 
 static gcmContextData *rsx_init_screen(rsx_t* gcm)
@@ -2579,8 +2650,6 @@ static void rsx_update_screen(rsx_t* gcm)
    }
 
    rsx_flip(gcm->context, buffer->id);
-   if (gcm->vsync)
-      rsx_wait_flip();
    rsxSetSurface(gcm->context, &gcm->surface[gcm->nextBuffer]);
 #ifdef HAVE_SYSUTILS
    cellSysutilCheckCallback();
@@ -2635,11 +2704,38 @@ static bool rsx_frame(void* data, const void* frame,
    bool widgets_active              = video_info->widgets_active;
 #endif
    bool draw                        = false;
+   bool ui_now                      = (msg && *msg)
+#ifdef HAVE_MENU
+         || (gcm->menu_frame_enable && menu_is_alive) || statistics_show
+#endif
+#ifdef HAVE_OVERLAY
+         || gcm->overlay_enable
+#endif
+         || video_info->widgets_visible;
+   bool draw_cached                 = ui_now || gcm->ui_presented || gcm->vsync;
+   bool sync_ui                     = false
+#ifdef HAVE_MENU
+         || menu_is_alive || gcm->menu_frame_enable
+#endif
+#ifdef HAVE_OVERLAY
+         || gcm->overlay_enable
+#endif
+         ;
+   /* Two images keep the core behind the flip: lowest input latency */
+   bool overlap                     = video_info->max_swapchain_images > 2;
+   /* The core shares the FIFO and leaves its own state behind. */
+   bool restore                     = gcm->hw_render && (frame || draw_cached);
 
    rsx_collect_retired_memory();
    rsx_fence_retired_memory(gcm->context);
-   /* The core shares the FIFO and leaves its own state behind */
-   if (gcm->hw_render && frame == RETRO_HW_FRAME_BUFFER_VALID)
+   /* Core work overlaps the previous flip; UI buffers cannot. */
+   if (frame || draw_cached)
+   {
+      if (gcm->vsync)
+         rsx_wait_flip();
+      gcmSetWaitFlip(gcm->context);
+   }
+   if (restore)
    {
       unsigned attrib;
       rsxSetSurface(gcm->context, &gcm->surface[gcm->nextBuffer]);
@@ -2666,6 +2762,9 @@ static bool rsx_frame(void* data, const void* frame,
 
    if (gcm->should_resize)
       rsx_update_viewport(gcm);
+
+   if (frame || draw_cached)
+      rsx_clear_surface(gcm);
 
    vp.min                           = 0.0f;
    vp.max                           = 1.0f;
@@ -2698,14 +2797,16 @@ static bool rsx_frame(void* data, const void* frame,
    }
    else if (frame && width && height)
    {
-      gcm->tex_index  = ((gcm->tex_index + 1) % RSX_MAX_TEXTURES);
+      /* A failed load leaves the last good frame the cached one */
+      unsigned next   = (gcm->tex_index + 1) % RSX_MAX_TEXTURES;
       if (rsx_load_texture_data(gcm,
-            &gcm->texture[gcm->tex_index],
+            &gcm->texture[next],
             frame, width, height, pitch, gcm->rgb32, false,
             gcm->smooth
             ? TEXTURE_FILTER_LINEAR
             : TEXTURE_FILTER_NEAREST))
       {
+         gcm->tex_index = next;
          /* TODO/FIXME - pipeline ID being used here is RSX_SHADER_MENU,
           * shouldn't this be RSX_SHADER_STOCK_BLEND instead? */
          rsx_set_texture(gcm, &gcm->texture[gcm->tex_index]);
@@ -2714,24 +2815,29 @@ static bool rsx_frame(void* data, const void* frame,
       }
    }
 
+   /* Core duplicates still need a synchronized present. */
+   if (!draw && draw_cached)
+   {
+      if (gcm->hw_render && gcm->hw_image_valid)
+      {
+         rsx_draw_hw_image(gcm);
+         draw = true;
+      }
+      else if (gcm->texture[gcm->tex_index].data)
+      {
+         rsx_set_texture(gcm, &gcm->texture[gcm->tex_index]);
+         rsx_draw_vertices(gcm);
+         draw = true;
+      }
+      /* Nothing cached: a cleared buffer goes out only to put up or
+       * take down UI, never in place of the image on screen */
+      else if (ui_now || gcm->ui_presented)
+         draw = true;
+   }
+
 #ifdef HAVE_MENU
    if (gcm->menu_frame_enable && menu_is_alive)
    {
-      /* A duped core frame stays behind the menu: the surface was
-       * cleared at the last flip */
-      if (!draw)
-      {
-         if (gcm->hw_render)
-         {
-            if (gcm->hw_image_valid)
-               rsx_draw_hw_image(gcm);
-         }
-         else if (gcm->texture[gcm->tex_index].data)
-         {
-            rsx_set_texture(gcm, &gcm->texture[gcm->tex_index]);
-            rsx_draw_vertices(gcm);
-         }
-      }
       menu_driver_frame(menu_is_alive, video_info);
       draw = true;
       if (gcm->menu_texture.data)
@@ -2757,11 +2863,15 @@ static bool rsx_frame(void* data, const void* frame,
 #endif
 
 #ifdef HAVE_GFX_WIDGETS
+   /* Called on bare dupes too, for the widgets' own per-frame work.
+    * Without vsync those go out without the state restore and are not
+    * presented, so this relies on gfx_widgets_frame drawing nothing
+    * whenever the frame's widgets_visible is false. */
    if (widgets_active)
       gfx_widgets_frame(video_info);
 #endif
 
-   if (msg)
+   if (msg && *msg)
       font_driver_render_msg(gcm, msg, strlen(msg), NULL, NULL);
 
 #if 0
@@ -2769,9 +2879,12 @@ static bool rsx_frame(void* data, const void* frame,
 #endif
    if (draw)
    {
-      /* Only update when we draw to prevent flickering when core frame duping is enabled */
+      /* Undrawn frames are not presented: the last image stays up */
       rsx_update_screen(gcm);
-      rsx_clear_surface(gcm);
+      /* Menu and overlay uploads happen between frame calls. */
+      if (gcm->vsync && (sync_ui || !overlap))
+         rsx_wait_flip();
+      gcm->ui_presented = ui_now;
    }
    gcm->vert_idx         = 0;
 
@@ -2909,7 +3022,12 @@ static void rsx_set_osd_msg(void *data,
 }
 #endif
 
-static uint32_t rsx_get_flags(void *data) { return 0; }
+static uint32_t rsx_get_flags(void *data)
+{
+   uint32_t flags = 0;
+   BIT32_SET(flags, GFX_CTX_FLAGS_CUSTOMIZABLE_SWAPCHAIN_IMAGES);
+   return flags;
+}
 
 /* --- GPU-native BCn compressed-texture upload (PoC) --- */
 /* RSX (NV47/G70) natively samples DXT1/DXT23/DXT45 == BC1/BC2/BC3.

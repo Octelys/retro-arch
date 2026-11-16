@@ -45,6 +45,8 @@ void rcheevos_pause_hardcore(void);
 void rcheevos_hardcore_enabled_changed(void);
 void rcheevos_toggle_hardcore_paused(void);
 bool rcheevos_hardcore_active(void);
+/* Hardcore mode in force: on, with a game whose achievements are loaded */
+bool rcheevos_hardcore_in_game(void);
 
 bool rcheevos_is_pause_allowed(void);
 void rcheevos_spectating_changed(void);
@@ -81,8 +83,7 @@ struct gfx_surface *rcheevos_get_badge_texture_ex(const char* badge, bool locked
  * is lent: it stays the cache's, is good until the next
  * rcheevos_badge_cache_reset(), and the caller never frees it. */
 struct gfx_surface *rcheevos_get_default_badge_texture(void);
-/* Main thread, once a frame: start the loads asked for from other
- * threads. One atomic load when there are none. */
+/* Main thread, once a frame: drain requests and retire completed loads. */
 void rcheevos_badge_cache_service(void);
 void rcheevos_badge_cache_reset(void);
 void rcheevos_badge_request_download(const char* badge, bool locked);

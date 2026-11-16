@@ -126,20 +126,27 @@ static bool D3D9V_FN(views_target_retire)(d3d9_video_t *d3d,
    return true;
 }
 
-/* A render target of ARGB8 sized @dims */
-static bool D3D9V_FN(views_target_make)(d3d9_video_t *d3d,
-      d3d9_views_target_t *t, unsigned dims)
+static bool D3D9V_FN(views_target_make_format)(d3d9_video_t *d3d,
+      d3d9_views_target_t *t, unsigned dims, D3DFORMAT format)
 {
    if (     SUCCEEDED(IDirect3DDevice9_CreateTexture(d3d->dev,
                VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims), 1,
-               D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT,
+               D3DUSAGE_RENDERTARGET, format, D3DPOOL_DEFAULT,
                &t->tex, NULL))
          && SUCCEEDED(IDirect3DTexture9_GetSurfaceLevel(t->tex, 0,
                &t->surf)))
       return true;
+   D3D9V_FN(views_target_retire)(d3d, t);
+   return false;
+}
+
+static bool D3D9V_FN(views_target_make)(d3d9_video_t *d3d,
+      d3d9_views_target_t *t, unsigned dims)
+{
+   if (D3D9V_FN(views_target_make_format)(d3d, t, dims, D3DFMT_A8R8G8B8))
+      return true;
    RARCH_WARN(D3D9V_TAG " Views can't draw into a %ux%u image. "
          "Drawing without it.\n", VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims));
-   D3D9V_FN(views_target_retire)(d3d, t);
    return false;
 }
 
@@ -308,16 +315,9 @@ static bool D3D9V_FN(views_setup)(d3d9_video_t *d3d,
             &d3d->views.canvas);
    per_eye = video_views_ui_per_eye(&video_info->views, layout,
          D3D9V_FN(views_allowed)(d3d));
-   /* No directive inside the macro's arguments: MSVC's preprocessor
-    * takes it as tokens. */
-#ifdef HAVE_GFX_WIDGETS
    ui = VIDEO_VIEWS_UI_WANTED(per_eye, menu, msg,
          video_info->statistics_show,
-         video_info->widgets_active && gfx_widgets_visible(video_info));
-#else
-   ui = VIDEO_VIEWS_UI_WANTED(per_eye, menu, msg,
-         video_info->statistics_show, false);
-#endif
+         video_info->widgets_visible);
    views = video_info->views.num_views
       && D3D9V_FN(views_allowed)(d3d)
       && (!offscreen || *blend)
@@ -343,8 +343,9 @@ static bool D3D9V_FN(views_setup)(d3d9_video_t *d3d,
       d3d->views.preset_seen = true;
       RARCH_LOG(D3D9V_TAG " Views drawn through the preset, each by a "
             "chain of its own.\n");
-      RARCH_LOG(D3D9V_TAG " Views' presets have each view of a software "
-            "frame written straight in.\n");
+      if (!d3d->views.hw_frame)
+         RARCH_LOG(D3D9V_TAG " Views' presets have each view of a "
+               "software frame written straight in.\n");
    }
    return views;
 }
@@ -470,7 +471,8 @@ static void D3D9V_FN(views_menu_viewport)(d3d9_video_t *d3d, unsigned dims)
 {
    struct video_viewport vp;
    D3DVIEWPORT9 out;
-   memset(&vp, 0, sizeof(vp));
+   vp.pos       = 0;
+   vp.dims      = 0;
    vp.full_dims = dims;
    video_driver_update_viewport(&vp, false, d3d->keep_aspect, true);
    out.X        = (VIDEO_POS_X(vp.pos) > 0) ? VIDEO_POS_X(vp.pos) : 0;

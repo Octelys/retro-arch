@@ -64,6 +64,7 @@ typedef struct
 {
    char *path;
    char *desc;
+   char *url;
    /* Set missing once to avoid opening
     * the same file several times. */
    bool missing;
@@ -199,6 +200,11 @@ bool core_info_list_update_missing_firmware(core_info_ctx_firmware_t *info);
 
 bool core_info_find(const char *core_path,
       core_info_t **core_info);
+
+/* Writes the file id of 'core_filename' (no extension or
+ * platform suffix) to 's'; returns its length */
+size_t core_info_get_file_id(const char *core_filename,
+      char *s, size_t len);
 
 bool core_info_load(const char *core_path);
 

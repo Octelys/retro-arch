@@ -69,6 +69,22 @@ typedef struct oss_audio
    int16_t *stage;
    size_t   stage_bytes;
    bool is_paused;
+   bool nonblock;
+   /* select() on this device does not wait for room: a driver with no
+    * poll method - RetroFW's jz4760 one - reports every descriptor
+    * ready at once. Latched by oss_wait_writable(); from then on the
+    * wait for room is the blocking write's, in the driver, on its own
+    * fragment-done interrupt. */
+   bool select_blind;
+#ifdef RETROFW
+   /* jz4760's DMA moves 16-byte units: it drops a write's remainder,
+    * and a write under one unit starts a transfer of none. Writes go
+    * out in whole units; the remainder leads the next one. */
+   uint8_t *units;
+   size_t   units_bytes;
+   uint8_t  carry[16];
+   size_t   carry_bytes;
+#endif
 } oss_audio_t;
 
 #define OSS_FRAME_BYTES (ossaudio->channels * sizeof(int16_t))
@@ -76,6 +92,59 @@ typedef struct oss_audio
 /* Iteration cap for oss_wait_writable(): bounds wakes that deliver no
  * space, so one call costs at most this many bounded waits. */
 #define OSS_WAIT_WRITABLE_LAPS 8
+
+#ifdef RETROFW
+#define OSS_DMA_UNIT 16
+
+/* @len bytes behind the carry, whole units to the device. Returns the
+ * bytes of @s taken, the remainder held among them. */
+static ssize_t oss_write_units(oss_audio_t *ossaudio,
+      const uint8_t *s, size_t len)
+{
+   ssize_t w;
+   size_t k     = ossaudio->carry_bytes;
+   size_t total = k + len;
+   size_t whole = total & ~(size_t)(OSS_DMA_UNIT - 1);
+   const uint8_t *out = s;
+
+   if (!whole)
+   {
+      memcpy(ossaudio->carry + k, s, len);
+      ossaudio->carry_bytes = total;
+      return (ssize_t)len;
+   }
+   if (k)
+   {
+      if (ossaudio->units_bytes < whole)
+      {
+         uint8_t *n = (uint8_t*)realloc(ossaudio->units, whole);
+         if (!n)
+            return -1;
+         ossaudio->units       = n;
+         ossaudio->units_bytes = whole;
+      }
+      memcpy(ossaudio->units, ossaudio->carry, k);
+      memcpy(ossaudio->units + k, s, whole - k);
+      out = ossaudio->units;
+   }
+   if ((w = write(ossaudio->fd, out, whole)) < 0)
+   {
+      if (errno == EAGAIN && (fcntl(ossaudio->fd, F_GETFL) & O_NONBLOCK))
+         return 0;
+      return -1;
+   }
+   if (!w)
+      return 0;
+   ossaudio->frames_written += (uint64_t)w / OSS_FRAME_BYTES;
+   ossaudio->carry_bytes     = 0;
+   /* Short, the rest stays with the caller; whole units always. */
+   if ((size_t)w < whole)
+      return w - (ssize_t)k;
+   memcpy(ossaudio->carry, s + (whole - k), total - whole);
+   ossaudio->carry_bytes = total - whole;
+   return (ssize_t)len;
+}
+#endif
 
 static void *oss_init(const char *device,
       unsigned rate, unsigned latency,
@@ -205,6 +274,9 @@ static ssize_t oss_write(void *data, const void *s, size_t len)
       s   = ossaudio->stage;
       len = frames * OSS_FRAME_BYTES;
    }
+#ifdef RETROFW
+   return oss_write_units(ossaudio, (const uint8_t*)s, len);
+#endif
    if ((_len = write(ossaudio->fd, s, len)) < 0)
    {
       if (errno == EAGAIN && (fcntl(ossaudio->fd, F_GETFL) & O_NONBLOCK))
@@ -242,10 +314,12 @@ static size_t oss_frames_consumed(void *data)
 /* Sleep in select() on the device until it is writable, which OSS
  * reports at fragment granularity, then ask SNDCTL_DSP_GETOSPACE how
  * much fits; repeat until at least len bytes do, len capped at one
- * fragment. Every select() is bounded to two fragments' worth of time
- * and the loop to OSS_WAIT_WRITABLE_LAPS, so a device that stalls or
- * wakes without space returns 0 - a pass to skip - rather than holding
- * the audio thread. Returns the free space otherwise. */
+ * fragment. Every select() is bounded to two fragments' worth of time,
+ * so a device that stalls returns 0 - a pass to skip - rather than
+ * holding the audio thread. A device that wakes OSS_WAIT_WRITABLE_LAPS
+ * times without space has a select() that does not wait on room
+ * (select_blind): its room is claimed from then on, and the blocking
+ * write waits for it. Returns the free space otherwise. */
 static size_t oss_wait_writable(void *data, size_t len)
 {
    oss_audio_t *ossaudio  = (oss_audio_t*)data;
@@ -266,6 +340,12 @@ static size_t oss_wait_writable(void *data, size_t len)
          want = (size_t)info.fragsize;
       if (info.bytes >= (int)want)
          return (size_t)info.bytes;
+      /* Nothing here can wait on such a device: the room is claimed,
+       * and the write that follows sleeps in the driver until a
+       * fragment is played. Not without blocking writes - there the
+       * write would refuse, and the caller skips the pass instead. */
+      if (ossaudio->select_blind)
+         return ossaudio->nonblock ? 0 : want;
 
       /* Two fragments, in microseconds: a fragment is fragsize bytes
        * of 16-bit stereo at the device rate. Clamped so a strange
@@ -290,8 +370,15 @@ static size_t oss_wait_writable(void *data, size_t len)
       }
       if (rc == 0)
          return 0;
+      /* Every lap woken and none of them with room: select() is not
+       * waiting on room. Handed 0 for it, the audio thread comes
+       * straight back, and on a single core at real-time priority
+       * nothing else then runs. */
       if (--laps < 0)
-         return 0;
+      {
+         ossaudio->select_blind = true;
+         return ossaudio->nonblock ? 0 : want;
+      }
    }
 }
 
@@ -305,6 +392,9 @@ static bool oss_stop(void *data)
 #endif
 
    ossaudio->is_paused = true;
+#ifdef RETROFW
+   ossaudio->carry_bytes = 0;
+#endif
    return true;
 }
 
@@ -336,6 +426,8 @@ static void oss_set_nonblock_state(void *data, bool state)
             fcntl(ossaudio->fd, F_GETFL) & (~O_NONBLOCK));
    if (rc != 0)
       RARCH_WARN("[OSS] Could not set nonblocking on OSS file descriptor. Will not be able to fast-forward.\n");
+   else
+      ossaudio->nonblock = state;
 }
 
 static void oss_free(void *data)
@@ -344,12 +436,18 @@ static void oss_free(void *data)
 
 /*RETROFW IOCTL always returns EINVAL*/
 #if !defined(RETROFW)
-   if (ioctl(ossaudio->fd, SNDCTL_DSP_RESET, 0) < 0)
-      return;
+   /* Fails on a device that has gone away; it is closed all the same. */
+   ioctl(ossaudio->fd, SNDCTL_DSP_RESET, 0);
 #endif
 
+   if (ossaudio->select_blind)
+      RARCH_LOG("[OSS] The device's select() did not wait for room; "
+            "its blocking write did.\n");
    close(ossaudio->fd);
    free(ossaudio->stage);
+#ifdef RETROFW
+   free(ossaudio->units);
+#endif
    free(data);
 }
 

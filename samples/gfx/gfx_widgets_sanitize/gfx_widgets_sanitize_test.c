@@ -238,6 +238,43 @@ static void test_init_deinit_cycles(void)
    }
 }
 
+static bool shown(const char *msg)
+{
+   size_t i;
+   dispgfx_widget_t *p_dispwidget = dispwidget_get_ptr();
+
+   for (i = 0; i < p_dispwidget->current_msgs_size; i++)
+      if (     p_dispwidget->current_msgs[i]
+            && p_dispwidget->current_msgs[i]->msg
+            && !strcmp(p_dispwidget->current_msgs[i]->msg, msg))
+         return true;
+   return false;
+}
+
+/* A message queued but not shown yet when the video driver goes. */
+static void test_queued_across_reinit(void)
+{
+   gfx_widgets_deinit(false);
+   if (!widgets_up())
+      return;
+   push("queued, persisting", NULL, 0);
+   gfx_widgets_deinit(true);
+   if (!widgets_up())
+      return;
+   pump(1);
+   CHECK(shown("queued, persisting"),
+         "a queued message was lost in a reinit that keeps the widgets");
+
+   push("queued, not persisting", NULL, 0);
+   gfx_widgets_deinit(false);
+   if (!widgets_up())
+      return;
+   pump(1);
+   CHECK(!shown("queued, not persisting"),
+         "a queued message outlived widgets that do not persist");
+   gfx_widgets_deinit(false);
+}
+
 /* An icon draw carries its size to the display driver as one packed
  * word. Asymmetric dimensions, so a transposition cannot pass. */
 extern unsigned stub_draw_dims;
@@ -374,6 +411,25 @@ static void test_media_startup(void)
    gfx_widgets_deinit(false);
 }
 
+static void test_layout_dims(void)
+{
+   const float crt = 4.0f / 3.0f;
+   CHECK(gfx_widgets_layout_dims(VIDEO_SCALE_PACK(2560, 240), crt)
+         == VIDEO_SCALE_PACK(320, 240), "a super resolution lays out at 4:3");
+   CHECK(gfx_widgets_layout_dims(VIDEO_SCALE_PACK(1920, 224), crt)
+         == VIDEO_SCALE_PACK(299, 224), "whatever its line count");
+   CHECK(gfx_widgets_layout_dims(VIDEO_SCALE_PACK(2560, 480), crt)
+         == VIDEO_SCALE_PACK(640, 480), "or an interlaced one");
+   CHECK(gfx_widgets_layout_dims(VIDEO_SCALE_PACK(256, 224), crt)
+         == VIDEO_SCALE_PACK(256, 224), "a native mode is left alone");
+   CHECK(gfx_widgets_layout_dims(VIDEO_SCALE_PACK(384, 224), crt)
+         == VIDEO_SCALE_PACK(384, 224), "a wide native mode too");
+   CHECK(gfx_widgets_layout_dims(VIDEO_SCALE_PACK(1920, 1080), crt)
+         == VIDEO_SCALE_PACK(1920, 1080), "a 16:9 panel is left alone");
+   CHECK(gfx_widgets_layout_dims(VIDEO_SCALE_PACK(2560, 240), 0.0f)
+         == VIDEO_SCALE_PACK(2560, 240), "no aspect, no change");
+}
+
 int main(void)
 {
    task_queue_init(false, NULL);
@@ -381,12 +437,14 @@ int main(void)
    test_titles();
    test_queue_overflow();
    test_init_deinit_cycles();
+   test_queued_across_reinit();
    test_icon_draw_size();
    test_worker_deinit();
 #if defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__)
    test_modal_scale();
 #endif
    test_media_startup();
+   test_layout_dims();
 
    printf("pushes=%d frames=%d\n", pushes, iterations);
 

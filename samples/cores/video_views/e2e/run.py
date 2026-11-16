@@ -156,6 +156,11 @@ HW_CASES = {
     'd3d12': [(name, 'd3d12')
               for name in ('3ds-2d', '3ds-sbs-full', '3ds-anaglyph',
                            '3ds-interlaced', '3ds-sbs-full-threaded')],
+    # The core's own Direct3D 9 textures, its views drawn straight from
+    # them
+    'd3d9_hlsl': [(name, 'd3d9')
+                  for name in ('3ds-2d', '3ds-sbs-full', '3ds-anaglyph',
+                               '3ds-interlaced', '3ds-sbs-full-threaded')],
 }
 
 # A frame past the declared maximum in the core's own Vulkan image.
@@ -184,6 +189,16 @@ MENU_CASES = [
 # Pixels allowed to differ from the first mode's menu: the cursor's
 # border pulses. A menu laid out for one eye differs in over 200000.
 MENU_DIFF_MAX = 20000
+
+# RGUI is drawn in the picture's rectangle, not the whole window: a 4:3
+# picture on the 5:3 screen leaves 160-pixel black strips either side.
+# (name, map option, settings, points)
+MENU_FIT_CASE = ('no-map-rgui-fit', 'none',
+                 {'aspect_ratio_index': '0', 'menu_driver': 'rgui',
+                  'rgui_menu_color_theme': '4', 'rgui_particle_effect': '0',
+                  'menu_timedate_enable': 'false'}, [])
+MENU_FIT_DRIVERS = ('d3d10', 'd3d11', 'd3d12')
+MENU_FIT_STRIP = 150
 
 # The menu draws its own cursor where it has the pointer: with a per-eye
 # UI, at the pointer in the copy it is over and at the matching place in
@@ -264,6 +279,7 @@ EXACT_CASES = [
     ('exact-3ds', '3ds', NOISE, 'vulkan'),
     ('exact-3ds', '3ds', NOISE, 'd3d11'),
     ('exact-3ds', '3ds', NOISE, 'd3d12'),
+    ('exact-3ds', '3ds', NOISE, 'd3d9'),
     # No map: the frame drawn whole. A core's GL framebuffer as large as
     # its maximum holds the frame in a corner, so the stock chain would
     # copy it out; glcore draws it straight from there instead.
@@ -273,7 +289,7 @@ EXACT_CASES = [
 EXACT_HW = {'gl': ('off', 'gl_compat'),
             'glcore': ('off', 'gl', 'gl_topleft'), 'vulkan': ('off', 'vulkan'),
             'gl1': ('off',), 'd3d10': ('off',), 'd3d11': ('off', 'd3d11'),
-            'd3d12': ('off', 'd3d12'), 'd3d9_hlsl': ('off',),
+            'd3d12': ('off', 'd3d12'), 'd3d9_hlsl': ('off', 'd3d9'),
             'sdl2': ('off',), 'sdl3': ('off',), 'd3d8': ('off',),
             'gdi': ('off',), 'sdl': ('off',), 'x11': ('off',)}
 # Drivers whose views take a preset: on the others a preset draws the
@@ -310,6 +326,11 @@ SW_IN_PLACE_DRIVERS = ('glcore', 'vulkan')
 WRITE_SW_RE = re.compile(
     r'\] Views\' presets have each view of a software frame written '
     r'straight in\.')
+# d3d9_hlsl's presets on a core's Direct3D 9 texture: each view copied
+# out of it on the GPU
+D3D9_HW_COPY_RE = re.compile(
+    r'\] Views\' presets have each view of a hardware frame copied out '
+    r'of the core\'s texture\.')
 # Drivers on shader model 4, where the rect presets' gathers of more than
 # the red component do not compile.
 SM4_DRIVERS = ('d3d10',)
@@ -499,6 +520,9 @@ def write_cfg(path, d, driver, settings, port):
         'confirm_quit': 'false',
         'quit_press_twice': 'false',
         'config_save_on_exit': 'false',
+        # A first run offers the missing downloads in a dialog over the
+        # menu, which then holds the menu's input.
+        'rgui_show_start_screen': 'false',
         'network_cmd_enable': 'true',
         'network_cmd_port': str(port),
         'history_list_enable': 'false',
@@ -1256,6 +1280,10 @@ def run_exact_case(retroarch, root, driver, case, suffix='',
     if driver in WRITE_SW_VIEWS and direct_drawn(d, WRITE_SW_RE) != written:
         errors.append('views %s straight in'
                       % ('not written' if written else 'written'))
+    if driver == 'd3d9_hlsl' and hw == 'd3d9' and mapopt != 'none' \
+            and direct_drawn(d, D3D9_HW_COPY_RE) != bool(preset):
+        errors.append('views %s out of the core\'s texture'
+                      % ('copied' if not preset else 'not copied'))
     shots = sorted(x for x in os.listdir(os.path.join(d, 'shots'))
                    if x.endswith('.png'))
     if not shots:
@@ -1313,6 +1341,25 @@ def run_menu_case(retroarch, root, driver, case):
         if diff > MENU_DIFF_MAX:
             errors.append('stereo mode %s: %d pixels differ from mode %s'
                           % (mode, diff, modes[0]))
+    return errors
+
+
+def run_menu_fit_case(retroarch, root, driver, case):
+    """RGUI over a picture narrower than the window stays inside it."""
+    errors = run_case(retroarch, root, driver, case, menu=True)
+    path = os.path.join(root, '%s-%s' % (driver, case[0]), 'menu.png')
+    if errors or not os.path.exists(path):
+        return errors or ['no menu screenshot']
+    w, h, bpp, rows = read_png(path)
+    lit = 0
+    for x in list(range(MENU_FIT_STRIP)) + list(range(w - MENU_FIT_STRIP, w)):
+        for y in range(h):
+            if max(rows[y][x * bpp:x * bpp + 3]) > TOLERANCE:
+                lit += 1
+    if lit:
+        errors.append('%d lit pixels in the strips beside the picture' % lit)
+    if max(rows[h // 2][w // 2 * bpp:(w // 2 + 40) * bpp]) <= TOLERANCE:
+        errors.append('nothing drawn in the middle of the screen')
     return errors
 
 
@@ -1638,6 +1685,11 @@ def driver_jobs(retroarch, root, driver):
         errors = run_menu_case(retroarch, root, driver, case)
         return report('%s/%s' % (driver, case[0]), errors), bool(errors)
 
+    def menu_fit():
+        errors = run_menu_fit_case(retroarch, root, driver, MENU_FIT_CASE)
+        return report('%s/%s' % (driver, MENU_FIT_CASE[0]), errors), \
+            bool(errors)
+
     def pointer(menu, case):
         errors = run_pointer_case(retroarch, root, driver, menu, case)
         return report('%s/%s-%s' % (driver, case[0], menu), errors), \
@@ -1673,6 +1725,8 @@ def driver_jobs(retroarch, root, driver):
              for c in (MEMORY_CASES if driver in MEMORY_HW and not XVFB
                        else []) if wanted(c[0])]
     jobs += [lambda c=c: menu_case(c) for c in MENU_CASES if wanted(c[0])]
+    if driver in MENU_FIT_DRIVERS and wanted(MENU_FIT_CASE[0]):
+        jobs.append(menu_fit)
     jobs += [lambda m=m, c=c: pointer(m, c) for m in sorted(POINTER_MENUS)
              for c in POINTER_CASES
              if wanted(c[0]) and driver not in NO_POINTER_DRIVERS]

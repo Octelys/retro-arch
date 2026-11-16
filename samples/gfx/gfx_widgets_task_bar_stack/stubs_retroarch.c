@@ -151,6 +151,13 @@ void gfx_display_blend_end(gfx_display_ctx_driver_t *dispctx, void *data)
 { (void)dispctx; (void)data; }
 
 /* --- display: signatures copied from gfx/gfx_display.h --- */
+void gfx_display_set_output_dims(gfx_display_t *p_disp,
+      unsigned output_dims)
+{ (void)p_disp; (void)output_dims; }
+unsigned gfx_display_output_dims(const gfx_display_t *p_disp,
+      unsigned video_dims)
+{ (void)p_disp; return video_dims; }
+float video_driver_ui_display_aspect(void) { return 0.0f; }
 void gfx_display_draw_quad(gfx_display_t *p_disp, void *data,
       unsigned video_dims,
       int x, int y, unsigned dims,
@@ -278,6 +285,9 @@ bool video_thread_run_queued(custom_command_method_t func, void *data)
 
 /* --- video driver --- */
 uint32_t video_driver_get_disp_flags(void) { return 0; }
+unsigned video_frame_ui_layer_dims(const video_frame_info_t *video_info,
+      unsigned layer)
+{ (void)layer; return video_info->dims; }
 bool video_driver_get_viewport_info(struct video_viewport *vp)
 { (void)vp; return false; }
 void video_driver_monitor_reset(void) { }

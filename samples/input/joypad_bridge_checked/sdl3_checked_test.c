@@ -12,7 +12,7 @@
 #include "bridge_view.h"
 
 /* No video thread here: the driver pumps the queue itself. */
-void sdl3_pump_input_events(void) { SDL_PumpEvents(); }
+bool sdl3_pump_input_events(void) { SDL_PumpEvents(); return true; }
 
 static void randomise(sdl3_joypad_t *pad)
 {
@@ -155,6 +155,25 @@ static unsigned check_touchpad(void)
    return bad;
 }
 
+/* set_player() shows the port's player on the pad, none for 0 */
+static unsigned check_players(void)
+{
+   unsigned bad = 0, i, slot = MAX_USERS;
+
+   for (i = 0; i < MAX_USERS; i++)
+      if (sdl3_joypads[i].joypad)
+         slot = i;
+   sdl3_joypad.set_player(slot, 3);
+   if (SDL_GetJoystickPlayerIndex(sdl3_joypads[slot].joypad) != 2)
+      bad++;
+   sdl3_joypad.set_player(slot, 0);
+   if (SDL_GetJoystickPlayerIndex(sdl3_joypads[slot].joypad) != -1)
+      bad++;
+   if (bad)
+      printf("FAIL sdl3_checked_test: set_player() did not reach the pad\n");
+   return bad;
+}
+
 int main(void)
 {
    unsigned n, bad = 0, pads = 0, gamepads = 0, i;
@@ -215,6 +234,7 @@ int main(void)
       }
 
    bad += check_touchpad();
+   bad += check_players();
 
    sdl3_joypad_destroy();
    if (bad)
@@ -224,7 +244,8 @@ int main(void)
    }
    printf("PASS sdl3_checked_test: 1500 random states of %u virtual joysticks"
          " (%u opened as a gamepad); what the bridge would read is what the"
-         " driver says; a touchpad's fingers and press as SDL has them\n",
+         " driver says; a touchpad's fingers and press as SDL has them;"
+         " set_player() reaches the pad\n",
          pads, gamepads);
    return 0;
 }

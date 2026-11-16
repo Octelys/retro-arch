@@ -603,6 +603,19 @@ name. A region with a select mask answers every address that agrees
 with its start in the selected bits, not only start to start plus
 length.
 
+A core that publishes no memory map - snes9x among them - still hands
+its RAM over through `retro_get_memory_data`, and every memory tool reads
+that instead: system RAM from address 0 and save RAM straight after it,
+the layout RetroArch's achievements use when they know no console.
+`GET_MEMORY_MAP` lists the two as `system` and `save`, in the address
+space `core`. These are offsets into the core's RAM, not the console's
+addresses: the SNES's work RAM at `$7E0000` is `0` here, which is also the
+address RetroAchievements' notes give for it. Other consoles' notes may
+place RAM elsewhere - the NES's save RAM at `0x6000`, say, is straight
+after system RAM here. Reads run across from one
+to the other, `WATCH` and conditions take them, and `WRITE_CORE_MEMORY`
+writes them.
+
 To find something to play, an assistant lists the playlists with
 `LIST_PLAYLISTS`, reads one with `GET_PLAYLIST` (index, label, content
 path and core path per entry, 200 at a time; `MORE <next>` gives the
@@ -689,9 +702,22 @@ picture itself as image content (PNG, up to 4 MiB) and the file's path as
 text, so a client can see the screen without reaching the file - or with
 `SCREENSHOT ERROR` and the reason if it could not be.
 
+`GET_FRAME [size]` is the look without the file: the content's frame
+on screen now, scaled down to fit a square of `size` pixels (64 to
+640, 320 when left out; never scaled up), answered as image content
+with `GET_FRAME 320x240` as its text. Nothing is written - no file, no
+history entry, no notification - so it costs a client only the image.
+It takes the frame the way `SCREENSHOT` does, from the GPU's read-back
+for a hardware-rendered core, and is refused while another screenshot
+is being taken. It is for what memory cannot say: a game whose RAM no
+one has charted, or checking what the RAM says. It is not for the step
+loop, where `WATCH`'s numbers cost far less than a picture. The line
+interfaces carry no image, so there it is refused, pointing to
+`SCREENSHOT`.
+
 Every tool carries hints for the client:
 
-- **read-only**: only reports (`GET_STATUS`, `GET_LOG`, `LIST_CORES`,
+- **read-only**: only reports (`GET_STATUS`, `GET_FRAME`, `GET_LOG`, `LIST_CORES`,
   `LIST_PLAYLISTS`, `GET_PLAYLIST`, `READ_CORE_MEMORY`,
   `GET_MEMORY_MAP`);
 - **destructive**: can lose unsaved progress or data, or loads code
@@ -714,6 +740,19 @@ first - the same probe core scanning uses - and answer `no core at
 not probed. A stale library or something renamed would otherwise
 unload the running core and then fail, costing the game that was
 running.
+
+## Achievements hardcore mode
+
+While RetroAchievements' hardcore mode is on, the server runs no tool:
+every `tools/call` is answered as the tool's own failure, `<NAME> ERROR
+achievements hardcore mode is on; the player can turn it off`. Hardcore
+achievements are the player's own, as the mode's ban on rewind, slow
+motion, cheats and states already says. The handshake and `tools/list`
+still answer, so a client can connect and learn why. When hardcore mode
+takes effect - switched on, or a game loaded with it on - what a client
+left playing stops with it, as slow motion does: a running or queued
+step job ends, and what `INPUT` holds is let go. Turning hardcore mode
+off is the player's, in RetroArch.
 
 ## Security
 

@@ -23,6 +23,7 @@
 #include <streams/file_stream.h>
 #include <features/features_cpu.h>
 #include <formats/cdfs.h>
+#include <streams/cdfs_file.h>
 #include <compat/strl.h>
 #include <retro_miscellaneous.h>
 #include <retro_math.h>
@@ -59,6 +60,7 @@
 #endif
 
 #include "cheevos.h"
+#include "cheevos_ciso.h"
 #include "cheevos_client.h"
 #include "cheevos_menu.h"
 #include "cheevos_locals.h"
@@ -865,6 +867,11 @@ bool rcheevos_hardcore_active(void)
    return rcheevos_locals.hardcore_being_enabled;
 }
 
+bool rcheevos_hardcore_in_game(void)
+{
+   return rcheevos_hardcore_active() && rcheevos_is_game_loaded();
+}
+
 void rcheevos_pause_hardcore(void)
 {
    rcheevos_locals.hardcore_allowed = false;
@@ -956,10 +963,13 @@ void rcheevos_leaderboard_trackers_visibility_changed(void)
 #endif
 }
 
-/* Disable slowdown */
+/* Disable slowdown, and what a command left playing */
 static void rcheevos_enforce_hardcore_settings(void)
 {
    runloop_state_get_ptr()->flags &= ~RUNLOOP_FLAG_SLOWMOTION;
+#ifdef HAVE_COMMAND
+   command_hardcore_entered();
+#endif
 }
 
 static void rcheevos_toggle_hardcore_active(rcheevos_locals_t* locals)
@@ -1457,7 +1467,10 @@ static int rcheevos_rvz_pump(rcheevos_rvz_t* handle, bool opening)
 
       if (err != RVZ_PENDING)
          return err;
-      if (filestream_seek(handle->file, (int64_t)req.offset,
+      /* At the offset in one call; seek and read where there is none */
+      if ((got = filestream_read_at(handle->file, req.dst,
+                  (int64_t)req.length, (int64_t)req.offset)) < 0
+            && filestream_seek(handle->file, (int64_t)req.offset,
                RETRO_VFS_SEEK_POSITION_START) == 0)
          got = filestream_read(handle->file, req.dst, (int64_t)req.length);
       rvz_feed(handle->rvz, got > 0 ? (size_t)got : 0);
@@ -1793,10 +1806,12 @@ void rcheevos_download_next_badge(retro_task_t* task)
    const rc_client_achievement_t* first_locked_achievement =
       rc_client_get_next_achievement_info(rcheevos_locals.client,
       (const rc_client_achievement_t*)task->user_data, bucket);
+   unsigned examined = 0;
 
    while (first_locked_achievement)
    {
       bool result;
+      task->user_data = (void*)first_locked_achievement;
 
       if (pass == 1)
       {
@@ -1811,6 +1826,13 @@ void rcheevos_download_next_badge(retro_task_t* task)
 
       if (result)
          break;
+
+      /* Resume cached-file traversal on a later owner-thread tick. */
+      if (++examined == 16)
+      {
+         task->when = cpu_features_get_time_usec() + 1000;
+         return;
+      }
 
       first_locked_achievement =
          rc_client_get_next_achievement_info(rcheevos_locals.client, first_locked_achievement, bucket);
@@ -1869,6 +1891,8 @@ static void rcheevos_finalize_game_load(rc_client_t* client)
       task = task_init();
       if (task)
       {
+         /* The iterator reads owner-thread client state. */
+         task->flags |= RETRO_TASK_FLG_MAIN_THREAD;
          task->handler = rcheevos_download_next_badge;
          task->user_data = (void*)first_locked_achievement;
          task->when = cpu_features_get_time_usec() + 5*60*1000000; /* five minutes */
@@ -2186,8 +2210,8 @@ bool rcheevos_load(const void *data)
 
 #ifdef CHEEVOS_RVZ_READER
       /* The file reader is kept from one load to the next, so it is
-       * set for every load: the RVZ one for a file it reads, the
-       * default for anything else. */
+       * set for every load: the RVZ or CISO one for a file it reads,
+       * the default for anything else. */
       const char* ext = path_get_extension(info->path);
       if (     (string_is_equal_noncase(ext, "rvz") || string_is_equal_noncase(ext, "wia"))
             && (console_id = rcheevos_rvz_get_console_id(info->path))
@@ -2203,8 +2227,13 @@ bool rcheevos_load(const void *data)
          rc_hash_init_custom_filereader(&filereader);
       }
       else
-         rc_hash_init_custom_filereader(NULL);
 #endif
+      if (     string_is_equal_noncase(path_get_extension(info->path), "ciso")
+            && (console_id = rcheevos_ciso_get_console_id(info->path))
+               != RC_CONSOLE_UNKNOWN)
+         rcheevos_ciso_filereader_init();
+      else
+         rc_hash_init_custom_filereader(NULL);
 
       {
 #ifdef HAVE_THREADS

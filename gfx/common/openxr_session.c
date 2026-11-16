@@ -13,6 +13,7 @@
  *  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdlib.h>
 #include <string.h>
 
 #include <retro_atomic.h>
@@ -116,7 +117,7 @@ static void openxr_session_state(openxr_session_t *s, XrSessionState state)
    }
 }
 
-void openxr_session_poll(openxr_session_t *s)
+bool openxr_session_next_event(openxr_session_t *s, openxr_event_t *e)
 {
    XrResult res;
    XrEventDataBuffer ev;
@@ -125,41 +126,90 @@ void openxr_session_poll(openxr_session_t *s)
       ev.type = XR_TYPE_EVENT_DATA_BUFFER;
       ev.next = NULL;
       res     = s->PollEvent(s->rt->instance, &ev);
+      memset(e, 0, sizeof(*e));
       if (res == XR_ERROR_INSTANCE_LOST)
-         openxr_session_end(s, true);
+      {
+         e->kind = OPENXR_EVENT_INSTANCE_LOST;
+         return true;
+      }
       if (res != XR_SUCCESS)
-         break;
-      if (ev.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING)
+         return false;
+      switch (ev.type)
       {
-         const XrEventDataReferenceSpaceChangePending *sc =
-            (const XrEventDataReferenceSpaceChangePending*)&ev;
-         if (sc->session == s->session)
-         {
-            if (     sc->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL
-                  && s->hooks.local_changed)
-               s->hooks.local_changed(s->hooks.user);
-            else if (sc->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_STAGE
-                  && s->hooks.stage_changed)
-               s->hooks.stage_changed(s->hooks.user);
-         }
+         case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
+            {
+               const XrEventDataReferenceSpaceChangePending *sc =
+                  (const XrEventDataReferenceSpaceChangePending*)&ev;
+               e->kind    = OPENXR_EVENT_SPACE_CHANGE;
+               e->session = sc->session;
+               e->value   = (int)sc->referenceSpaceType;
+            }
+            return true;
+         case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED:
+            {
+               const XrEventDataSessionStateChanged *sc =
+                  (const XrEventDataSessionStateChanged*)&ev;
+               e->kind    = OPENXR_EVENT_STATE;
+               e->session = sc->session;
+               e->value   = (int)sc->state;
+            }
+            return true;
+         case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
+            e->kind = OPENXR_EVENT_LOSS_PENDING;
+            return true;
+         case XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB:
+            {
+               const XrEventDataDisplayRefreshRateChangedFB *rc =
+                  (const XrEventDataDisplayRefreshRateChangedFB*)&ev;
+               e->kind    = OPENXR_EVENT_REFRESH_RATE;
+               e->from_hz = rc->fromDisplayRefreshRate;
+               e->to_hz   = rc->toDisplayRefreshRate;
+            }
+            return true;
+         default:
+            break;
       }
-      if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED)
-      {
-         const XrEventDataSessionStateChanged *sc =
-            (const XrEventDataSessionStateChanged*)&ev;
-         /* A session destroyed for a new one may have some queued. */
-         if (sc->session == s->session)
-            openxr_session_state(s, sc->state);
-      }
-      else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING)
+   }
+}
+
+void openxr_session_apply(openxr_session_t *s, const openxr_event_t *e)
+{
+   switch (e->kind)
+   {
+      case OPENXR_EVENT_INSTANCE_LOST:
+      case OPENXR_EVENT_LOSS_PENDING:
          openxr_session_end(s, true);
-      else if (ev.type == XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB)
-      {
-         const XrEventDataDisplayRefreshRateChangedFB *rc =
-            (const XrEventDataDisplayRefreshRateChangedFB*)&ev;
+         break;
+      case OPENXR_EVENT_SPACE_CHANGE:
+         if (e->session != s->session)
+            break;
+         if (     e->value == (int)XR_REFERENCE_SPACE_TYPE_LOCAL
+               && s->hooks.local_changed)
+            s->hooks.local_changed(s->hooks.user);
+         else if (e->value == (int)XR_REFERENCE_SPACE_TYPE_STAGE
+               && s->hooks.stage_changed)
+            s->hooks.stage_changed(s->hooks.user);
+         break;
+      case OPENXR_EVENT_STATE:
+         /* A session destroyed for a new one may have some queued. */
+         if (e->session == s->session)
+            openxr_session_state(s, (XrSessionState)e->value);
+         break;
+      case OPENXR_EVENT_REFRESH_RATE:
          RARCH_LOG("[OpenXR] The headset changed from %.2f to %.2f Hz.\n",
-               rc->fromDisplayRefreshRate, rc->toDisplayRefreshRate);
-      }
+               e->from_hz, e->to_hz);
+         break;
+   }
+}
+
+void openxr_session_poll(openxr_session_t *s)
+{
+   openxr_event_t e;
+   while (openxr_session_next_event(s, &e))
+   {
+      openxr_session_apply(s, &e);
+      if (e.kind == OPENXR_EVENT_INSTANCE_LOST)
+         break;
    }
 }
 
@@ -232,8 +282,14 @@ error:
 
 void openxr_session_destroy(openxr_session_t *s)
 {
-   if (s->track_space)
-      s->DestroySpace(s->track_space);
+   openxr_track_t *t;
+   openxr_session_take_track(s);
+   if ((t = (openxr_track_t*)retro_atomic_exchange_ptr(&s->track, NULL)))
+   {
+      s->DestroySpace(t->space);
+      free(t);
+   }
+   s->carry_from = s->carry_to = 0;
    if (s->view_space)
       s->DestroySpace(s->view_space);
    if (s->local_space)
@@ -252,6 +308,7 @@ bool openxr_session_swap_track_space(openxr_session_t *s,
 {
    XrResult res;
    XrReferenceSpaceCreateInfo rci;
+   openxr_track_t *t, *old;
    XrSpace fresh                     = XR_NULL_HANDLE;
    enum retro_vr_reference_space got = RETRO_VR_REFERENCE_SPACE_LOCAL;
    bool stage_failed                 = false;
@@ -292,20 +349,47 @@ bool openxr_session_swap_track_space(openxr_session_t *s,
       if (stage_failed)
          RARCH_WARN("[OpenXR] No STAGE space: tracked content is seated.\n");
    }
-   /* The XR thread submits in it, and places the screens by it, under
-    * the lock. */
-   openxr_session_lock(s);
-   if (s->track_space)
-      s->DestroySpace(s->track_space);
-   s->track_space  = fresh;
-   s->track_origin = *origin;
-   s->track_local  = (got == RETRO_VR_REFERENCE_SPACE_LOCAL);
-   retro_atomic_fetch_add_int(&s->track_seq, 1);
+   if (!(t = (openxr_track_t*)malloc(sizeof(*t))))
+   {
+      s->DestroySpace(fresh);
+      return false;
+   }
+   /* Consecutive carries make one range. */
+   if (swapped)
+   {
+      if (from != s->carry_to)
+         s->carry_from = from;
+      s->carry_to = from + 1;
+   }
+   t->space       = fresh;
+   t->origin      = *origin;
+   t->seq         = from + 1;
+   t->carry_from  = s->carry_from;
+   t->carry_to    = s->carry_to;
+   t->local       = (got == RETRO_VR_REFERENCE_SPACE_LOCAL);
+   s->track_space = fresh;
+   retro_atomic_store_release_int(&s->track_seq, from + 1);
+   /* The frame loop may be submitting in the old one: it goes at that
+    * thread's next frame, which takes this one. */
+   if ((old = (openxr_track_t*)retro_atomic_exchange_ptr(&s->track, t)))
+      mpsc_stack_push(&s->track_retired, &old->park);
    if (swapped)
       swapped(user, from, from + 1);
-   openxr_session_unlock(s);
    *space = got;
    return true;
+}
+
+const openxr_track_t *openxr_session_take_track(openxr_session_t *s)
+{
+   mpsc_stack_node_t *n = mpsc_stack_drain(&s->track_retired);
+   while (n)
+   {
+      openxr_track_t *t = (openxr_track_t*)n;
+      n                 = n->next;
+      s->DestroySpace(t->space);
+      free(t);
+   }
+   return (const openxr_track_t*)retro_atomic_load_acquire_ptr(&s->track);
 }
 
 /* Keeps lost: a lost instance cannot make a new session. */

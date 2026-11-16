@@ -128,6 +128,9 @@ struct gl3_views_fbo
 
 typedef struct gl3
 {
+#ifdef HAVE_GL_MENU_BLOOM
+   gl_menu_bloom_t *menu_bloom;
+#endif
    const gfx_ctx_driver_t *ctx_driver;
    void *ctx_data;
    /* The frame's swap: how long it took, and whether it was one that
@@ -274,22 +277,32 @@ typedef struct gl3
    struct
    {
       GLuint alpha_blend;
+      GLuint xmb_plastic;
+      GLuint xmb_font;
       GLuint font;
 #ifdef HAVE_SHADERPIPELINE
-      GLuint ribbon;
-      GLuint ribbon_simple;
-      GLuint snow_simple;
-      GLuint snow;
-      GLuint bokeh;
-      GLuint snowflake;
+      /* The ribbon's uniform block, and the menu effects' programs,
+       * cross-compiled when installed */
+      GLuint ribbon_ubo;
+      struct gl3_effect
+      {
+         GLuint prog;
+         struct gl3_buffer_locations loc;
+         unsigned flags;
+      } effects[16];
+      unsigned effect_count;
 #endif /* HAVE_SHADERPIPELINE */
       struct gl3_buffer_locations alpha_blend_loc;
+      struct gl3_buffer_locations xmb_plastic_loc;
+      struct gl3_buffer_locations xmb_font_loc;
       struct gl3_buffer_locations font_loc;
       /* Half-float (linear scRGB) textures under the scRGB composite:
        * alpha_blend_linear.frag, made the first time one is drawn */
       GLuint alpha_blend_linear;
       struct gl3_buffer_locations alpha_blend_linear_loc;
       bool   alpha_blend_linear_tried;
+      bool   xmb_plastic_tried;
+      bool   xmb_font_tried;
       /* stock_rect.frag, made the first time the stock chain would draw
        * a view or a padded frame: with its nearest and linear samplers,
        * it draws them straight from the frame's texture. */
@@ -299,14 +312,6 @@ typedef struct gl3
       bool   stock_rect_tried;
       /* A padded frame has been drawn straight from its texture. */
       bool   stock_rect_frame_seen;
-#ifdef HAVE_SHADERPIPELINE
-      struct gl3_buffer_locations ribbon_loc;
-      struct gl3_buffer_locations ribbon_simple_loc;
-      struct gl3_buffer_locations snow_simple_loc;
-      struct gl3_buffer_locations snow_loc;
-      struct gl3_buffer_locations bokeh_loc;
-      struct gl3_buffer_locations snowflake_loc;
-#endif /* HAVE_SHADERPIPELINE */
       GLuint hdr_scrgb;
       struct gl3_buffer_locations hdr_scrgb_loc;
       /* gfx_display meshes */
@@ -384,6 +389,17 @@ typedef struct gl3
       uint32_t id;
    } meshes[8];
    uint64_t mesh_frame;
+#if defined(HAVE_SHADERPIPELINE) && defined(HAVE_GLSL)
+   /* The menu effects made from their GLSL, in the dialect of the
+    * context, where they cannot be cross-compiled from SPIR-V: without
+    * slang, or when that fails */
+   struct gl3_glsl_effect
+   {
+      gl_glsl_effect_t glsl;
+      unsigned flags;
+   } glsl_effects[16];
+   unsigned glsl_effect_count;
+#endif
    GLuint hw_render_texture;
    GLuint hw_render_fbo;
    GLuint hw_render_rb_ds;
@@ -471,7 +487,7 @@ static void gl3_set_viewport(gl3_t *gl,
       unsigned dims,
       bool force_full,   bool allow_rotate);
 #ifdef HAVE_SLANG
-static void gl3_views_free_chains(gl3_t *gl, unsigned first);
+static void gl3_views_free_chains(gl3_t *gl, unsigned first, bool frame);
 static void gl3_views_free_copies(gl3_t *gl, unsigned first);
 /* What a frame's placement draws read */
 struct gl3_views_draw
@@ -618,15 +634,16 @@ void gl3_framebuffer_copy(
    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
+/* @vbo: written with the quad each call, made once by the caller */
 void gl3_framebuffer_copy_partial(
       GLuint fb_id,
       GLuint quad_program,
+      GLuint vbo,
       GLint flat_ubo_vertex,
       unsigned size_width, unsigned size_height,
       GLuint image,
       float ox, float oy, float rx, float ry)
 {
-   GLuint vbo;
    /* C89: an aggregate initializer must be constant, and the corners'
     * texture coordinates are not; they are set after declaration. */
    float quad_data[16] = {
@@ -671,18 +688,14 @@ void gl3_framebuffer_copy_partial(
    glEnableVertexAttribArray(0);
    glEnableVertexAttribArray(1);
 
-   /* A bit crude, but heeeey. */
-   glGenBuffers(1, &vbo);
    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-
-   glBufferData(GL_ARRAY_BUFFER, sizeof(quad_data), quad_data, GL_STREAM_DRAW);
+   glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(quad_data), quad_data);
    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
                          (void *)((uintptr_t)(0)));
    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
                          (void *)((uintptr_t)(2 * sizeof(float))));
    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
    glBindBuffer(GL_ARRAY_BUFFER, 0);
-   glDeleteBuffers(1, &vbo);
    glDisableVertexAttribArray(0);
    glDisableVertexAttribArray(1);
    glUseProgram(0);
@@ -911,7 +924,7 @@ uint32_t gl3_get_cross_compiler_target_version(void)
    return 100 * major + 10 * minor;
 }
 
-#ifdef HAVE_SLANG
+#if defined(HAVE_SLANG) || (defined(HAVE_SHADERPIPELINE) && defined(HAVE_GLSL))
 /* The slot whose buffers hold @mesh, uploaded the first time it is
  * drawn; -1 when they cannot be had, and the mesh is streamed */
 static int gl3_mesh_slot(gl3_t *gl, const gfx_display_mesh_t *mesh)
@@ -1008,153 +1021,155 @@ static const float *gfx_display_gl3_get_default_tex_coords(void)
    return &gl3_tex_coords[0];
 }
 
+#if defined(HAVE_SHADERPIPELINE) && defined(HAVE_GLSL)
+/* @effect, when it is one made from GLSL */
+static const struct gl3_glsl_effect *gl3_glsl_effect(const gl3_t *gl,
+      const void *effect)
+{
+   const struct gl3_glsl_effect *fx = (const struct gl3_glsl_effect*)effect;
+   if (     fx >= gl->glsl_effects
+         && fx <  gl->glsl_effects + gl->glsl_effect_count)
+      return fx;
+   return NULL;
+}
+
+/* An effect made from GLSL, as gl2 draws one: its own program, the
+ * uniforms it reads at the locations found when it was made, and the
+ * mesh from its buffer - a core profile reads nothing from client
+ * memory. The chain's program is put back after. */
+static void gl3_draw_glsl_effect(gl3_t *gl,
+      const struct gl3_glsl_effect *fx, const gfx_display_ctx_draw_t *draw)
+{
+   gfx_display_t *p_disp          = disp_get_ptr();
+   const gl_glsl_effect_t *prg    = &fx->glsl;
+   const gfx_display_mesh_t *mesh = p_disp->effect_mesh;
+   int slot;
+
+   if (     prg->vertex_coord < 0 || !mesh || !draw->coords
+         || (slot = gl3_mesh_slot(gl, mesh)) < 0)
+      return;
+
+   if (fx->flags & GFX_EFFECT_BLEND_ADD)
+      glBlendFunc(GL_ONE, GL_ONE);
+   else if (fx->flags & GFX_EFFECT_BLEND_SCREEN)
+      glBlendFunc(GL_DST_COLOR, GL_ONE);
+   else
+      gl3_blend_alpha(gl);
+
+   glUseProgram(prg->prog);
+   if (prg->mvp >= 0)
+      glUniformMatrix4fv(prg->mvp, 1, GL_FALSE, gl->mvp_no_rot.data);
+   if (prg->time >= 0)
+      glUniform1f(prg->time, p_disp->effect_time);
+   if (prg->ribbon >= 0 && (fx->flags & GFX_EFFECT_RIBBON))
+   {
+      const float *ribbon = gfx_display_ribbon_data(p_disp);
+      if (ribbon)
+         glUniform4fv(prg->ribbon, 50, ribbon);
+   }
+   if (prg->output_size >= 0 && !(fx->flags & GFX_EFFECT_MESH))
+      glUniform2f(prg->output_size, (float)VIDEO_SCALE_W(draw->dims),
+            (float)VIDEO_SCALE_H(draw->dims));
+
+   gl->meshes[slot].last_frame = gl->mesh_frame;
+   glBindBuffer(GL_ARRAY_BUFFER, gl->meshes[slot].vbo);
+   glEnableVertexAttribArray(prg->vertex_coord);
+   glVertexAttribPointer(prg->vertex_coord, 2, GL_FLOAT, GL_FALSE,
+         sizeof(gfx_display_mesh_vertex_t), (const GLvoid*)0);
+   glDrawArrays(GL_TRIANGLE_STRIP, 0, draw->coords->vertices);
+   glDisableVertexAttribArray(prg->vertex_coord);
+   glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+   gl3_blend_alpha(gl);
+   if (gl->chain.active && gl->chain.shader)
+      gl->chain.shader->use(gl, gl->chain.shader_data,
+            VIDEO_SHADER_STOCK_BLEND, true);
+}
+#endif
+
 static void gfx_display_gl3_draw_pipeline(
       gfx_display_ctx_draw_t *draw,
       gfx_display_t *p_disp,
       void *data,
       unsigned video_dims)
 {
-   unsigned video_width  = VIDEO_SCALE_W(video_dims);
-   unsigned video_height = VIDEO_SCALE_H(video_dims);
-#ifdef HAVE_SHADERPIPELINE
+#if defined(HAVE_SHADERPIPELINE) && defined(HAVE_GLSL)
+   {
+      gl3_t *gl3 = (gl3_t*)data;
+      if (gl3 && draw && gl3_glsl_effect(gl3, draw->effect))
+      {
+         /* Drawn from the effect's mesh, at the origin, under the
+          * display's own MVP: gl3_draw_glsl_effect() */
+         draw->pos         = VIDEO_POS_PACK(0, 0);
+         draw->matrix_data = NULL;
+         draw->coords      = gfx_display_effect_coords(p_disp);
+         return;
+      }
+   }
+#endif
+#if defined(HAVE_SHADERPIPELINE) && defined(HAVE_SLANG)
+   {
+   static struct video_coords blank_coords;
+   static uint8_t ubo_scratch_data[768];
+   static float ribbon_ubo[4];
+   float output_size[2];
    float t                       = p_disp ? p_disp->effect_time : 0.0f;
    float yflip                   = 0.0f;
-   gl3_t *gl                 = (gl3_t*)data;
+   gl3_t *gl                     = (gl3_t*)data;
+   const struct gl3_effect *fx;
 
-   if (!gl || !draw)
+   if (!gl || !draw || !(fx = (const struct gl3_effect*)draw->effect))
       return;
 
    draw->pos                     = VIDEO_POS_PACK(0, 0);
    draw->matrix_data             = NULL;
+   output_size[0]                = (float)VIDEO_SCALE_W(video_dims);
+   output_size[1]                = (float)VIDEO_SCALE_H(video_dims);
 
-   if (gl->chain.active)
+   if (fx->flags & GFX_EFFECT_MESH)
    {
-      struct uniform_info uniform_param;
-
       if (!(draw->coords = gfx_display_effect_coords(p_disp)))
          return;
-
-      switch (draw->pipeline_id)
+      ribbon_ubo[0]                   = t;
+      ribbon_ubo[1]                   = 1.0f;
+      ribbon_ubo[2]                   = draw->color ? draw->color[3] : 1.0f;
+      ribbon_ubo[3]                   = 0.0f;
+      draw->backend_data              = ribbon_ubo;
+      draw->backend_data_size         = sizeof(ribbon_ubo);
+      if (fx->flags & GFX_EFFECT_RIBBON)
       {
-         case VIDEO_SHADER_MENU:
-         case VIDEO_SHADER_MENU_2:
-            glBlendFunc(GL_DST_COLOR, GL_ONE);
-            break;
-         default:
-            gl3_blend_alpha(gl);
-            break;
-      }
-
-      switch (draw->pipeline_id)
-      {
-         case VIDEO_SHADER_MENU:
-         case VIDEO_SHADER_MENU_2:
-         case VIDEO_SHADER_MENU_3:
-         case VIDEO_SHADER_MENU_4:
-         case VIDEO_SHADER_MENU_5:
-         case VIDEO_SHADER_MENU_6:
-            gl->chain.shader->use(gl, gl->chain.shader_data, draw->pipeline_id,
-                  true);
-
-            uniform_param.type              = UNIFORM_1F;
-            uniform_param.enabled           = true;
-            uniform_param.location          = 0;
-            uniform_param.count             = 0;
-
-            uniform_param.lookup.type       = SHADER_PROGRAM_VERTEX;
-            uniform_param.lookup.ident      = "time";
-            uniform_param.lookup.idx        = draw->pipeline_id;
-            uniform_param.lookup.add_prefix = true;
-            uniform_param.lookup.enable     = true;
-
-            uniform_param.result.f.v0       = t;
-
-            gl->chain.shader->set_uniform_parameter(gl->chain.shader_data,
-                  &uniform_param, NULL);
-            break;
-      }
-
-      switch (draw->pipeline_id)
-      {
-         case VIDEO_SHADER_MENU_3:
-         case VIDEO_SHADER_MENU_4:
-         case VIDEO_SHADER_MENU_5:
-         case VIDEO_SHADER_MENU_6:
-            uniform_param.type              = UNIFORM_2F;
-            uniform_param.lookup.ident      = "OutputSize";
-            uniform_param.result.f.v0       = VIDEO_SCALE_W(draw->dims);
-            uniform_param.result.f.v1       = VIDEO_SCALE_H(draw->dims);
-
-            gl->chain.shader->set_uniform_parameter(gl->chain.shader_data,
-                  &uniform_param, NULL);
-            break;
+         draw->backend_data = (void*)gfx_display_ribbon_ubo(p_disp, 1.0f);
+         draw->backend_data_size = 51 * 4 * sizeof(float);
       }
    }
-#ifdef HAVE_SLANG
    else
    {
-      static struct video_coords blank_coords;
-      static uint8_t ubo_scratch_data[768];
-      float output_size[2];
-      output_size[0]                = (float)video_width;
-      output_size[1]                = (float)video_height;
+      draw->backend_data               = ubo_scratch_data;
+      draw->backend_data_size          = sizeof(math_matrix_4x4)
+         + 4 * sizeof(float);
 
-      switch (draw->pipeline_id)
-      {
-         /* Ribbon */
-         default:
-         case VIDEO_SHADER_MENU:
-         case VIDEO_SHADER_MENU_2:
-            if (!(draw->coords = gfx_display_effect_coords(p_disp)))
-               return;
-            draw->backend_data               = ubo_scratch_data;
-            draw->backend_data_size          = 2 * sizeof(float);
+      /* Match UBO layout in shader. */
+      memcpy(ubo_scratch_data,
+            &gl->mvp_no_rot,
+            sizeof(math_matrix_4x4));
+      memcpy(ubo_scratch_data + sizeof(math_matrix_4x4),
+            output_size,
+            sizeof(output_size));
 
-            /* Match UBO layout in shader. */
-            yflip = 1.0f;
-            memcpy(ubo_scratch_data, &t, sizeof(t));
-            memcpy(ubo_scratch_data + sizeof(float), &yflip, sizeof(yflip));
-            break;
+      if (fx->flags & GFX_EFFECT_YFLIP)
+         yflip = 1.0f;
 
-         /* Snow simple */
-         case VIDEO_SHADER_MENU_3:
-         case VIDEO_SHADER_MENU_4:
-         case VIDEO_SHADER_MENU_5:
-         case VIDEO_SHADER_MENU_6:
-            draw->backend_data               = ubo_scratch_data;
-            draw->backend_data_size          = sizeof(math_matrix_4x4)
-               + 4 * sizeof(float);
-
-            /* Match UBO layout in shader. */
-            memcpy(ubo_scratch_data,
-                  &gl->mvp_no_rot,
-                  sizeof(math_matrix_4x4));
-            memcpy(ubo_scratch_data + sizeof(math_matrix_4x4),
-                  output_size,
-                  sizeof(output_size));
-
-            if (   draw->pipeline_id == VIDEO_SHADER_MENU_5
-                || draw->pipeline_id == VIDEO_SHADER_MENU_6)
-               yflip = 1.0f;
-
-            memcpy(ubo_scratch_data + sizeof(math_matrix_4x4)
-                  + 2 * sizeof(float), &t, sizeof(t));
-            memcpy(ubo_scratch_data + sizeof(math_matrix_4x4)
-                  + 3 * sizeof(float), &yflip, sizeof(yflip));
-            draw->coords          = &blank_coords;
-            blank_coords.vertices = 4;
-            break;
-      }
+      memcpy(ubo_scratch_data + sizeof(math_matrix_4x4)
+            + 2 * sizeof(float), &t, sizeof(t));
+      memcpy(ubo_scratch_data + sizeof(math_matrix_4x4)
+            + 3 * sizeof(float), &yflip, sizeof(yflip));
+      draw->coords          = &blank_coords;
+      blank_coords.vertices = 4;
    }
-#endif
-
+   }
 #endif
 }
 
-#if defined(HAVE_SLANG) && defined(HAVE_SHADERPIPELINE)
-static GLuint gl3_effect_program(gl3_t *gl, unsigned pipeline_id,
-      const struct gl3_buffer_locations **loc);
-#endif
 
 /* The names of the half-float textures loaded: linear scRGB, which the
  * HDR composite shows through the linear program rather than as SDR.
@@ -1207,6 +1222,9 @@ static void gl3_fp16_forget_all(void)
    gl3_fp16_cap   = 0;
 }
 
+#ifdef HAVE_SLANG
+/* Only the slang pipelines draw a half-float texture through the
+ * linear program */
 static bool gl3_fp16_is(GLuint id)
 {
    unsigned i;
@@ -1216,10 +1234,9 @@ static bool gl3_fp16_is(GLuint id)
    return false;
 }
 
-#ifdef HAVE_SLANG
 static GLuint gl3_linear_program(gl3_t *gl);
-#else
-static GLuint gl3_linear_program(gl3_t *gl) { (void)gl; return 0; }
+static GLuint gl3_plastic_program(gl3_t *gl);
+static GLuint gl3_font_plastic_program(gl3_t *gl);
 #endif
 
 static void gfx_display_gl3_draw(gfx_display_ctx_draw_t *draw,
@@ -1227,7 +1244,9 @@ static void gfx_display_gl3_draw(gfx_display_ctx_draw_t *draw,
 {
    video_coords_t coords;
    gl3_t *gl                 = (gl3_t*)data;
+#ifdef HAVE_SLANG
    GLuint lin_prog           = 0;
+#endif
 
    if (!gl || !draw)
       return;
@@ -1246,12 +1265,27 @@ static void gfx_display_gl3_draw(gfx_display_ctx_draw_t *draw,
    glViewport(VIDEO_POS_X(draw->pos), VIDEO_POS_Y(draw->pos),
          VIDEO_SCALE_W(draw->dims), VIDEO_SCALE_H(draw->dims));
 
-   if (gl->chain.active)
+#if defined(HAVE_SHADERPIPELINE) && defined(HAVE_GLSL)
+   {
+      const struct gl3_glsl_effect *gfx = gl3_glsl_effect(gl, draw->effect);
+      if (gfx)
+      {
+         gl3_draw_glsl_effect(gl, gfx, draw);
+         return;
+      }
+   }
+#endif
+
+   /* An effect draws through its own program, whatever the chain */
+   if (gl->chain.active && !draw->effect)
    {
       glActiveTexture(GL_TEXTURE0);
       glBindTexture(GL_TEXTURE_2D, draw->texture
             ? (GLuint)draw->texture : gl->white_texture);
 
+      if (draw->pipeline_id == VIDEO_SHADER_XMB_PLASTIC)
+         gl->chain.shader->use(gl, gl->chain.shader_data,
+               VIDEO_SHADER_XMB_PLASTIC, true);
       gl->chain.shader->set_coords(gl->chain.shader_data, &coords);
       gl->chain.shader->set_mvp(gl->chain.shader_data,
             draw->matrix_data ? (math_matrix_4x4*)draw->matrix_data
@@ -1259,6 +1293,9 @@ static void gfx_display_gl3_draw(gfx_display_ctx_draw_t *draw,
 
       /* Menu draws use a triangle-strip layout. */
       glDrawArrays(GL_TRIANGLE_STRIP, 0, coords.vertices);
+      if (draw->pipeline_id == VIDEO_SHADER_XMB_PLASTIC)
+         gl->chain.shader->use(gl, gl->chain.shader_data,
+               VIDEO_SHADER_STOCK_BLEND, true);
    }
 #ifdef HAVE_SLANG
    else
@@ -1266,46 +1303,52 @@ static void gfx_display_gl3_draw(gfx_display_ctx_draw_t *draw,
       const struct
          gl3_buffer_locations
          *loc                   = NULL;
+      const struct gl3_buffer_locations *stock_loc = &gl->pipelines.alpha_blend_loc;
+#ifdef HAVE_SHADERPIPELINE
+      const struct gl3_effect *fx = (const struct gl3_effect*)draw->effect;
+#endif
 
       glActiveTexture(GL_TEXTURE1);
       glBindTexture(GL_TEXTURE_2D, draw->texture
             ? (GLuint)draw->texture : gl->white_texture);
 
-      switch (draw->pipeline_id)
-      {
-         case VIDEO_SHADER_MENU:
-         case VIDEO_SHADER_MENU_2:
-            glBlendFunc(GL_DST_COLOR, GL_ONE);
-            break;
-         default:
-            gl3_blend_alpha(gl);
-            break;
-      }
+#ifdef HAVE_SHADERPIPELINE
+      if (fx && (fx->flags & GFX_EFFECT_BLEND_ADD))
+         glBlendFunc(GL_ONE, GL_ONE);
+      else if (fx && (fx->flags & GFX_EFFECT_BLEND_SCREEN))
+         glBlendFunc(GL_DST_COLOR, GL_ONE);
+      else
+#endif
+         gl3_blend_alpha(gl);
 
-      switch (draw->pipeline_id)
+      switch (draw->effect ? 1 : 0)
       {
 #ifdef HAVE_SHADERPIPELINE
-         case VIDEO_SHADER_MENU:
-
-         case VIDEO_SHADER_MENU_2:
-
-         case VIDEO_SHADER_MENU_3:
-
-         case VIDEO_SHADER_MENU_4:
-
-         case VIDEO_SHADER_MENU_5:
-
-         case VIDEO_SHADER_MENU_6:
+         case 1:
+            loc = &fx->loc;
+            glUseProgram(fx->prog);
+            if (     (fx->flags & GFX_EFFECT_RIBBON)
+                  && loc->buffer_index_ubo_vertex != GL_INVALID_INDEX)
             {
-               GLuint prog = gl3_effect_program(gl, draw->pipeline_id, &loc);
-               if (!prog)
-                  return;
-               glUseProgram(prog);
+               if (!gl->pipelines.ribbon_ubo)
+                  glGenBuffers(1, &gl->pipelines.ribbon_ubo);
+               glBindBuffer(GL_UNIFORM_BUFFER, gl->pipelines.ribbon_ubo);
+               glBufferData(GL_UNIFORM_BUFFER, draw->backend_data_size,
+                     draw->backend_data, GL_STREAM_DRAW);
+               glUniformBlockBinding(fx->prog, loc->buffer_index_ubo_vertex, 0);
+               glBindBufferBase(GL_UNIFORM_BUFFER, 0, gl->pipelines.ribbon_ubo);
             }
             break;
 #endif /* HAVE_SHADERPIPELINE */
 
          default:
+            if (draw->pipeline_id == VIDEO_SHADER_XMB_PLASTIC
+                  && gl3_plastic_program(gl))
+            {
+               glUseProgram(gl->pipelines.xmb_plastic);
+               stock_loc = &gl->pipelines.xmb_plastic_loc;
+               break;
+            }
             /* A half-float texture is linear scRGB: under the scRGB
              * composite, through the program that inverts its encode */
             if (     gl->scrgb.active
@@ -1351,8 +1394,8 @@ static void gfx_display_gl3_draw(gfx_display_ctx_draw_t *draw,
                glUniform4fv(gl->pipelines.alpha_blend_linear_loc.flat_ubo_fragment,
                      5, ubo);
          }
-         else if (gl->pipelines.alpha_blend_loc.flat_ubo_vertex >= 0)
-            glUniform4fv(gl->pipelines.alpha_blend_loc.flat_ubo_vertex,
+         else if (stock_loc->flat_ubo_vertex >= 0)
+            glUniform4fv(stock_loc->flat_ubo_vertex,
                          4, mat->data);
       }
 
@@ -1360,10 +1403,9 @@ static void gfx_display_gl3_draw(gfx_display_ctx_draw_t *draw,
       /* The two ribbon shaders declare only the position attribute:
        * it is bound from the ribbon mesh's own buffer, the others are
        * left disabled. */
-      if (     draw->pipeline_id == VIDEO_SHADER_MENU
-            || draw->pipeline_id == VIDEO_SHADER_MENU_2)
+      if (fx && (fx->flags & GFX_EFFECT_MESH))
       {
-         /* From the ribbon mesh's own buffer, its position only */
+         /* From the mesh's own buffer, its position only */
          const gfx_display_mesh_t *mesh = disp_get_ptr()->effect_mesh;
          int slot;
          if (mesh && (slot = gl3_mesh_slot(gl, mesh)) >= 0)
@@ -1373,7 +1415,8 @@ static void gfx_display_gl3_draw(gfx_display_ctx_draw_t *draw,
             glEnableVertexAttribArray(0);
             glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
                   sizeof(gfx_display_mesh_vertex_t), (void *)(uintptr_t)0);
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, mesh->vertex_count);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0,
+                  disp_get_ptr()->effect_vertices);
             glDisableVertexAttribArray(0);
          }
       }
@@ -1405,6 +1448,12 @@ static void gfx_display_gl3_draw(gfx_display_ctx_draw_t *draw,
          glDisableVertexAttribArray(1);
          glDisableVertexAttribArray(2);
       }
+#ifdef HAVE_SHADERPIPELINE
+      /* The chain's draws use the program they find bound */
+      if (fx && gl->chain.active)
+         gl->chain.shader->use(gl, gl->chain.shader_data,
+               VIDEO_SHADER_STOCK_BLEND, true);
+#endif
    }
 #endif /* HAVE_SLANG */
 
@@ -1713,14 +1762,29 @@ static void gl3_raster_font_draw_vertices(gl3_t *gl,
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_ONE);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_RED);
 
+      if (font->block && font->block->xmb_plastic)
+         gl->chain.shader->use(gl, gl->chain.shader_data,
+               VIDEO_SHADER_XMB_FONT_PLASTIC, true);
       gl->chain.shader->set_coords(gl->chain.shader_data, coords);
       gl->chain.shader->set_mvp(gl->chain.shader_data, &gl->mvp_no_rot);
 
       glDrawArrays(GL_TRIANGLES, 0, coords->vertices);
+      if (font->block && font->block->xmb_plastic)
+         gl->chain.shader->use(gl, gl->chain.shader_data,
+               VIDEO_SHADER_STOCK_BLEND, true);
    }
 #ifdef HAVE_SLANG
    else
    {
+      struct gl3_buffer_locations *loc = &gl->pipelines.font_loc;
+      if (font->block && font->block->xmb_plastic
+            && gl3_font_plastic_program(gl))
+      {
+         glUseProgram(gl->pipelines.xmb_font);
+         loc = &gl->pipelines.xmb_font_loc;
+      }
+      else
+         glUseProgram(gl->pipelines.font);
       glActiveTexture(GL_TEXTURE1);
       glBindTexture(GL_TEXTURE_2D, font->tex);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED);
@@ -1728,8 +1792,8 @@ static void gl3_raster_font_draw_vertices(gl3_t *gl,
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_BLUE);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ALPHA);
 
-      if (gl->pipelines.font_loc.flat_ubo_vertex >= 0)
-         glUniform4fv(gl->pipelines.font_loc.flat_ubo_vertex,
+      if (loc->flat_ubo_vertex >= 0)
+         glUniform4fv(loc->flat_ubo_vertex,
                       4, gl->mvp_no_rot.data);
 
       glEnableVertexAttribArray(0);
@@ -1778,8 +1842,8 @@ static void gl3_raster_font_draw_vertices(gl3_t *gl,
 static void gl3_raster_font_render_message(
       gl3_t *gl,
       gl3_raster_t *font, const char *msg, size_t msg_len,
-      GLfloat scale, const GLfloat color[4], GLfloat pos_x,
-      GLfloat pos_y, unsigned text_align)
+      GLfloat scale, GLfloat x_scale, const GLfloat color[4],
+      GLfloat pos_x, GLfloat pos_y, unsigned text_align)
 {
    struct video_coords coords;
    GLfloat color_block[4 * 6];
@@ -1794,9 +1858,10 @@ static void gl3_raster_font_render_message(
    GLfloat *font_color                    = font->font_color;
    float inv_tex_size_x                   = 1.0f / font->atlas->width;
    float inv_tex_size_y                   = 1.0f / font->atlas->height;
-   float inv_win_width                    = 1.0f / VIDEO_SCALE_W(gl->vp.dims);
+   float win_width                        = VIDEO_SCALE_W(gl->vp.dims) / x_scale;
+   float inv_win_width                    = 1.0f / win_width;
    float inv_win_height                   = 1.0f / VIDEO_SCALE_H(gl->vp.dims);
-   int pre_x                              = roundf(pos_x * VIDEO_SCALE_W(gl->vp.dims));
+   int pre_x                              = roundf(pos_x * win_width);
    const struct font_glyph* (*get_glyph)(void*, uint32_t)
                                           = font->font_driver->get_glyph;
    void *font_data                        = font->font_data;
@@ -1952,13 +2017,13 @@ static void gl3_raster_font_render_msg(
          color_dark[3] = color[3] * drop_alpha;
 
          gl3_raster_font_render_message(gl, font, msg, msg_len, scale,
-               color_dark,
-               x + scale * drop_x / VIDEO_SCALE_W(gl->vp.dims),
+               rp.x_scale, color_dark,
+               x + scale * drop_x * rp.x_scale / VIDEO_SCALE_W(gl->vp.dims),
                y + scale * drop_y / VIDEO_SCALE_H(gl->vp.dims), text_align);
       }
 
       gl3_raster_font_render_message(gl, font, msg, msg_len, scale,
-            color,
+            rp.x_scale, color,
             x, y, text_align);
    }
 
@@ -2208,22 +2273,7 @@ static void gl3_fence_iterate(gl3_t *gl, unsigned hard_sync_frames)
    }
 }
 
-#ifdef HAVE_OVERLAY
-static void gl3_free_overlay(gl3_t *gl)
-{
-   if (gl->overlay_tex && !(gl->flags & GL3_FLAG_OVERLAY_BORROWED))
-      glDeleteTextures(gl->overlays, gl->overlay_tex);
-   gl->flags &= ~GL3_FLAG_OVERLAY_BORROWED;
-
-   /* The three coordinate arrays are views into the overlay_tex block. */
-   free(gl->overlay_tex);
-   gl->overlay_tex          = NULL;
-   gl->overlay_vertex_coord = NULL;
-   gl->overlay_tex_coord    = NULL;
-   gl->overlay_color_coord  = NULL;
-   gl->overlays             = 0;
-}
-
+/* The streamed vertex buffers and the meshes kept on the GPU */
 static void gl3_free_scratch_vbos(gl3_t *gl)
 {
    int i;
@@ -2240,6 +2290,22 @@ static void gl3_free_scratch_vbos(gl3_t *gl)
       gl->meshes[i].ibo = 0;
       gl->meshes[i].id  = 0;
    }
+}
+
+#ifdef HAVE_OVERLAY
+static void gl3_free_overlay(gl3_t *gl)
+{
+   if (gl->overlay_tex && !(gl->flags & GL3_FLAG_OVERLAY_BORROWED))
+      glDeleteTextures(gl->overlays, gl->overlay_tex);
+   gl->flags &= ~GL3_FLAG_OVERLAY_BORROWED;
+
+   /* The three coordinate arrays are views into the overlay_tex block. */
+   free(gl->overlay_tex);
+   gl->overlay_tex          = NULL;
+   gl->overlay_vertex_coord = NULL;
+   gl->overlay_tex_coord    = NULL;
+   gl->overlay_color_coord  = NULL;
+   gl->overlays             = 0;
 }
 
 static void gl3_overlay_vertex_geom(void *data,
@@ -2422,7 +2488,7 @@ static void gl3_destroy_resources(gl3_t *gl)
    gl->filter_chain_default = NULL;
 
 #ifdef HAVE_SLANG
-   gl3_views_free_chains(gl, 0);
+   gl3_views_free_chains(gl, 0, true);
    gl3_views_free_copies(gl, 0);
    if (gl->views.read_fbo)
       glDeleteFramebuffers(1, &gl->views.read_fbo);
@@ -2486,6 +2552,15 @@ static void gl3_destroy_resources(gl3_t *gl)
       glDeleteProgram(gl->pipelines.alpha_blend);
       gl->pipelines.alpha_blend = 0;
    }
+   if (gl->pipelines.xmb_plastic)
+      glDeleteProgram(gl->pipelines.xmb_plastic);
+   gl->pipelines.xmb_plastic = 0;
+   gl->pipelines.xmb_plastic_tried = false;
+   if (gl->pipelines.xmb_font)
+      glDeleteProgram(gl->pipelines.xmb_font);
+   gl->pipelines.xmb_font = 0;
+   gl->pipelines.xmb_font_tried = false;
+
    if (gl->pipelines.alpha_blend_linear)
    {
       glDeleteProgram(gl->pipelines.alpha_blend_linear);
@@ -2549,42 +2624,28 @@ static void gl3_destroy_resources(gl3_t *gl)
       gl->scrgb.ui_tex = 0;
    }
 #ifdef HAVE_SHADERPIPELINE
-   if (gl->pipelines.ribbon)
+   glDeleteBuffers(1, &gl->pipelines.ribbon_ubo);
+   gl->pipelines.ribbon_ubo = 0;
    {
-      glDeleteProgram(gl->pipelines.ribbon);
-      gl->pipelines.ribbon = 0;
-   }
-   if (gl->pipelines.ribbon_simple)
-   {
-      glDeleteProgram(gl->pipelines.ribbon_simple);
-      gl->pipelines.ribbon_simple = 0;
-   }
-   if (gl->pipelines.snow_simple)
-   {
-      glDeleteProgram(gl->pipelines.snow_simple);
-      gl->pipelines.snow_simple = 0;
-   }
-   if (gl->pipelines.snow)
-   {
-      glDeleteProgram(gl->pipelines.snow);
-      gl->pipelines.snow = 0;
-   }
-   if (gl->pipelines.bokeh)
-   {
-      glDeleteProgram(gl->pipelines.bokeh);
-      gl->pipelines.bokeh = 0;
-   }
-   if (gl->pipelines.snowflake)
-   {
-      glDeleteProgram(gl->pipelines.snowflake);
-      gl->pipelines.snowflake = 0;
+      unsigned e;
+      for (e = 0; e < gl->pipelines.effect_count; e++)
+         glDeleteProgram(gl->pipelines.effects[e].prog);
+      gl->pipelines.effect_count = 0;
    }
 #endif /* HAVE_SHADERPIPELINE */
 #endif /* HAVE_SLANG */
 
 #ifdef HAVE_OVERLAY
    gl3_free_overlay(gl);
+#endif
    gl3_free_scratch_vbos(gl);
+#if defined(HAVE_SHADERPIPELINE) && defined(HAVE_GLSL)
+   {
+      unsigned e;
+      for (e = 0; e < gl->glsl_effect_count; e++)
+         glDeleteProgram(gl->glsl_effects[e].glsl.prog);
+      gl->glsl_effect_count = 0;
+   }
 #endif
    gl3_deinit_fences(gl);
    gl3_deinit_pbo_readback(gl);
@@ -2894,6 +2955,32 @@ static void gl3_set_viewport(gl3_t *gl,
 }
 
 #ifdef HAVE_SLANG
+static GLuint gl3_plastic_program(gl3_t *gl)
+{
+   if (!gl->pipelines.xmb_plastic_tried)
+   {
+      gl->pipelines.xmb_plastic_tried = true;
+      gl->pipelines.xmb_plastic = gl3_cross_compile_program(
+            spirv_alpha_blend_vert, spirv_alpha_blend_vert_size,
+            spirv_xmb_plastic_frag, spirv_xmb_plastic_frag_size,
+            &gl->pipelines.xmb_plastic_loc, true);
+   }
+   return gl->pipelines.xmb_plastic;
+}
+
+static GLuint gl3_font_plastic_program(gl3_t *gl)
+{
+   if (!gl->pipelines.xmb_font_tried)
+   {
+      gl->pipelines.xmb_font_tried = true;
+      gl->pipelines.xmb_font = gl3_cross_compile_program(
+            spirv_alpha_blend_vert, spirv_alpha_blend_vert_size,
+            spirv_xmb_font_frag, spirv_xmb_font_frag_size,
+            &gl->pipelines.xmb_font_loc, true);
+   }
+   return gl->pipelines.xmb_font;
+}
+
 /* The program for a half-float texture under the scRGB composite, made
  * the first time one is drawn; 0 where it cannot be. */
 static GLuint gl3_linear_program(gl3_t *gl)
@@ -2911,59 +2998,58 @@ static GLuint gl3_linear_program(gl3_t *gl)
 }
 
 #ifdef HAVE_SHADERPIPELINE
-/* A menu effect's program, compiled the first time the effect is drawn
- * rather than all six at start: at most one is ever on screen. 0 when
- * it cannot be had, and the effect is not drawn. */
-static GLuint gl3_effect_program(gl3_t *gl, unsigned pipeline_id,
-      const struct gl3_buffer_locations **loc)
+/* A menu effect's program, made when the menu installs it */
+static void *gl3_effect_install_spirv(gl3_t *gl,
+      const gfx_display_effect_desc_t *desc)
 {
-   const uint32_t *vs, *fs;
-   size_t vs_size, fs_size;
-   struct gl3_buffer_locations *l;
-   GLuint *prog;
-
-   switch (pipeline_id)
-   {
-      case VIDEO_SHADER_MENU:
-         prog = &gl->pipelines.ribbon;      l    = &gl->pipelines.ribbon_loc;
-         vs   = spirv_pipeline_ribbon_vert;       vs_size = spirv_pipeline_ribbon_vert_size;
-         fs   = spirv_pipeline_ribbon_frag;       fs_size = spirv_pipeline_ribbon_frag_size;
-         break;
-      case VIDEO_SHADER_MENU_2:
-         prog = &gl->pipelines.ribbon_simple; l    = &gl->pipelines.ribbon_simple_loc;
-         vs   = spirv_pipeline_ribbon_simple_vert;  vs_size = spirv_pipeline_ribbon_simple_vert_size;
-         fs   = spirv_pipeline_ribbon_simple_frag;  fs_size = spirv_pipeline_ribbon_simple_frag_size;
-         break;
-      case VIDEO_SHADER_MENU_3:
-         prog = &gl->pipelines.snow_simple; l    = &gl->pipelines.snow_simple_loc;
-         vs   = spirv_alpha_blend_vert;           vs_size = spirv_alpha_blend_vert_size;
-         fs   = spirv_pipeline_snow_simple_frag;  fs_size = spirv_pipeline_snow_simple_frag_size;
-         break;
-      case VIDEO_SHADER_MENU_4:
-         prog = &gl->pipelines.snow;        l    = &gl->pipelines.snow_loc;
-         vs   = spirv_alpha_blend_vert;           vs_size = spirv_alpha_blend_vert_size;
-         fs   = spirv_pipeline_snow_frag;         fs_size = spirv_pipeline_snow_frag_size;
-         break;
-      case VIDEO_SHADER_MENU_5:
-         prog = &gl->pipelines.bokeh;       l    = &gl->pipelines.bokeh_loc;
-         vs   = spirv_alpha_blend_vert;           vs_size = spirv_alpha_blend_vert_size;
-         fs   = spirv_pipeline_bokeh_frag;        fs_size = spirv_pipeline_bokeh_frag_size;
-         break;
-      case VIDEO_SHADER_MENU_6:
-         prog = &gl->pipelines.snowflake;   l    = &gl->pipelines.snowflake_loc;
-         vs   = spirv_alpha_blend_vert;           vs_size = spirv_alpha_blend_vert_size;
-         fs   = spirv_pipeline_snowflake_frag;    fs_size = spirv_pipeline_snowflake_frag_size;
-         break;
-      default:
-         return 0;
-   }
-   if (!*prog)
-      *prog = gl3_cross_compile_program(vs, vs_size, fs, fs_size, l, true);
-   *loc = l;
-   return *prog;
+   struct gl3_effect *fx;
+   if ( !desc->spirv_vertex || !desc->spirv_fragment
+         || gl->pipelines.effect_count >= ARRAY_SIZE(gl->pipelines.effects))
+      return NULL;
+   fx = &gl->pipelines.effects[gl->pipelines.effect_count];
+   /* The ribbon's 51 vec4s go in a real uniform block */
+   if (!(fx->prog = gl3_cross_compile_program(
+               desc->spirv_vertex, desc->spirv_vertex_size,
+               desc->spirv_fragment, desc->spirv_fragment_size,
+               &fx->loc, !(desc->flags & GFX_EFFECT_RIBBON))))
+      return NULL;
+   fx->flags = desc->flags;
+   gl->pipelines.effect_count++;
+   return fx;
 }
 #endif /* HAVE_SHADERPIPELINE */
 #endif /* HAVE_SLANG */
+
+#if defined(HAVE_SHADERPIPELINE) && (defined(HAVE_SLANG) || defined(HAVE_GLSL))
+/* A menu effect's program, made when the menu installs it: from its
+ * SPIR-V where slang can cross-compile it, else from its GLSL in the
+ * context's dialect, as a build without slang has always drawn them */
+static void *gfx_display_gl3_effect_install(void *data,
+      const gfx_display_effect_desc_t *desc)
+{
+   gl3_t *gl = (gl3_t*)data;
+   void *fx  = NULL;
+   if (!gl || !desc)
+      return NULL;
+#ifdef HAVE_SLANG
+   if ((fx = gl3_effect_install_spirv(gl, desc)))
+      return fx;
+#endif
+#ifdef HAVE_GLSL
+   if (gl->glsl_effect_count < ARRAY_SIZE(gl->glsl_effects))
+   {
+      struct gl3_glsl_effect *gfx = &gl->glsl_effects[gl->glsl_effect_count];
+      if (gl_glsl_effect_compile(&gfx->glsl, desc))
+      {
+         gfx->flags = desc->flags;
+         gl->glsl_effect_count++;
+         fx         = gfx;
+      }
+   }
+#endif
+   return fx;
+}
+#endif
 
 #ifdef HAVE_SLANG
 static bool gl3_init_pipelines(gl3_t *gl)
@@ -3026,9 +3112,9 @@ static enum rarch_shader_type gl3_get_fallback_shader_type(enum rarch_shader_typ
     * wayland_ctx.c, etc.  Cg requires the legacy fixed-function / ARB
     * asm pipeline that Core Profile contexts don't expose, so no
     * RARCH_SHADER_CG path is wired up here.  GLSL and slang are both
-    * Core Profile-compatible and remain valid; in practice context
-    * drivers advertise SLANG for glcore but the GLSL fallback is kept
-    * for builds without slang/spirv-cross. */
+    * Core Profile-compatible and remain valid: context drivers
+    * advertise SLANG for glcore, or GLSL where the build has no slang
+    * to draw through. */
    if (type != RARCH_SHADER_GLSL && type != RARCH_SHADER_SLANG)
    {
       type = GL3_DEFAULT_SHADER_TYPE;
@@ -3088,8 +3174,9 @@ static bool gl3_init_default_filter_chain(gl3_t *gl)
    return true;
 }
 
-/* Frees the view chains from index first on. */
-static void gl3_views_free_chains(gl3_t *gl, unsigned first)
+/* Frees the view chains from index first on, and with frame the
+ * headset's whole-frame chains. */
+static void gl3_views_free_chains(gl3_t *gl, unsigned first, bool frame)
 {
    unsigned i;
    video_views_chains_t *set = &gl->views.chains;
@@ -3114,7 +3201,7 @@ static void gl3_views_free_chains(gl3_t *gl, unsigned first)
 #endif
    }
 #ifdef HAVE_GL3_XR
-   if (!first)
+   if (frame)
    {
       if (gl->xr.frame_chain)
          gl3_filter_chain_free(gl->xr.frame_chain);
@@ -3165,7 +3252,7 @@ static void gl3_views_build_chains(gl3_t *gl)
       set->preset[i] = gl3_filter_chain_create_from_preset(
             gl->views.preset, gl->video_info.smooth
             ? GLSLANG_FILTER_CHAIN_LINEAR
-            : GLSLANG_FILTER_CHAIN_NEAREST, true);
+            : GLSLANG_FILTER_CHAIN_NEAREST, true, false);
       if (!set->preset[i])
          RARCH_ERR("[GLCore] Failed to create view %u's preset: \"%s\".\n",
                i, gl->views.preset);
@@ -3184,7 +3271,7 @@ static void gl3_views_build_chains(gl3_t *gl)
       *chain = gl3_filter_chain_create_from_preset(gl->views.preset,
             gl->video_info.smooth
             ? GLSLANG_FILTER_CHAIN_LINEAR
-            : GLSLANG_FILTER_CHAIN_NEAREST, false);
+            : GLSLANG_FILTER_CHAIN_NEAREST, false, true);
       if (!*chain)
          RARCH_ERR("[OpenXR] Failed to create the headset's preset: \"%s\".\n",
                gl->views.preset);
@@ -3197,7 +3284,7 @@ static void gl3_views_build_chains(gl3_t *gl)
 static void gl3_views_set_preset(gl3_t *gl, const char *path)
 {
    strlcpy(gl->views.preset, path ? path : "", sizeof(gl->views.preset));
-   gl3_views_free_chains(gl, 0);
+   gl3_views_free_chains(gl, 0, true);
    gl3_views_build_chains(gl);
 }
 
@@ -3211,7 +3298,7 @@ static bool gl3_init_filter_chain_preset(gl3_t *gl, const char *shader_path)
          gl->video_info.smooth
          ? GLSLANG_FILTER_CHAIN_LINEAR
          : GLSLANG_FILTER_CHAIN_NEAREST,
-         (gl->flags & GL3_FLAG_HW_RENDER_ENABLE) != 0);
+         (gl->flags & GL3_FLAG_HW_RENDER_ENABLE) != 0, false);
 
    if (!gl->filter_chain)
    {
@@ -3258,7 +3345,6 @@ static const shader_backend_t *gl3_shader_driver_set_backend(
 static bool gl3_shader_driver_init(gl3_video_shader_ctx_init_t *init)
 {
    void            *tmp = NULL;
-   settings_t *settings = config_get_ptr();
 
    if (!init->shader || !init->shader->init)
    {
@@ -3272,13 +3358,6 @@ static bool gl3_shader_driver_init(gl3_video_shader_ctx_init_t *init)
 
    if (!tmp)
       return false;
-
-   if (string_is_equal(settings->arrays.menu_driver, "xmb")
-         && init->shader->init_menu_shaders)
-   {
-      RARCH_LOG("[GLCore] Setting up menu pipeline shaders for XMB...\n");
-      init->shader->init_menu_shaders(tmp);
-   }
 
    init->shader_data = tmp;
 
@@ -3297,6 +3376,10 @@ static void gl3_renderchain_recompute_pass_sizes(
    unsigned last_max_dims  = VIDEO_SCALE_PACK(
          RARCH_SCALE_BASE * gl->video_info.input_scale,
          RARCH_SCALE_BASE * gl->video_info.input_scale);
+   /* width x height stays the core's frame while last_dims moves on
+    * with each pass; an "original" pass is sized from it, and from
+    * the largest frame the core can send */
+   unsigned orig_max       = RARCH_SCALE_BASE * gl->video_info.input_scale;
 
    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_size);
 
@@ -3333,6 +3416,11 @@ static void gl3_renderchain_recompute_pass_sizes(
             else
                img_w  = max_img_w = fbo_scale->scale_x * vp_width;
             break;
+
+         case RARCH_SCALE_ORIGINAL:
+            img_w     = width      * fbo_scale->scale_x;
+            max_img_w = orig_max   * fbo_scale->scale_x;
+            break;
       }
 
       switch (fbo_scale->type_y)
@@ -3351,6 +3439,11 @@ static void gl3_renderchain_recompute_pass_sizes(
                img_h  = max_img_h = fbo_scale->scale_y * vp_width;
             else
                img_h  = max_img_h = fbo_scale->scale_y * vp_height;
+            break;
+
+         case RARCH_SCALE_ORIGINAL:
+            img_h     = height     * fbo_scale->scale_y;
+            max_img_h = orig_max   * fbo_scale->scale_y;
             break;
       }
 
@@ -3667,8 +3760,9 @@ static bool gl3_init_filter_chain_with_path(gl3_t *gl, const char *shader_path)
    }
 
 #ifdef HAVE_GLSL
-   if (type == RARCH_SHADER_GLSL)
-      gl_glsl_set_context_type(
+   /* Whatever the backend: a menu effect that cannot be cross-compiled
+    * is made from GLSL in this dialect */
+   gl_glsl_set_context_type(
 #ifdef HAVE_OPENGLES
             false,
 #else
@@ -4420,6 +4514,9 @@ static void gl3_free(void *data)
 
    if (gl->flags & GL3_FLAG_USE_SHARED_CONTEXT)
       gl->ctx_driver->bind_hw_render(gl->ctx_data, false);
+#ifdef HAVE_GL_MENU_BLOOM
+   gl_menu_bloom_free(&gl->menu_bloom);
+#endif
 #ifdef HAVE_GL3_XR
    gl3_xr_free(gl);
 #endif
@@ -5112,8 +5209,11 @@ static void gl3_update_cpu_texture(gl3_t *gl,
       struct gl3_streamed_texture *streamed,
       const void *frame, unsigned dims, unsigned pitch, bool write)
 {
-   unsigned width  = VIDEO_SCALE_W(dims);
-   unsigned height = VIDEO_SCALE_H(dims);
+   /* The frame's own size, which is all there is to write */
+   unsigned frame_w = VIDEO_SCALE_W(dims);
+   unsigned frame_h = VIDEO_SCALE_H(dims);
+   unsigned width   = frame_w;
+   unsigned height  = frame_h;
    if (gl->chain.active)
    {
       /* The input texture is expected to be square with a power of 2 size when not using Slang */
@@ -5155,8 +5255,10 @@ static void gl3_update_cpu_texture(gl3_t *gl,
    else
       glBindTexture(GL_TEXTURE_2D, streamed->tex);
 
+   /* The frame alone: the texture is a power-of-two square around it,
+    * and the core's buffer holds no more than the frame */
    if (write)
-      gl3_write_cpu_texture(gl, frame, width, height, pitch);
+      gl3_write_cpu_texture(gl, frame, frame_w, frame_h, pitch);
 }
 
 #ifdef HAVE_SLANG
@@ -6520,6 +6622,7 @@ static void gl3_xr_plan(gl3_t *gl, const video_frame_info_t *video_info,
       bool views, bool eyes, unsigned frame_dims, unsigned src_dims,
       unsigned ui_dims)
 {
+   unsigned s;
    video_xr_params_t p;
    gl_openxr_t *xr = gl->xr.host;
 
@@ -6530,6 +6633,13 @@ static void gl3_xr_plan(gl3_t *gl, const video_frame_info_t *video_info,
          / (float)VIDEO_SCALE_H(frame_dims);
    p.frame_dims    = src_dims;
    video_xr_pose_identity(&p.anchor);
+   /* A frame shown whole despite a map is not screen 1. */
+   p.screens       = (views || !video_info->views.num_views)
+      ? video_info->headset_screens : NULL;
+   p.edit_seq      = video_info->headset_edit_seq;
+   p.menu          = video_info->headset_menu_placed
+      ? &video_info->headset_menu : NULL;
+   p.menu_follow   = video_info->headset_menu_follow;
    p.distance      = video_info->headset_distance;
    p.width         = video_info->headset_width;
    p.px_per_rad    = gl_openxr_pixels_per_radian(xr);
@@ -6542,6 +6652,11 @@ static void gl3_xr_plan(gl3_t *gl, const video_frame_info_t *video_info,
    if (views && eyes)
       p.skip_screens = gl3_xr_eye_screens(video_info);
    video_xr_place(&p, &gl->xr.set);
+   for (s = 0; s < VIDEO_XR_MAX_SLOTS; s++)
+      gl->xr.set.slots[s].dims = video_xr_keep_dims(
+            gl->xr.set.slots[s].dims,
+            gl->xr.shown[s].published ? gl->xr.shown[s].info.dims : 0,
+            video_info->headset_editing);
 }
 
 /* Whether slot s's plan this frame is what it last published. */
@@ -6592,10 +6707,13 @@ static void gl3_xr_forget(gl3_t *gl, unsigned s, bool yield)
 }
 
 /* Each layer of a screen slot drawn whole into tex by its view's
- * headset chain or the whole frame's: its passes at the image's size. */
+ * headset chain or the whole frame's: its passes at the image's size. A
+ * repeat - a screen moved, resized or not yet shown while no new frame
+ * came - replays the last frame's final pass, so feedback and history
+ * stay where that frame left them. */
 static void gl3_xr_draw_screen(gl3_t *gl, unsigned s, const uint32_t *tex,
       gl3_filter_chain_t **chains, gl3_filter_chain_t *frame_chain,
-      const struct gl3_filter_chain_texture *frame_tex)
+      const struct gl3_filter_chain_texture *frame_tex, bool new_frame)
 {
    unsigned l;
    struct gl3_viewport vp;
@@ -6608,6 +6726,8 @@ static void gl3_xr_draw_screen(gl3_t *gl, unsigned s, const uint32_t *tex,
       struct gl3_filter_chain_texture in;
       int v                    = plan->view[l];
       gl3_filter_chain_t *chain = (v >= 0) ? chains[v] : frame_chain;
+      bool replay              = chain && !new_frame
+         && gl3_filter_chain_replay_ready(chain);
 
       if (v >= 0)
       {
@@ -6619,7 +6739,7 @@ static void gl3_xr_draw_screen(gl3_t *gl, unsigned s, const uint32_t *tex,
       }
       else
          in = *frame_tex;
-      if (chain)
+      if (chain && !replay)
       {
          gl3_filter_chain_set_input_texture(chain, &in);
          gl3_filter_chain_build_offscreen_passes(chain, &vp);
@@ -6631,10 +6751,13 @@ static void gl3_xr_draw_screen(gl3_t *gl, unsigned s, const uint32_t *tex,
       glViewport(0, 0, VIDEO_SCALE_W(plan->dims), VIDEO_SCALE_H(plan->dims));
       glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
       glClear(GL_COLOR_BUFFER_BIT);
-      if (chain)
+      if (replay)
+         gl3_filter_chain_build_viewport_pass_replay(chain, &vp, gl->xr.mvp);
+      else if (chain)
       {
          gl3_filter_chain_build_viewport_pass(chain, &vp, gl->xr.mvp);
-         gl3_filter_chain_end_frame(chain);
+         if (new_frame)
+            gl3_filter_chain_end_frame(chain);
       }
    }
 }
@@ -6794,7 +6917,8 @@ static void gl3_xr_draw(gl3_t *gl, const video_frame_info_t *video_info,
       if (s == VIDEO_XR_MENU_SLOT)
          gl3_xr_copy_ui(gl, s, tex[0], ui_dims);
       else
-         gl3_xr_draw_screen(gl, s, tex, chains, frame_chain, frame_tex);
+         gl3_xr_draw_screen(gl, s, tex, chains, frame_chain, frame_tex,
+               new_frame);
       gl_openxr_slot_publish(xr, s, &gl->xr.set, NULL);
       gl3_xr_keep(gl, s);
    }
@@ -6947,6 +7071,7 @@ static bool gl3_frame(void *data, const void *frame,
    bool views_direct                       = false;
    bool views_in_place                     = false;
    bool views_ui                           = false;
+   bool views_ui_menu                      = false;
    unsigned ui_layer_dims                  = 0;
    /* A software frame a preset may draw as views, written once they are
     * known: straight into each view's texture if they need copies */
@@ -7049,6 +7174,10 @@ static bool gl3_frame(void *data, const void *frame,
    if (gl->flags & GL3_FLAG_USE_SHARED_CONTEXT)
       gl->ctx_driver->bind_hw_render(gl->ctx_data, false);
    glBindVertexArray(gl->vao);
+#ifdef HAVE_GL_MENU_BLOOM
+   /* Before the frame draws into any framebuffer of its own */
+   gfx_display_bloom_prepass(gl);
+#endif
 
    if (gl->chain.active)
       gl->chain.shader->use(gl, gl->chain.shader_data, 1, true);
@@ -7373,6 +7502,9 @@ static bool gl3_frame(void *data, const void *frame,
       params.fbo_info      = NULL;
       params.fbo_info_cnt  = 0;
 
+      /* The preset's first pass draws the frame, whatever the menu or
+       * the last frame's passes left bound, as gl2 does */
+      gl->chain.shader->use(gl, gl->chain.shader_data, 1, true);
       glBindTexture(GL_TEXTURE_2D, texture.image);
       glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
       glClear(GL_COLOR_BUFFER_BIT);
@@ -7626,14 +7758,15 @@ static bool gl3_frame(void *data, const void *frame,
    /* A failed size stays latched until the layer changes size. */
    if (frame && !ui_layer_dims)
       gl3_vv_target_drop(gl, &gl->views.ui_target, &gl->views.ui);
-#ifdef HAVE_GFX_WIDGETS
-   views_ui = VIDEO_VIEWS_UI_WANTED(ui_layer_dims,
-         (gl->flags & GL3_FLAG_MENU_TEXTURE_ENABLE), msg, statistics_show,
-         widgets_active && gfx_widgets_visible(video_info))
-#else
-   views_ui = VIDEO_VIEWS_UI_WANTED(ui_layer_dims,
-         (gl->flags & GL3_FLAG_MENU_TEXTURE_ENABLE), msg, statistics_show, false)
+   views_ui_menu = (gl->flags & GL3_FLAG_MENU_TEXTURE_ENABLE) ? true : false;
+#ifdef HAVE_GL3_XR
+   /* Edit mode moves the menu's quad: it stays up, empty. */
+   if (xr_draw && video_info->headset_editing)
+      views_ui_menu = true;
 #endif
+   views_ui = VIDEO_VIEWS_UI_WANTED(ui_layer_dims,
+         views_ui_menu, msg, statistics_show,
+         video_info->widgets_visible)
       && gl3_vv_target_ensure(gl, &gl->views.ui_target, &gl->views.ui,
             ui_layer_dims);
 #endif
@@ -7738,10 +7871,8 @@ static bool gl3_frame(void *data, const void *frame,
 #endif
       if ((msg && *msg) || statistics_show)
          ui_visible = true;
-#ifdef HAVE_GFX_WIDGETS
-      if (widgets_active)
+      if (video_info->widgets_visible)
          ui_visible = true;
-#endif
 
       {
          bool  pq         = (gl->scrgb.content_hdr_mode != 0)
@@ -7975,6 +8106,8 @@ static bool gl3_frame(void *data, const void *frame,
       gl3_fence_iterate(gl, hard_sync_frames);
 
 #ifdef HAVE_GL3_XR
+   if (gl->xr.host)
+      gl_openxr_host_poll(gl->xr.host);
    /* In place of the window's vsync: once a core frame, never under
     * fast-forward. */
    if (gl->xr.paced && !(gl->flags & GL3_FLAG_FRAME_DUPE_LOCK))
@@ -8890,15 +9023,19 @@ static retro_time_t gl3_get_last_present_wait(void *data, bool *shown)
 #ifdef HAVE_SLANG
 static void gl3_set_view_count(void *data, unsigned count)
 {
+   unsigned had;
    gl3_t *gl = (gl3_t*)data;
    if (!gl)
       return;
    if (gl->flags & GL3_FLAG_USE_SHARED_CONTEXT)
       gl->ctx_driver->bind_hw_render(gl->ctx_data, false);
+   had                    = gl->views.chains.count;
    gl->views.chains.count = MIN(count, RETRO_VIDEO_VIEWS_MAX);
-   gl3_views_free_chains(gl, gl->views.chains.count);
+   gl3_views_free_chains(gl, gl->views.chains.count, false);
    gl3_views_free_copies(gl, gl->views.chains.count);
-   gl3_views_build_chains(gl);
+   /* The threaded wrapper applies a shrink with the main thread running */
+   if (gl->views.chains.count > had)
+      gl3_views_build_chains(gl);
    if (     (gl->flags & GL3_FLAG_USE_SHARED_CONTEXT)
          && !gl3_core_context_is_mains(gl))
       gl->ctx_driver->bind_hw_render(gl->ctx_data, true);
@@ -9140,8 +9277,38 @@ video_driver_t video_gl3 = {
    NULL, /* set_vr_content_info */
 #endif
 #endif
-   gl3_read_viewport_bgrx
+   gl3_read_viewport_bgrx,
+   true /* max_geometry_in_place */
 };
+
+#ifdef HAVE_GL_MENU_BLOOM
+static unsigned gfx_display_gl3_bloom_begin(void *data, unsigned dims,
+      bool defer)
+{
+   gl3_t *gl = (gl3_t*)data;
+   if (!gl)
+      return 0;
+   return gl_menu_bloom_begin(&gl->menu_bloom, dims, true,
+#ifdef HAVE_OPENGLES
+         true,
+#else
+         false,
+#endif
+         defer);
+}
+
+static void gfx_display_gl3_bloom_end(void *data, unsigned dims, bool defer)
+{
+   gl3_t *gl = (gl3_t*)data;
+   gl_menu_bloom_end(gl->menu_bloom, dims, defer);
+}
+
+static void gfx_display_gl3_bloom_composite(void *data, unsigned dims)
+{
+   gl3_t *gl = (gl3_t*)data;
+   gl_menu_bloom_composite(gl->menu_bloom, dims);
+}
+#endif
 
 gfx_display_ctx_driver_t gfx_display_ctx_gl3 = {
    gfx_display_gl3_draw,
@@ -9159,7 +9326,19 @@ gfx_display_ctx_driver_t gfx_display_ctx_gl3 = {
    gfx_display_gl3_scissor_begin,
    gfx_display_gl3_scissor_end,
 #ifdef HAVE_SLANG
-   gfx_display_gl3_mesh_draw
+   gfx_display_gl3_mesh_draw,
+#else
+   NULL,
+#endif
+#ifdef HAVE_GL_MENU_BLOOM
+   gfx_display_gl3_bloom_begin,
+   gfx_display_gl3_bloom_end,
+   gfx_display_gl3_bloom_composite,
+#else
+   NULL, NULL, NULL,
+#endif
+#if defined(HAVE_SHADERPIPELINE) && (defined(HAVE_SLANG) || defined(HAVE_GLSL))
+   gfx_display_gl3_effect_install
 #else
    NULL
 #endif

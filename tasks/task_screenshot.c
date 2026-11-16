@@ -33,6 +33,7 @@
 #include <encodings/base64.h>
 #include <string/stdstring.h>
 #include <streams/interface_stream.h>
+#include <retro_atomic.h>
 
 #ifdef HAVE_RBMP
 #include <formats/rbmp.h>
@@ -71,8 +72,19 @@ enum screenshot_task_flags
    SS_TASK_FLAG_HDR                 = (1 << 6),
    SS_TASK_FLAG_WRITTEN             = (1 << 7),
    /* the written PNG is read back for the callback */
-   SS_TASK_FLAG_WANT_IMAGE          = (1 << 8)
+   SS_TASK_FLAG_WANT_IMAGE          = (1 << 8),
+   /* encoded into memory for the callback; no file is written */
+   SS_TASK_FLAG_MEMORY              = (1 << 9),
+   /* holds screenshot_file_claim until the task finishes */
+   SS_TASK_FLAG_CLAIM               = (1 << 10)
 };
+
+/* One screenshot that writes a file at a time, among screenshots
+ * only. As a blocking task it also turned away every state save and
+ * load pushed while it encoded - a save's thumbnail, or a full-size
+ * capture of a 4K output, held off Load State until it was through. */
+static retro_atomic_int_t screenshot_file_claim =
+   RETRO_ATOMIC_INT_INITIALIZER(0);
 
 typedef struct screenshot_task_state screenshot_task_state_t;
 
@@ -94,6 +106,9 @@ struct screenshot_task_state
    /* the PNG as written, base64 (SS_TASK_FLAG_WANT_IMAGE) */
    char *image_b64;
    int   image_b64_len;
+   /* SS_TASK_FLAG_MEMORY: what the encoder writes into */
+   uint8_t *png;
+   size_t   png_size;
    char filename[PATH_MAX_LENGTH];
    char shotname[NAME_MAX_LENGTH];
    /* Colour-space metadata for an HDR screenshot (SS_TASK_FLAG_HDR). The
@@ -131,7 +146,20 @@ static bool screenshot_png_begin(screenshot_task_state_t *state,
     * of magnitude) while costing a raw-frame-sized allocation that
     * no-overcommit platforms would have to commit up front.  Peak
     * scratch this way is a handful of rows plus the deflate window. */
-   if (!(state->enc_s = intfstream_open_file(state->filename,
+   if (state->flags & SS_TASK_FLAG_MEMORY)
+   {
+      /* the rows, a filter byte each, with room for deflate's own
+       * framing and the chunks: what a frame cannot compress still fits */
+      state->png_size = (size_t)VIDEO_SCALE_H(dims)
+         * (VIDEO_SCALE_W(dims) * 3 + 1);
+      state->png_size += state->png_size / 16 + 1024;
+      if (     !(state->png = (uint8_t*)malloc(state->png_size))
+            || !(state->enc_s = intfstream_open_memory(state->png,
+                  RETRO_VFS_FILE_ACCESS_WRITE,
+                  RETRO_VFS_FILE_ACCESS_HINT_NONE, state->png_size)))
+         return false;
+   }
+   else if (!(state->enc_s = intfstream_open_file(state->filename,
          RETRO_VFS_FILE_ACCESS_WRITE,
          RETRO_VFS_FILE_ACCESS_HINT_NONE)))
       return false;
@@ -141,7 +169,8 @@ static bool screenshot_png_begin(screenshot_task_state_t *state,
       intfstream_close(state->enc_s);
       free(state->enc_s);
       state->enc_s = NULL;
-      filestream_delete(state->filename);
+      if (!(state->flags & SS_TASK_FLAG_MEMORY))
+         filestream_delete(state->filename);
       return false;
    }
    return true;
@@ -156,12 +185,21 @@ static void screenshot_png_end(screenshot_task_state_t *state, bool done)
    state->enc = NULL;
    if (state->enc_s)
    {
+      int64_t len = intfstream_tell(state->enc_s);
       intfstream_close(state->enc_s);
       free(state->enc_s);
       state->enc_s = NULL;
-      if (!done)
+      if (state->flags & SS_TASK_FLAG_MEMORY)
+      {
+         if (done && len > 0 && len <= SCREENSHOT_IMAGE_MAX)
+            state->image_b64 = base64(state->png, (int)len,
+                  &state->image_b64_len);
+      }
+      else if (!done)
          filestream_delete(state->filename);
    }
+   free(state->png);
+   state->png = NULL;
    free(state->out_buffer);
    state->out_buffer = NULL;
 }
@@ -255,7 +293,7 @@ static bool screenshot_encode_begin(screenshot_task_state_t *state)
    else
       scaler->in_fmt             = SCALER_FMT_RGB565;
 
-   video_frame_convert_to_bgr24(
+   if (!video_frame_convert_to_bgr24(
          scaler,
          state->out_buffer,
          input,
@@ -264,8 +302,11 @@ static bool screenshot_encode_begin(screenshot_task_state_t *state)
          -state->pitch,
          VIDEO_SCALE_W(state->out_dims),
          VIDEO_SCALE_H(state->out_dims),
-         VIDEO_SCALE_W(state->out_dims) * 3
-         );
+         VIDEO_SCALE_W(state->out_dims) * 3))
+   {
+      scaler_ctx_gen_reset(&state->scaler);
+      return false;
+   }
 
    scaler_ctx_gen_reset(&state->scaler);
 
@@ -361,7 +402,7 @@ static void task_screenshot_handler(retro_task_t *task)
 #endif
 
    /* Push screenshot to image history playlist */
-#ifdef HAVE_IMAGEVIEWER
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
    if (       ret
          && !(state->flags & SS_TASK_FLAG_SILENCE)
          &&  (state->flags & SS_TASK_FLAG_HISTORY_LIST_ENABLE)
@@ -398,8 +439,8 @@ static void task_screenshot_handler(retro_task_t *task)
       free(png);
    }
 
-   /* Report any errors */
-   if (!ret)
+   /* Report any errors; the frame's are its caller's to report */
+   if (!ret && !(state->flags & SS_TASK_FLAG_MEMORY))
    {
       const char *_msg = msg_hash_to_str(MSG_FAILED_TO_TAKE_SCREENSHOT);
       runloop_msg_queue_push(_msg, strlen(_msg), 1,
@@ -421,6 +462,12 @@ static void task_screenshot_handler(retro_task_t *task)
 task_finished:
    if (task)
       task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
+
+   if (state && (state->flags & SS_TASK_FLAG_CLAIM))
+   {
+      state->flags &= ~SS_TASK_FLAG_CLAIM;
+      retro_atomic_store_release_int(&screenshot_file_claim, 0);
+   }
 
 #if defined(HAVE_RPNG)
    /* Cancelled mid-encode: the partial file goes */
@@ -445,11 +492,41 @@ task_finished:
    }
 }
 
+/* Screenshots taken while one is encoding: held, in order, and pushed
+ * as each one ahead of them finishes. Turned away, the Screenshot
+ * hotkey did nothing while a save's thumbnail or an achievement's
+ * capture encoded, and a thumbnail was skipped behind a screenshot.
+ * Each holds its own copy of the frame, taken when it was asked for.
+ * Frame thread only: take_screenshot() and the task's callback run
+ * there. Bounded: past it a screenshot is refused, as all were. */
+#define SCREENSHOTS_HELD_MAX 4
+static retro_task_t *screenshots_held[SCREENSHOTS_HELD_MAX];
+static unsigned      screenshots_held_count = 0;
+
+/* From a screenshot's callback: the next held one takes the claim. */
+static void screenshots_release_held(void)
+{
+   unsigned i;
+   retro_task_t *task;
+   if (     !screenshots_held_count
+         || !retro_atomic_cas_int(&screenshot_file_claim, 0, 1))
+      return;
+   task = screenshots_held[0];
+   for (i = 1; i < screenshots_held_count; i++)
+      screenshots_held[i - 1] = screenshots_held[i];
+   screenshots_held[--screenshots_held_count] = NULL;
+   ((screenshot_task_state_t*)task->state)->flags |= SS_TASK_FLAG_CLAIM;
+   task_queue_push(task);
+}
+
 static void task_screenshot_callback(retro_task_t *task,
       void *task_data,
       void *user_data, const char *error)
 {
    screenshot_task_state_t *state = NULL;
+
+   /* this one's claim went as it finished */
+   screenshots_release_held();
 
    if (!task)
       return;
@@ -470,6 +547,8 @@ static void task_screenshot_callback(retro_task_t *task,
       r.path           = state->filename;
       r.png_base64     = state->image_b64;
       r.png_base64_len = state->image_b64 ? (size_t)state->image_b64_len : 0;
+      r.width          = VIDEO_SCALE_W(state->out_dims);
+      r.height         = VIDEO_SCALE_H(state->out_dims);
       state->cb(task, &r, user_data,
             (state->flags & SS_TASK_FLAG_WRITTEN)
             ? NULL : msg_hash_to_str(MSG_FAILED_TO_TAKE_SCREENSHOT));
@@ -489,70 +568,87 @@ static void task_screenshot_callback(retro_task_t *task,
  * Copies rotated @source image to @target
  * according to @rotate_type 'enum video_rotation_type'.
  **/
+static INLINE void screenshot_copy_pixel(void *dst, const void *src, unsigned bpp)
+{
+   if (bpp == sizeof(uint32_t))
+      memcpy(dst, src, sizeof(uint32_t));
+   else
+      memcpy(dst, src, sizeof(uint16_t));
+}
+
 static void screenshot_rotate(
-      uint32_t *target,
-      uint32_t *source,
-      size_t size,
+      void *target,
+      const void *source,
       unsigned *dims,
       size_t *pitch,
+      unsigned bpp,
       uint8_t rotate_type)
 {
-   int y;
-   size_t x;
-   size_t bpp          = *pitch / VIDEO_SCALE_W(*dims);
+   unsigned x, y, bx, by;
    size_t source_pitch = *pitch;
-   int source_width    = VIDEO_SCALE_W(*dims);
-   int source_height   = VIDEO_SCALE_H(*dims);
-   int target_width    = source_width;
-   int target_height   = source_height;
-   size_t target_pitch = source_pitch;
-   /* Copy by byte: a pixel is bpp bytes, which is 2 for RGB565 */
+   unsigned source_width  = VIDEO_SCALE_W(*dims);
+   unsigned source_height = VIDEO_SCALE_H(*dims);
+   unsigned target_width  = source_width;
+   unsigned target_height = source_height;
+   size_t target_pitch;
    uint8_t *target_px  = (uint8_t*)target;
    const uint8_t *source_px = (const uint8_t*)source;
 
-   if (!bpp)
-      return;
-
-   /* 90 deg dimension flip */
    if (     rotate_type == VIDEO_ROTATION_90_DEG
          || rotate_type == VIDEO_ROTATION_270_DEG)
    {
       target_width     = source_height;
       target_height    = source_width;
-      target_pitch     = target_width * bpp;
    }
+   target_pitch = (size_t)target_width * bpp;
 
-   for (y = 0; y < target_height; y++)
+   if (     rotate_type != VIDEO_ROTATION_90_DEG
+         && rotate_type != VIDEO_ROTATION_180_DEG
+         && rotate_type != VIDEO_ROTATION_270_DEG)
    {
-      for (x = 0; x < (size_t)target_width; x++)
-      {
-         size_t pixel_source = (y * source_width) + x;
-         size_t pixel_target = (y * target_width) + x;
-
-         switch (rotate_type)
-         {
-            default:
-            case VIDEO_ROTATION_NORMAL:
-               break;
-            case VIDEO_ROTATION_90_DEG:
-               pixel_source = ((target_height - 1 - y) + (x * source_width));
-               break;
-            case VIDEO_ROTATION_180_DEG:
-               pixel_source = ((target_height - 1 - y) * target_width) + (target_width - 1 - x);
-               break;
-            case VIDEO_ROTATION_270_DEG:
-               pixel_source = y + ((target_width - 1 - x) * source_width);
-               break;
-         }
-
-         if (     pixel_source >= size / bpp
-               || pixel_target >= size / bpp)
-            continue;
-
-         memcpy(target_px + pixel_target * bpp,
-               source_px + pixel_source * bpp, bpp);
-      }
+      if (source_pitch == target_pitch)
+         memcpy(target, source, target_pitch * target_height);
+      else
+         for (y = 0; y < target_height; y++)
+            memcpy(target_px + (size_t)y * target_pitch,
+                  source_px + (size_t)y * source_pitch, target_pitch);
+      *pitch = target_pitch;
+      return;
    }
+
+   if (rotate_type == VIDEO_ROTATION_180_DEG)
+      for (y = 0; y < target_height; y++)
+      {
+         const uint8_t *src_row = source_px
+            + (size_t)(source_height - 1 - y) * source_pitch;
+         uint8_t *dst_row = target_px + (size_t)y * target_pitch;
+         for (x = 0; x < target_width; x++)
+            screenshot_copy_pixel(dst_row + x * bpp,
+                  src_row + (source_width - 1 - x) * bpp, bpp);
+      }
+   else
+      /* Keep source columns and destination rows in cache together. */
+      for (by = 0; by < target_height; by += 32)
+         for (bx = 0; bx < target_width; bx += 32)
+         {
+            unsigned y_end = by + 32 < target_height ? by + 32 : target_height;
+            unsigned x_end = bx + 32 < target_width ? bx + 32 : target_width;
+            for (y = by; y < y_end; y++)
+            {
+               unsigned sx = rotate_type == VIDEO_ROTATION_90_DEG
+                  ? source_width - 1 - y : y;
+               const uint8_t *src_col = source_px + sx * bpp;
+               uint8_t *dst_row = target_px + (size_t)y * target_pitch;
+               if (rotate_type == VIDEO_ROTATION_90_DEG)
+                  for (x = bx; x < x_end; x++)
+                     screenshot_copy_pixel(dst_row + x * bpp,
+                           src_col + (size_t)x * source_pitch, bpp);
+               else
+                  for (x = bx; x < x_end; x++)
+                     screenshot_copy_pixel(dst_row + x * bpp,
+                           src_col + (size_t)(source_height - 1 - x) * source_pitch, bpp);
+            }
+         }
 
    /* Replace source values with target values */
    *dims   = VIDEO_SCALE_PACK(target_width, target_height);
@@ -574,10 +670,12 @@ static bool screenshot_dump(
       bool use_thread,
       unsigned pixel_format_type,
       const struct rpng_hdr_metadata *hdr,
+      unsigned frame_max,
       retro_task_callback_t cb, void *user_data)
 {
    settings_t *settings           = config_get_ptr();
-   bool history_list_enable       = settings->bools.history_list_enable;
+   bool history_list_enable       = settings->bools.history_list_enable
+      && !frame_max;
    screenshot_task_state_t *state = (screenshot_task_state_t*)
          calloc(1, sizeof(*state));
 
@@ -636,12 +734,32 @@ static bool screenshot_dump(
 
       state->flags              |= SS_TASK_FLAG_SILENCE;
    }
+   /* The frame, scaled to fit @frame_max and never up, for the callback
+    * alone: no file, no notification */
+   else if (frame_max)
+   {
+      unsigned w = VIDEO_SCALE_W(dims);
+      unsigned h = VIDEO_SCALE_H(dims);
+      if (w > VIDEO_SCALE_W(frame_max))
+      {
+         h = h * VIDEO_SCALE_W(frame_max) / w;
+         w = VIDEO_SCALE_W(frame_max);
+      }
+      if (h > VIDEO_SCALE_H(frame_max))
+      {
+         w = w * VIDEO_SCALE_H(frame_max) / h;
+         h = VIDEO_SCALE_H(frame_max);
+      }
+      state->out_dims            = VIDEO_SCALE_PACK(w ? w : 1, h ? h : 1);
+      state->flags              |= SS_TASK_FLAG_MEMORY
+                                 | SS_TASK_FLAG_SILENCE;
+   }
 
    if (history_list_enable)
       state->flags              |= SS_TASK_FLAG_HISTORY_LIST_ENABLE;
    state->pixel_format_type      = pixel_format_type;
 
-   if (!fullpath)
+   if (!fullpath && !frame_max)
    {
       if (savestate)
       {
@@ -764,10 +882,10 @@ static bool screenshot_dump(
          return false;
       }
 
-      task->type         = TASK_TYPE_BLOCKING;
+      task->type         = TASK_TYPE_NONE;
       task->state        = state;
       task->handler      = task_screenshot_handler;
-      if (savestate)
+      if (savestate || frame_max)
          task->flags    |=  RETRO_TASK_FLG_MUTE;
       else
          task->flags    &= ~RETRO_TASK_FLG_MUTE;
@@ -785,14 +903,36 @@ static bool screenshot_dump(
       else
 #endif
       {
-         if (!savestate && settings->bools.notification_show_screenshot)
+         if (     !savestate && !frame_max
+               && settings->bools.notification_show_screenshot)
             task->title = strdup(msg_hash_to_str(MSG_TAKING_SCREENSHOT));
       }
 
-      if (task_queue_push(task))
+      /* A frame writes no file, so it waits on no screenshot. One that
+       * does goes in with the claim, or is held behind the screenshot
+       * that has it; its callback hands the claim on. */
+      if (!frame_max)
+      {
+         task->callback  = task_screenshot_callback;
+         if (     screenshots_held_count
+               || !retro_atomic_cas_int(&screenshot_file_claim, 0, 1))
+         {
+            if (screenshots_held_count < SCREENSHOTS_HELD_MAX)
+            {
+               screenshots_held[screenshots_held_count++] = task;
+               return true;
+            }
+         }
+         else
+            state->flags |= SS_TASK_FLAG_CLAIM;
+      }
+
+      if (     (frame_max || (state->flags & SS_TASK_FLAG_CLAIM))
+            && task_queue_push(task))
          return true;
 
-      /* There is already a blocking task going on */
+      if (state->flags & SS_TASK_FLAG_CLAIM)
+         retro_atomic_store_release_int(&screenshot_file_claim, 0);
       if (task->title)
          task_free_title(task);
 
@@ -819,6 +959,8 @@ static bool screenshot_dump(
          r.path           = state->filename;
          r.png_base64     = NULL;
          r.png_base64_len = 0;
+         r.width          = VIDEO_SCALE_W(state->out_dims);
+         r.height         = VIDEO_SCALE_H(state->out_dims);
          state->cb(NULL, &r, user_data, NULL);
       }
       free(state);
@@ -834,6 +976,7 @@ static bool take_screenshot_viewport(
       bool fullpath,
       bool use_thread,
       unsigned pixel_format_type,
+      unsigned frame_max,
       retro_task_callback_t cb, void *user_data)
 {
    struct video_viewport vp;
@@ -855,7 +998,7 @@ static bool take_screenshot_viewport(
     * (e.g. not in HDR mode, or the driver has no HDR read-back), we fall
     * straight through to the ordinary 8-bit SDR read_viewport below, so
     * normal screenshots are unaffected. */
-   if (video_st->current_video->read_viewport_hdr)
+   if (video_st->current_video->read_viewport_hdr && !frame_max)
    {
       struct rpng_hdr_metadata hdr;
       uint16_t *hdr_buffer = (uint16_t*)malloc(VIDEO_SCALE_AREA(vp.dims) * 6);
@@ -880,11 +1023,16 @@ static bool take_screenshot_viewport(
                      hdr_buffer, vp.dims,
                      VIDEO_SCALE_W(vp.dims) * 6, false, hdr_buffer,
                      savestate, runloop_flags, fullpath, use_thread,
-                     pixel_format_type, &hdr, cb, user_data))
+                     pixel_format_type, &hdr, 0, cb, user_data))
                return true;
          }
          free(hdr_buffer);
       }
+
+      /* A failed HDR render may have changed the viewport. */
+      video_driver_get_viewport_info(&vp);
+      if (!VIDEO_SCALE_W(vp.dims) || !VIDEO_SCALE_H(vp.dims))
+         return false;
    }
 
    if (!(buffer = (uint8_t*)malloc(VIDEO_SCALE_AREA(vp.dims) * 3)))
@@ -907,7 +1055,7 @@ static bool take_screenshot_viewport(
                buffer, vp.dims,
                VIDEO_SCALE_W(vp.dims) * 3, true, buffer,
                savestate, runloop_flags, fullpath, use_thread,
-               pixel_format_type, NULL, cb, user_data))
+               pixel_format_type, NULL, frame_max, cb, user_data))
          return true;
    }
 
@@ -927,6 +1075,8 @@ struct ss_raw_copy
    void    *buffer;
    unsigned dims;
    size_t   pitch;
+   unsigned bpp;
+   uint8_t  rotation;
 };
 
 static void ss_raw_copy_cb(void *userdata,
@@ -934,18 +1084,27 @@ static void ss_raw_copy_cb(void *userdata,
       unsigned dims, size_t pitch)
 {
    struct ss_raw_copy *out = (struct ss_raw_copy*)userdata;
-   size_t             size;
+   unsigned width = VIDEO_SCALE_W(dims);
+   unsigned height = VIDEO_SCALE_H(dims);
+   size_t row_bytes, size;
 
-   if (!data || !VIDEO_SCALE_W(dims) || !VIDEO_SCALE_H(dims) || !pitch)
+   if (!data || !width || !height || !pitch
+         || (out->bpp != 2 && out->bpp != 4))
       return;
 
-   size = (size_t)VIDEO_SCALE_H(dims) * pitch;
+   row_bytes = (size_t)width * out->bpp;
+   if (     pitch < row_bytes
+         || height > (size_t)-1 / row_bytes
+         || (height > 1 && pitch > ((size_t)-1 - row_bytes) / (height - 1)))
+      return;
+   size = (size_t)height * row_bytes;
    if (!(out->buffer = malloc(size)))
       return;
 
-   memcpy(out->buffer, data, size);
    out->dims   = dims;
    out->pitch  = pitch;
+   screenshot_rotate(out->buffer, data, &out->dims, &out->pitch,
+         out->bpp, out->rotation);
 }
 
 static bool take_screenshot_raw(
@@ -955,6 +1114,7 @@ static bool take_screenshot_raw(
       bool savestate, uint32_t runloop_flags,
       bool fullpath, bool use_thread,
       unsigned pixel_format_type,
+      unsigned frame_max,
       retro_task_callback_t cb, void *user_data)
 {
    /* Pull a heap-owned copy of the cached frame's pixels via the
@@ -962,7 +1122,23 @@ static bool take_screenshot_raw(
     * onto a worker thread; without copying we'd risk a UAF if the
     * core closes or the driver reinit's between this enqueue and the
     * worker dequeuing it. */
-   struct ss_raw_copy copy = { NULL, 0, 0 };
+   struct ss_raw_copy copy = { NULL, 0, 0, 0, 0 };
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   switch (pixel_format_type)
+   {
+      case RETRO_PIXEL_FORMAT_0RGB1555:
+      case RETRO_PIXEL_FORMAT_RGB565:
+         copy.bpp = 2;
+         break;
+      case RETRO_PIXEL_FORMAT_XRGB8888:
+      case RETRO_PIXEL_FORMAT_XRGB2101010:
+      case RETRO_PIXEL_FORMAT_HDR10_2101010:
+         copy.bpp = 4;
+         break;
+      default:
+         return false;
+   }
+   copy.rotation = (uint8_t)runloop_st->system.rotation;
    video_driver_cached_frame_read(&copy, ss_raw_copy_cb);
 
    if (     !copy.buffer || !VIDEO_SCALE_W(copy.dims)
@@ -970,30 +1146,6 @@ static bool take_screenshot_raw(
    {
       free(copy.buffer);
       return false;
-   }
-
-   /* Rotate the buffer according to core SET_ROTATION */
-   {
-      runloop_state_t *runloop_st   = runloop_state_get_ptr();
-      rarch_system_info_t *sys_info = &runloop_st->system;
-
-      if (sys_info && sys_info->rotation)
-      {
-         uint32_t *buf = NULL;
-         uint8_t bpp   = copy.pitch / VIDEO_SCALE_W(copy.dims);
-         size_t size   = VIDEO_SCALE_AREA(copy.dims) * bpp;
-
-         if ((buf = (uint32_t*)calloc(1, size)))
-         {
-            screenshot_rotate(buf, (uint32_t*)copy.buffer, size,
-                  &copy.dims, &copy.pitch,
-                  sys_info->rotation);
-            memcpy(copy.buffer, buf, size);
-
-            free(buf);
-            buf = NULL;
-         }
-      }
    }
 
    /* Negative pitch is needed as screenshot takes bottom-up, but
@@ -1012,6 +1164,7 @@ static bool take_screenshot_raw(
             use_thread,
             pixel_format_type,
             NULL,
+            frame_max,
             cb, user_data))
       return true;
 
@@ -1032,6 +1185,7 @@ static bool take_screenshot_choice(
       bool use_thread,
       bool supports_vp_read,
       unsigned pixel_format_type,
+      unsigned frame_max,
       retro_task_callback_t cb, void *user_data
       )
 {
@@ -1045,13 +1199,13 @@ static bool take_screenshot_choice(
          video_driver_cached_frame();
       return take_screenshot_viewport(screenshot_dir,
             name_base, savestate, runloop_flags, fullpath, use_thread,
-            pixel_format_type, cb, user_data);
+            pixel_format_type, frame_max, cb, user_data);
    }
 
    if (!has_valid_framebuffer)
       return take_screenshot_raw(video_st, screenshot_dir,
             name_base, savestate, runloop_flags, fullpath, use_thread,
-            pixel_format_type, cb, user_data);
+            pixel_format_type, frame_max, cb, user_data);
 
    return false;
 }
@@ -1066,11 +1220,11 @@ bool take_screenshot(
          has_valid_framebuffer, fullpath, use_thread, NULL, NULL);
 }
 
-bool take_screenshot_notify(
+static bool take_screenshot_or_frame(
       const char *screenshot_dir,
       const char *name_base,
       bool savestate, bool has_valid_framebuffer,
-      bool fullpath, bool use_thread,
+      bool fullpath, bool use_thread, unsigned frame_max,
       retro_task_callback_t cb, void *user_data)
 {
    bool ret                       = false;
@@ -1094,11 +1248,14 @@ bool take_screenshot_notify(
             || video_driver_cached_frame_is_hw_render())
          prefer_vp_read           = true;
       /* Avoid GPU screenshots with savestates */
-      if (video_gpu_screenshot && !savestate)
+      /* nor with a frame: a software core's own frame needs no read
+       * back from the GPU, nor the present a read back asks for */
+      if (video_gpu_screenshot && !savestate && !frame_max)
          prefer_vp_read           = true;
    }
    /* No way to infer screenshot directory. */
-   if (     (!screenshot_dir || !*screenshot_dir)
+   if (     !frame_max
+         && (!screenshot_dir || !*screenshot_dir)
          && (!name_base || !*name_base))
       return false;
    ret       = take_screenshot_choice(
@@ -1112,6 +1269,7 @@ bool take_screenshot_notify(
          use_thread,
          prefer_vp_read,
          video_st->pix_fmt,
+         frame_max,
          cb,
          user_data
          );
@@ -1121,3 +1279,32 @@ bool take_screenshot_notify(
    return ret;
 }
 
+bool take_screenshot_notify(
+      const char *screenshot_dir,
+      const char *name_base,
+      bool savestate, bool has_valid_framebuffer,
+      bool fullpath, bool use_thread,
+      retro_task_callback_t cb, void *user_data)
+{
+   return take_screenshot_or_frame(screenshot_dir, name_base, savestate,
+         has_valid_framebuffer, fullpath, use_thread, 0, cb, user_data);
+}
+
+bool take_frame_notify(unsigned max_width, unsigned max_height,
+      retro_task_callback_t cb, void *user_data)
+{
+#if !defined(HAVE_RPNG)
+   /* only the PNG encoder writes into memory */
+   (void)max_width;
+   (void)max_height;
+   (void)cb;
+   (void)user_data;
+   return false;
+#else
+   if (!max_width || !max_height || !cb)
+      return false;
+   return take_screenshot_or_frame(NULL, NULL, false,
+         video_driver_cached_frame_is_hw_render(), false, true,
+         VIDEO_SCALE_PACK(max_width, max_height), cb, user_data);
+#endif
+}

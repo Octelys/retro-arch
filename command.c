@@ -47,6 +47,9 @@
 
 #ifdef HAVE_MENU
 #include "menu/menu_driver.h"
+#ifdef HAVE_CORE_SIGNATURES
+#include "core_trust_runtime.h"
+#endif
 #endif
 
 #ifdef HAVE_NETWORKING
@@ -54,6 +57,7 @@
 #endif
 
 #include "audio/audio_driver.h"
+#include "input/input_remapping.h"
 #if defined(HAVE_CG) || defined(HAVE_GLSL) || defined(HAVE_SLANG) || defined(HAVE_HLSL)
 #include "gfx/video_shader_parse.h"
 #endif
@@ -63,6 +67,7 @@
 #include "core_info.h"
 #include "playlist.h"
 #include <queues/task_queue.h>
+#include <retro_atomic.h>
 #include "cheat_manager.h"
 #include "content.h"
 #include "dynamic.h"
@@ -76,6 +81,9 @@
 #include "version.h"
 #include "version_git.h"
 #include "tasks/task_content.h"
+#ifdef HAVE_CORE_LOAD_CHECK
+#include "core_load_check.h"
+#endif
 #ifdef HAVE_TRANSLATE
 #include "accessibility.h"
 #endif
@@ -281,7 +289,7 @@ static void network_command_reply(command_t *cmd,
 {
    command_network_t *netcmd = (command_network_t*)cmd->userptr;
    /* Respond (fire and forget since it's UDP) */
-   sendto(netcmd->net_fd, s, len, 0,
+   sendto(netcmd->net_fd, s, (int)len, 0,
       (struct sockaddr*)&netcmd->cmd_source, netcmd->cmd_source_len);
 }
 
@@ -309,7 +317,7 @@ static void network_command_reply_to(command_t *cmd, void *data,
 {
    command_network_t      *netcmd = (command_network_t*)cmd->userptr;
    command_network_dest_t *dest   = (command_network_dest_t*)data;
-   sendto(netcmd->net_fd, s, len, 0,
+   sendto(netcmd->net_fd, s, (int)len, 0,
       (struct sockaddr*)&dest->addr, dest->addr_len);
 }
 
@@ -902,30 +910,38 @@ static void command_deferred_send(command_deferred_t *d,
 }
 
 #ifdef HAVE_SCREENSHOTS
+/* SCREENSHOT's answer, and GET_FRAME's - the frame written nowhere, so
+ * with no path: the picture where the interface takes one, with the
+ * file's path or the frame's size as its text. */
 static void command_screenshot_done(retro_task_t *task, void *task_data,
       void *user_data, const char *error)
 {
    command_deferred_t             *d = (command_deferred_t*)user_data;
    const struct screenshot_result *r = (const struct screenshot_result*)task_data;
+   bool                        frame = r && !*r->path;
    char msg[PATH_MAX_LENGTH];
-   if (error || !r)
+   if (error || !r || (frame && !r->png_base64))
    {
-      snprintf(msg, sizeof(msg), "SCREENSHOT ERROR %s",
+      snprintf(msg, sizeof(msg), "%s ERROR %s",
+            frame ? "GET_FRAME" : "SCREENSHOT",
             error ? error : "no result");
       command_deferred_send(d, msg, strlen(msg), true);
    }
-   else if (r->png_base64 && d->cmd->reply_image_to && d->dest
-         && input_driver_command_generation() == d->gen)
-   {
-      /* the picture itself, with its path, where the interface takes one */
-      d->cmd->reply_image_to(d->cmd, d->dest, r->path, strlen(r->path),
-            "image/png", r->png_base64, r->png_base64_len);
-      command_deferred_send(d, NULL, 0, false);
-   }
    else
    {
-      strlcpy(msg, r->path, sizeof(msg));
-      command_deferred_send(d, msg, strlen(msg), false);
+      if (frame)
+         snprintf(msg, sizeof(msg), "GET_FRAME %ux%u", r->width, r->height);
+      else
+         strlcpy(msg, r->path, sizeof(msg));
+      if (     r->png_base64 && d->cmd->reply_image_to && d->dest
+            && input_driver_command_generation() == d->gen)
+      {
+         d->cmd->reply_image_to(d->cmd, d->dest, msg, strlen(msg),
+               "image/png", r->png_base64, r->png_base64_len);
+         command_deferred_send(d, NULL, 0, false);
+      }
+      else
+         command_deferred_send(d, msg, strlen(msg), false);
    }
    free(d);
 }
@@ -956,6 +972,55 @@ static bool command_screenshot(command_t *cmd)
    command_deferred_take(d, cmd);
    return true;
 }
+
+#ifdef HAVE_RPNG
+/* GET_FRAME [size]: the frame on screen as image content, scaled to fit
+ * a square of @size and never up. Nothing is written: a software core's
+ * frame is copied, a hardware core's read back from the GPU. */
+bool command_get_frame(command_t *cmd, const char *arg)
+{
+   command_deferred_t *d;
+   unsigned long       size = COMMAND_FRAME_SIZE;
+   char               *end  = NULL;
+   while (arg && *arg == ' ')
+      arg++;
+   if (arg && *arg)
+   {
+      size = strtoul(arg, &end, 10);
+      if (     *arg < '0' || *arg > '9' || *end
+            || size < COMMAND_FRAME_SIZE_MIN || size > COMMAND_FRAME_SIZE_MAX)
+      {
+         command_reply_error(cmd, "GET_FRAME", "a size from %u to %u",
+               COMMAND_FRAME_SIZE_MIN, COMMAND_FRAME_SIZE_MAX);
+         return false;
+      }
+   }
+   /* the line interfaces carry text alone */
+   if (!cmd->reply_image_to)
+   {
+      command_reply_error(cmd, "GET_FRAME", "this interface carries no "
+            "image; SCREENSHOT writes one to a file");
+      return false;
+   }
+   if (!(runloop_get_flags() & RUNLOOP_FLAG_CORE_RUNNING))
+   {
+      command_reply_error(cmd, "GET_FRAME", "no content is running");
+      return false;
+   }
+   if (!(d = (command_deferred_t*)calloc(1, sizeof(*d))))
+      return false;
+   if (!take_frame_notify((unsigned)size, (unsigned)size,
+            command_screenshot_done, d))
+   {
+      free(d);
+      command_reply_error(cmd, "GET_FRAME", "the frame could not be "
+            "taken: none has been drawn, or a screenshot is being taken");
+      return false;
+   }
+   command_deferred_take(d, cmd);
+   return true;
+}
+#endif
 #endif
 
 /* A command answered once the work it starts is through: by @ok, else
@@ -1273,6 +1338,9 @@ static struct
    bool               has_index;
    bool               has_from;
    bool               lost;
+#ifdef HAVE_CORE_SIGNATURES
+   bool               refused;
+#endif
    /* the list the index was given in: how deep, and its label */
    size_t             depth;
    char               list[64];
@@ -1398,10 +1466,10 @@ static char *command_menu_answer(bool has_from, unsigned from,
       _len += (size_t)snprintf(out + _len, size - _len, "KEYBOARD %s\n",
             label);
    }
-   else if (menu_st->driver_data && *menu_st->driver_data->menu_state_msg)
+   else if (menu_st->driver_data && *MENU_STATE_TEXT(menu_st->driver_data))
    {
       char msg[sizeof(menu_st->driver_data->menu_state_msg)];
-      strlcpy(msg, menu_st->driver_data->menu_state_msg, sizeof(msg));
+      strlcpy(msg, MENU_STATE_TEXT(menu_st->driver_data), sizeof(msg));
       command_menu_clean(msg);
       _len += (size_t)snprintf(out + _len, size - _len, "MESSAGE %s\n",
             msg);
@@ -1447,6 +1515,14 @@ unsigned command_menu_action(unsigned action)
    char               where[sizeof(command_menu_st.list)];
    if (!command_menu_st.pending || command_menu_st.frames < 2)
       return action;
+#ifdef HAVE_CORE_SIGNATURES
+   if (menu_core_warning_user_only())
+   {
+      command_menu_st.has_index = false;
+      command_menu_st.refused   = true;
+      return action;
+   }
+#endif
    /* a request is input, as a press is: no screensaver comes over it,
     * and one up takes the press that ends it */
    menu_st->input_last_time_us = menu_st->current_time_us;
@@ -1502,6 +1578,17 @@ void command_menu_iterated(void)
          && (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE))
       return;
    command_menu_st.pending = false;
+#ifdef HAVE_CORE_SIGNATURES
+   if (command_menu_st.refused)
+   {
+      command_menu_st.refused = false;
+      command_deferred_send(&command_menu_st.deferred,
+            "MENU ERROR only the user can answer this screen\n",
+            STRLEN_CONST("MENU ERROR only the user can answer this "
+               "screen\n"), true);
+      return;
+   }
+#endif
    if (command_menu_st.lost)
    {
       command_menu_st.lost = false;
@@ -1694,6 +1781,9 @@ bool command_menu(command_t *cmd, const char *arg)
    command_menu_st.depth     = command_menu_where(command_menu_st.list,
          sizeof(command_menu_st.list));
    command_menu_st.lost      = false;
+#ifdef HAVE_CORE_SIGNATURES
+   command_menu_st.refused   = false;
+#endif
    command_menu_st.frames    = 2;
    command_menu_st.pending   = true;
    command_deferred_take(&command_menu_st.deferred, cmd);
@@ -1859,13 +1949,13 @@ static bool udp_send_packet(const char *host, uint16_t port, const char *msg)
 
    do
    {
-      int fd = socket(tmp_info->ai_family,
+      int fd = (int)socket(tmp_info->ai_family,
          tmp_info->ai_socktype, tmp_info->ai_protocol);
 
       if (fd < 0)
          continue;
 
-      if (sendto(fd, msg, len, 0, tmp_info->ai_addr, tmp_info->ai_addrlen) ==
+      if (sendto(fd, msg, (int)len, 0, tmp_info->ai_addr, (socklen_t)tmp_info->ai_addrlen) ==
             (ssize_t)len)
          ret = true;
 
@@ -1938,9 +2028,14 @@ bool command_network_send(const char *cmd_)
 
    if (port_str && *port_str)
    {
-      unsigned long val = strtoul(port_str, NULL, 0);
-      if (val > 0 && val <= 0xFFFF)
-         port = (uint16_t)val;
+      char *end;
+      unsigned long val = strtoul(port_str, &end, 0);
+      if (*end || !val || val > 0xFFFF)
+      {
+         RARCH_ERR("[NetCMD] Invalid port \"%s\".\n", port_str);
+         return false;
+      }
+      port = (uint16_t)val;
    }
 
    RARCH_LOG("[NetCMD] %s: \"%s\" to %s:%hu.\n",
@@ -3617,6 +3712,49 @@ void command_run_frames_free_frame(void)
    command_run_frames_st.let_go    = 0;
    command_run_frames_st.dry_since = 0;
    runloop_frame_work_set(RUNLOOP_WORK_FREE_FRAME, false);
+}
+
+const char *command_tools_refused(void)
+{
+#ifdef HAVE_CHEEVOS
+   if (rcheevos_hardcore_in_game())
+      return "achievements hardcore mode is on; the player can turn it off";
+#endif
+   return NULL;
+}
+
+#ifdef HAVE_THREADS
+/* hardcore mode took effect on a task thread, as a game's achievements
+ * finish loading: what it stops waits for the main thread's next frame */
+static retro_atomic_int_t command_hardcore_due;
+#endif
+
+void command_hardcore_entered(void)
+{
+#ifdef HAVE_THREADS
+   if (!task_is_on_main_thread())
+   {
+      retro_atomic_store_release_int(&command_hardcore_due, 1);
+      return;
+   }
+#endif
+   /* a queued job keeps why it ended, told once hardcore mode is off */
+   if (runloop_state_get_ptr()->frame_work & RUNLOOP_WORK_RUN_FRAMES)
+      command_run_frames_cancel("achievements hardcore mode is on");
+   else
+      command_run_frames_forget();
+   input_driver_command_release(MAX_USERS);
+}
+
+void command_frame_start(void)
+{
+#ifdef HAVE_THREADS
+   if (retro_atomic_exchange_int(&command_hardcore_due, 0))
+      command_hardcore_entered();
+#endif
+#ifdef HAVE_MENU
+   command_menu_closed();
+#endif
 }
 
 void command_run_frames_forget(void)
@@ -5387,6 +5525,11 @@ static bool command_core_at(command_t *cmd, const char *name,
    }
    if (!libretro_get_system_info(path, &info, NULL))
    {
+#ifdef HAVE_CORE_LOAD_CHECK
+      /* A core its check holds back: the load after this parks it */
+      if (core_load_check_refused(path))
+         return true;
+#endif
       command_reply_error(cmd, name, "%s is not a libretro core", path);
       return false;
    }
@@ -5420,6 +5563,10 @@ bool command_load_core(command_t *cmd, const char* arg)
    if (!task_push_load_new_core(path, NULL,
             &content_info, CORE_TYPE_PLAIN, NULL, NULL))
    {
+#ifdef HAVE_CORE_LOAD_CHECK
+      if (task_content_park_core_load(path))
+         return true;
+#endif
       command_reply_error(cmd, "LOAD_CORE", "could not load %s", path);
       return false;
    }
@@ -5727,13 +5874,69 @@ static const rarch_memory_descriptor_t* command_memory_get_descriptor(const rarc
    return NULL;
 }
 
+/* A core with no memory map still hands over its RAM as blocks, once a
+ * game is loaded: system RAM from address 0 and save RAM straight after
+ * it, as the achievements lay them out when they know no console - for
+ * the SNES, the addresses RetroAchievements' notes give. Fills @blocks
+ * (data, start, size) for the system and the save block, a NULL data
+ * where the core has none; false where it has neither. */
+struct command_ram_block
+{
+   uint8_t *data;
+   size_t   start;
+   size_t   size;
+};
+
+static bool command_memory_core_blocks(struct command_ram_block blocks[2])
+{
+   runloop_state_t        *runloop_st = runloop_state_get_ptr();
+   retro_ctx_memory_info_t info;
+   memset(blocks, 0, 2 * sizeof(*blocks));
+   if (     !(runloop_st->current_core.flags & RETRO_CORE_FLAG_GAME_LOADED)
+         || !runloop_st->current_core.retro_get_memory_data
+         || !runloop_st->current_core.retro_get_memory_size)
+      return false;
+   info.id = RETRO_MEMORY_SYSTEM_RAM;
+   core_get_memory(&info);
+   if (info.data && info.size)
+   {
+      blocks[0].data = (uint8_t*)info.data;
+      blocks[0].size = info.size;
+   }
+   info.id = RETRO_MEMORY_SAVE_RAM;
+   core_get_memory(&info);
+   if (info.data && info.size)
+   {
+      blocks[1].data  = (uint8_t*)info.data;
+      blocks[1].start = blocks[0].size;
+      blocks[1].size  = info.size;
+   }
+   return blocks[0].data || blocks[1].data;
+}
+
 static uint8_t *command_memory_get_pointer(
       const rarch_system_info_t* sys_info,
       unsigned address, unsigned int* max_bytes,
       int for_write, char *s, size_t len)
 {
    if (!sys_info || sys_info->mmaps.num_descriptors == 0)
-      strlcpy_lit(s, " -1 no memory map defined\n", len);
+   {
+      struct command_ram_block blocks[2];
+      unsigned                 n;
+      bool                     any = command_memory_core_blocks(blocks);
+      for (n = 0; n < 2; n++)
+         if (     blocks[n].data && address >= blocks[n].start
+               && address < blocks[n].start + blocks[n].size)
+         {
+            *max_bytes = (unsigned int)(blocks[n].start + blocks[n].size
+                  - address);
+            return blocks[n].data + (address - blocks[n].start);
+         }
+      if (any)
+         strlcpy_lit(s, " -1 no descriptor for address\n", len);
+      else
+         strlcpy_lit(s, " -1 no memory map defined\n", len);
+   }
    else
    {
       size_t offset;
@@ -5786,16 +5989,39 @@ bool command_get_memory_map(command_t *cmd, const char *arg)
    const rarch_memory_map_t *mmap  = runloop_st ? &runloop_st->system.mmaps
                                                 : NULL;
 
-   if (!mmap || !mmap->num_descriptors)
-   {
-      command_reply_error(cmd, "GET_MEMORY_MAP",
-            "the running core has no memory map");
-      return false;
-   }
    if (!(reply = (char*)malloc(COMMAND_LIST_REPLY_MAX + 1)))
    {
       command_reply_error(cmd, "GET_MEMORY_MAP", "out of memory");
       return false;
+   }
+   /* no map: the RAM the core hands over, where READ_CORE_MEMORY reads
+    * it, in an address space named core */
+   if (!mmap || !mmap->num_descriptors)
+   {
+      struct command_ram_block blocks[2];
+      command_memory_core_blocks(blocks);
+      for (i = 0; i < 2; i++)
+      {
+         char s_start[24], s_len[24];
+         if (!blocks[i].data)
+            continue;
+         command_hex(s_start, blocks[i].start);
+         command_hex(s_len,   blocks[i].size);
+         _len += (size_t)snprintf(reply + _len,
+               COMMAND_LIST_REPLY_MAX + 1 - _len,
+               "%s\t%s\t0\t0\t%s\trw\tlittle\tcore\n", s_start, s_len,
+               i ? "save" : "system");
+      }
+      if (!_len)
+      {
+         free(reply);
+         command_reply_error(cmd, "GET_MEMORY_MAP",
+               "the running core has no memory map, and hands over no RAM");
+         return false;
+      }
+      cmd->replier(cmd, reply, _len);
+      free(reply);
+      return true;
    }
 
    for (i = 0; i < mmap->num_descriptors; i++)
@@ -6133,7 +6359,7 @@ void command_event_init_controllers(rarch_system_info_t *sys_info,
          if (i >= MAX_USERS)
             break;
 
-         if (port == settings->uints.input_remap_ports[i])
+         if (port == input_remapping_user_port((unsigned)i))
          {
             device = input_config_get_device(port);
             break;
@@ -7222,11 +7448,12 @@ bool command_event_main_state(unsigned cmd)
                      settings->uints.savestate_max_keep;
                bool frame_time_counter_auto_reset             =
                      settings->bools.frame_time_counter_auto_reset;
+               bool queued                                    = true;
 
                if (cmd == CMD_EVENT_SAVE_STATE)
                {
-                  bool queued = content_save_state(state_path, true);
-                  RARCH_LOG("[State] save dispatch for slot %d, path "
+                  queued = content_save_state(state_path, true);
+                  RARCH_LOG("[State] Save dispatch for slot %d, path "
                         "\"%s\": content_save_state queued=%s "
                         "(auto_index=%s, max_keep=%u). NOTE: actual disk "
                         "write is asynchronous; success is only known when "
@@ -7235,18 +7462,29 @@ bool command_event_main_state(unsigned cmd)
                         queued ? "yes" : "NO",
                         savestate_auto_index ? "on" : "off",
                         savestate_max_keep);
+                  /* Turned away - the saves and loads held behind the
+                   * one in flight are already at their bound: said,
+                   * rather than the hotkey doing nothing */
+                  if (!queued)
+                     _len = snprintf(msg, sizeof(msg), "%s \"%s\".",
+                           msg_hash_to_str(MSG_FAILED_TO_SAVE_STATE_TO),
+                           path_basename(state_path));
                }
                else
                   content_save_state_to_ram();
 
-               /* Clean up excess savestates if necessary */
-               if (savestate_auto_index && (savestate_max_keep > 0))
+               /* Clean up excess savestates if necessary: not for a
+                * save that was turned away, which wrote nothing */
+               if (     queued
+                     && savestate_auto_index && (savestate_max_keep > 0))
                   command_event_set_savestate_garbage_collect(settings);
 
                if (frame_time_counter_auto_reset)
                   video_st->frame_time_count = 0;
 
-               ret      = true;
+               /* false for a save turned away, so the caller can take
+                * back the slot it advanced for it */
+               ret      = queued;
             }
             break;
          case CMD_EVENT_LOAD_STATE:
@@ -7263,6 +7501,12 @@ bool command_event_main_state(unsigned cmd)
                   command_post_state_loaded();
                   ret = true;
                }
+               /* Turned away (the hold behind the state task in flight
+                * is full) or not begun: said, rather than nothing */
+               else if (cmd == CMD_EVENT_LOAD_STATE)
+                  _len = strlcpy(msg,
+                        msg_hash_to_str(MSG_FAILED_TO_LOAD_STATE),
+                        sizeof(msg));
             }
             break;
         case CMD_EVENT_UNDO_LOAD_STATE:
@@ -7365,7 +7609,8 @@ static void command_reinit_snapshot_cb(void *userdata,
    if (!*ctx->buf_p)
       return;
 
-   memcpy(*ctx->buf_p, data, want);
+   if (*ctx->buf_p != data)
+      memcpy(*ctx->buf_p, data, want);
    ctx->dims = dims;
    ctx->p    = pitch;
    ctx->size = want;
@@ -7444,6 +7689,7 @@ bool command_event_reinit(const int flags)
 
 
 
+   if (flags & DRIVER_VIDEO_AND_INPUT_MASK)
    {
       struct command_reinit_snapshot_ctx ctx;
       ctx.buf_p = &cached_snapshot;

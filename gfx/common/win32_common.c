@@ -109,6 +109,7 @@ typedef char win32_dwm_timing_info_size_check[
 #include <features/features_cpu.h>
 #ifdef HAVE_THREADS
 #include <rthreads/rthreads.h>
+#include <rthreads/retro_eventcount.h>
 #endif
 #ifdef HAVE_DYLIB
 #include <dynamic/dylib.h>
@@ -275,99 +276,272 @@ typedef REASON_CONTEXT POWER_REQUEST_CONTEXT, *PPOWER_REQUEST_CONTEXT, *LPPOWER_
 #define MIN_HEIGHT 240
 
 #ifdef HAVE_D3DKMT
-static d3dkmt_adapter_t d3dkmt_adapter;
+/* The adapter and VidPn source of the monitor the window is on, under
+ * a seqlock: the window's thread rebinds them (win32_d3dkmt_follow),
+ * and the video and main threads read them. */
+static HMONITOR d3dkmt_monitor;
+static retro_atomic_int_t d3dkmt_seq     = RETRO_ATOMIC_INT_INITIALIZER(0);
+static retro_atomic_int_t d3dkmt_adapter = RETRO_ATOMIC_INT_INITIALIZER(0);
+static retro_atomic_int_t d3dkmt_source  = RETRO_ATOMIC_INT_INITIALIZER(0);
 
-static void d3dkmt_init(void)
+static bool d3dkmt_bound(D3DKMT_HANDLE *adapter, UINT *source)
 {
-   if (!pD3DKMTOpenAdapterFromHdc)
+   for (;;)
    {
-      unsigned d3dkmt_adapter_hAdapter = 0;
-      unsigned d3dkmt_adapter_VidPnSourceId = 0;
-      unsigned adapter_index = 0;
-      DISPLAY_DEVICE add;
+      int seq = retro_atomic_load_acquire_int(&d3dkmt_seq);
+      if (seq & 1)
+         continue;
+      *adapter = (D3DKMT_HANDLE)retro_atomic_load_relaxed_int(&d3dkmt_adapter);
+      *source  = (UINT)retro_atomic_load_relaxed_int(&d3dkmt_source);
+      retro_atomic_thread_fence_acquire();
+      if (retro_atomic_load_relaxed_int(&d3dkmt_seq) == seq)
+         break;
+   }
+   return *adapter != 0;
+}
 
-      add.cb = sizeof(add);
-
-      pD3DKMTOpenAdapterFromHdc = (D3DKMTOPENADAPTERFROMHDC)
-            GetProcAddress(GetModuleHandle("gdi32.dll"), "D3DKMTOpenAdapterFromHdc");
-      pD3DKMTGetScanLine = (D3DKMTGETSCANLINE)
-            GetProcAddress(GetModuleHandle("gdi32.dll"), "D3DKMTGetScanLine");
-      /* Optional: only the phase anchor depends on it, and
-       * d3dkmt_wait_vblank() reports its absence so the caller can
-       * fall back. Not part of the guard below for that reason. */
-      pD3DKMTWaitForVerticalBlankEvent = (D3DKMTWAITFORVERTICALBLANKEVENT)
-            GetProcAddress(GetModuleHandle("gdi32.dll"),
-                  "D3DKMTWaitForVerticalBlankEvent");
-
-      /* Both exports are WDDM, so they are absent under XDDM - there
-       * are no D3DKMT entry points in gdi32 before Vista at all.
-       * pD3DKMTGetScanLine is null-checked at its two use sites;
-       * pD3DKMTOpenAdapterFromHdc was not, and it is called inside the
-       * loop below, so a missing export was a call through NULL on the
-       * first display device. Leave the scanline state zeroed and let
-       * d3dkmt_scanline_get() report -1, which
-       * video_driver_scanline_after_frame() treats as unsupported. */
-      if (!pD3DKMTOpenAdapterFromHdc || !pD3DKMTGetScanLine)
+static bool d3dkmt_open(const char *device, D3DKMT_HANDLE *adapter,
+      UINT *source)
+{
+   bool ret = false;
+   HDC hdc  = CreateDC(NULL, device, NULL, NULL);
+   if (hdc)
+   {
+      D3DKMT_OPENADAPTERFROMHDC desc;
+      desc.hDc                  = hdc;
+      desc.hAdapter             = 0;
+      desc.AdapterLuid.LowPart  = 0;
+      desc.AdapterLuid.HighPart = 0;
+      desc.VidPnSourceId        = 0;
+      if (     pD3DKMTOpenAdapterFromHdc(&desc) == STATUS_SUCCESS
+            && desc.hAdapter)
       {
-         memset(&d3dkmt_adapter, 0, sizeof(d3dkmt_adapter_t));
-         return;
+         *adapter = desc.hAdapter;
+         *source  = desc.VidPnSourceId;
+         ret      = true;
       }
+      DeleteDC(hdc);
+   }
+   return ret;
+}
 
-      while (EnumDisplayDevices(NULL, adapter_index, &add, 0))
+static void d3dkmt_bind(D3DKMT_HANDLE adapter, UINT source)
+{
+   int seq           = retro_atomic_load_relaxed_int(&d3dkmt_seq);
+   D3DKMT_HANDLE old = (D3DKMT_HANDLE)
+      retro_atomic_load_relaxed_int(&d3dkmt_adapter);
+   retro_atomic_store_relaxed_int(&d3dkmt_seq, seq + 1);
+   retro_atomic_thread_fence_release();
+   retro_atomic_store_relaxed_int(&d3dkmt_adapter, (int)adapter);
+   retro_atomic_store_relaxed_int(&d3dkmt_source, (int)source);
+   retro_atomic_thread_fence_release();
+   retro_atomic_store_release_int(&d3dkmt_seq, seq + 2);
+   /* A call still in flight on the old handle fails or completes */
+   if (old && pD3DKMTCloseAdapter)
+   {
+      D3DKMT_CLOSEADAPTER close_data;
+      close_data.hAdapter = old;
+      pD3DKMTCloseAdapter(&close_data);
+   }
+}
+
+/* Without a monitor to follow: the first display device that opens */
+static void d3dkmt_bind_first(void)
+{
+   unsigned i;
+   DISPLAY_DEVICE add;
+   add.cb = sizeof(add);
+   for (i = 0; EnumDisplayDevices(NULL, i, &add, 0); i++)
+   {
+      D3DKMT_HANDLE adapter = 0;
+      UINT source           = 0;
+      if (d3dkmt_open(add.DeviceName, &adapter, &source))
       {
-         HDC hdc = CreateDC(NULL, add.DeviceName, NULL, NULL);
-         if (hdc != NULL)
-         {
-            D3DKMT_OPENADAPTERFROMHDC OpenAdapterData = {0};
-            OpenAdapterData.hDc = hdc;
-            if (pD3DKMTOpenAdapterFromHdc(&OpenAdapterData) == STATUS_SUCCESS)
-            {
-               d3dkmt_adapter_hAdapter      = OpenAdapterData.hAdapter;
-               d3dkmt_adapter_VidPnSourceId = OpenAdapterData.VidPnSourceId;
-            }
-            DeleteDC(hdc);
-
-            if (d3dkmt_adapter_hAdapter)
-               break;
-         }
-         adapter_index++;
-      }
-
-      memset(&d3dkmt_adapter, 0, sizeof(d3dkmt_adapter_t));
-
-      if (pD3DKMTGetScanLine)
-      {
-         D3DKMT_GETSCANLINE sl = {0};
-         sl.hAdapter           = d3dkmt_adapter_hAdapter;
-         sl.VidPnSourceId      = d3dkmt_adapter_VidPnSourceId;
-         d3dkmt_adapter.sl     = sl;
-      }
-
-      {
-         D3DKMT_WAITFORVERTICALBLANKEVENT vb = {0};
-         vb.hAdapter           = d3dkmt_adapter_hAdapter;
-         vb.VidPnSourceId      = d3dkmt_adapter_VidPnSourceId;
-         /* hDevice is documented optional and is not needed to wait on
-          * a VidPn source. */
-         d3dkmt_adapter.vb     = vb;
+         d3dkmt_bind(adapter, source);
+         break;
       }
    }
 }
 
-bool d3dkmt_wait_vblank(void)
+void win32_d3dkmt_follow(HWND hwnd, bool force)
 {
-   if (!pD3DKMTWaitForVerticalBlankEvent || !d3dkmt_adapter.vb.hAdapter)
-      return false;
-   return (pD3DKMTWaitForVerticalBlankEvent(&d3dkmt_adapter.vb)
-         == STATUS_SUCCESS);
+   MONITORINFOEX info;
+   D3DKMT_HANDLE adapter = 0;
+   UINT source           = 0;
+   HMONITOR mon          = hwnd
+      ? MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) : NULL;
+   /* Both exports are WDDM, absent under XDDM: nothing is bound, and
+    * d3dkmt_scanline_get() reports -1. */
+   if (     !pD3DKMTOpenAdapterFromHdc
+         || !mon
+         || (mon == d3dkmt_monitor && !force))
+      return;
+   /* Whether or not it opens: a window being dragged asks on every
+    * move */
+   d3dkmt_monitor = mon;
+   memset(&info, 0, sizeof(info));
+   info.cbSize    = sizeof(MONITORINFOEX);
+   if (     GetMonitorInfo(mon, (LPMONITORINFO)&info)
+         && d3dkmt_open(info.szDevice, &adapter, &source))
+      d3dkmt_bind(adapter, source);
+}
+
+static void d3dkmt_init(void)
+{
+   D3DKMT_HANDLE adapter;
+   UINT source;
+   if (!pD3DKMTOpenAdapterFromHdc)
+   {
+      HMODULE gdi32 = GetModuleHandle("gdi32.dll");
+      pD3DKMTOpenAdapterFromHdc = (D3DKMTOPENADAPTERFROMHDC)
+            GetProcAddress(gdi32, "D3DKMTOpenAdapterFromHdc");
+      pD3DKMTGetScanLine = (D3DKMTGETSCANLINE)
+            GetProcAddress(gdi32, "D3DKMTGetScanLine");
+      /* Optional: d3dkmt_vblank_wait() reports its absence so the
+       * caller can fall back, and an adapter left open is only that. */
+      pD3DKMTWaitForVerticalBlankEvent = (D3DKMTWAITFORVERTICALBLANKEVENT)
+            GetProcAddress(gdi32, "D3DKMTWaitForVerticalBlankEvent");
+      pD3DKMTCloseAdapter = (D3DKMTCLOSEADAPTER)
+            GetProcAddress(gdi32, "D3DKMTCloseAdapter");
+      if (!pD3DKMTGetScanLine)
+         pD3DKMTOpenAdapterFromHdc = NULL;
+   }
+   /* Until a window says which monitor it is on */
+   if (pD3DKMTOpenAdapterFromHdc && !d3dkmt_bound(&adapter, &source))
+      d3dkmt_bind_first();
+}
+
+#ifdef HAVE_THREADS
+/* The vblank clock. D3DKMTWaitForVerticalBlankEvent takes no timeout
+ * and cannot be interrupted, so a thread of its own waits on it and
+ * counts for d3dkmt_vblank_wait(). It parks once nobody has asked for
+ * D3DKMT_VBLANK_IDLE vblanks and while the wait fails, and is never
+ * joined. */
+#define D3DKMT_VBLANK_IDLE 256
+static retro_eventcount_t d3dkmt_vb_tick;
+static retro_eventcount_t d3dkmt_vb_wake;
+static retro_atomic_int_t d3dkmt_vb_count   = RETRO_ATOMIC_INT_INITIALIZER(0);
+/* low 32 bits of the latest one's time */
+static retro_atomic_int_t d3dkmt_vb_at      = RETRO_ATOMIC_INT_INITIALIZER(0);
+static retro_atomic_int_t d3dkmt_vb_asked   = RETRO_ATOMIC_INT_INITIALIZER(0);
+static retro_atomic_int_t d3dkmt_vb_ticking = RETRO_ATOMIC_INT_INITIALIZER(0);
+/* The caller's: 0 not started, 1 running, -1 cannot */
+static int d3dkmt_vb_state;
+
+static void d3dkmt_vblank_thread(void *userdata)
+{
+   unsigned idle  = 0;
+   unsigned quick = 0;
+   (void)userdata;
+   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+   for (;;)
+   {
+      int key;
+      D3DKMT_WAITFORVERTICALBLANKEVENT vb;
+      if (retro_atomic_exchange_int(&d3dkmt_vb_asked, 0))
+         idle = 0;
+      if (     idle++ < D3DKMT_VBLANK_IDLE
+            && d3dkmt_bound(&vb.hAdapter, &vb.VidPnSourceId))
+      {
+         retro_time_t before = cpu_features_get_time_usec();
+         /* hDevice is documented optional and is not needed to wait
+          * on a VidPn source. */
+         vb.hDevice = 0;
+         if (pD3DKMTWaitForVerticalBlankEvent(&vb) == STATUS_SUCCESS)
+         {
+            retro_time_t now = cpu_features_get_time_usec();
+            int n            = (int)((unsigned)
+               retro_atomic_load_relaxed_int(&d3dkmt_vb_count) + 1u);
+            /* Called just ahead of a vblank it comes straight back
+             * once; one that keeps doing so is not waiting at all */
+            quick            = (now - before < 200) ? quick + 1 : 0;
+            if (quick < 2)
+            {
+               retro_atomic_store_release_int(&d3dkmt_vb_at,
+                     (int)(uint32_t)now);
+               retro_atomic_store_release_int(&d3dkmt_vb_count,
+                     n ? n : 1);
+               retro_atomic_store_release_int(&d3dkmt_vb_ticking, 1);
+               retro_eventcount_notify(&d3dkmt_vb_tick);
+               continue;
+            }
+         }
+      }
+      retro_atomic_store_release_int(&d3dkmt_vb_ticking, 0);
+      retro_eventcount_notify(&d3dkmt_vb_tick);
+      key = retro_eventcount_prepare_wait(&d3dkmt_vb_wake);
+      if (retro_atomic_load_acquire_int(&d3dkmt_vb_asked))
+         retro_eventcount_cancel_wait(&d3dkmt_vb_wake);
+      else
+         retro_eventcount_commit_wait(&d3dkmt_vb_wake, key);
+      idle  = 0;
+      quick = 0;
+   }
+}
+#endif
+
+unsigned d3dkmt_vblank_wait(unsigned seen, unsigned timeout_us,
+      retro_time_t *at)
+{
+#ifdef HAVE_THREADS
+   unsigned n;
+   retro_time_t now, end;
+   if (d3dkmt_vb_state <= 0)
+   {
+      sthread_t *thread;
+      if (d3dkmt_vb_state < 0 || !pD3DKMTWaitForVerticalBlankEvent)
+         return 0;
+      d3dkmt_vb_state = -1;
+      if (     !retro_eventcount_init(&d3dkmt_vb_tick)
+            || !retro_eventcount_init(&d3dkmt_vb_wake)
+            || !(thread = sthread_create(d3dkmt_vblank_thread, NULL)))
+         return 0;
+      sthread_detach(thread);
+      d3dkmt_vb_state = 1;
+   }
+   if (!retro_atomic_load_relaxed_int(&d3dkmt_vb_asked))
+   {
+      retro_atomic_store_release_int(&d3dkmt_vb_asked, 1);
+      retro_eventcount_notify(&d3dkmt_vb_wake);
+   }
+   now = cpu_features_get_time_usec();
+   end = now + timeout_us;
+   for (;;)
+   {
+      int key = retro_eventcount_prepare_wait(&d3dkmt_vb_tick);
+      if (!retro_atomic_load_acquire_int(&d3dkmt_vb_ticking))
+      {
+         retro_eventcount_cancel_wait(&d3dkmt_vb_tick);
+         return 0;
+      }
+      n = (unsigned)retro_atomic_load_acquire_int(&d3dkmt_vb_count);
+      if (n != seen || now >= end)
+      {
+         retro_eventcount_cancel_wait(&d3dkmt_vb_tick);
+         break;
+      }
+      retro_eventcount_commit_wait_timeout(&d3dkmt_vb_tick, key, end - now);
+      now = cpu_features_get_time_usec();
+   }
+   now = cpu_features_get_time_usec();
+   *at = now - (retro_time_t)(uint32_t)((uint32_t)now
+         - (uint32_t)retro_atomic_load_acquire_int(&d3dkmt_vb_at));
+   return n;
+#else
+   return 0;
+#endif
 }
 
 int d3dkmt_scanline_get(void)
 {
-   if (pD3DKMTGetScanLine)
+   D3DKMT_GETSCANLINE sl;
+   if (     pD3DKMTGetScanLine
+         && d3dkmt_bound(&sl.hAdapter, &sl.VidPnSourceId))
    {
-      if (pD3DKMTGetScanLine(&d3dkmt_adapter.sl) == STATUS_SUCCESS)
-         return d3dkmt_adapter.sl.ScanLine;
+      sl.InVerticalBlank = FALSE;
+      sl.ScanLine        = 0;
+      if (pD3DKMTGetScanLine(&sl) == STATUS_SUCCESS)
+         return sl.ScanLine;
    }
    return -1;
 }
@@ -677,11 +851,9 @@ static void win32_save_position(void)
       {
          bool ui_menubar_enable                     = settings->bools.ui_menubar_enable;
          bool window_show_decor                     = settings->bools.video_window_show_decorations;
-         unsigned win_w                             =
-               VIDEO_SCALE_W(g_win32->pos_dims);
-         unsigned win_h                             =
-               VIDEO_SCALE_H(g_win32->pos_dims);
-         settings->uints.window_position_pos        = g_win32->pos;
+         unsigned win_w                             = VIDEO_SCALE_W(g_win32->pos_dims);
+         unsigned win_h                             = VIDEO_SCALE_H(g_win32->pos_dims);
+
          /* The frame the window reports includes whatever chrome it
           * is wearing; the setting holds the client area, so take the
           * chrome off both axes before the pair is stored. */
@@ -695,11 +867,12 @@ static void win32_save_position(void)
          }
          if (ui_menubar_enable)
          {
-            int menu_bar_height   = GetSystemMetrics(SM_CYMENU);
+            int menu_bar_height                     = GetSystemMetrics(SM_CYMENU);
             win_h                                  -= menu_bar_height;
          }
-         settings->uints.window_position_dims       =
-               VIDEO_SCALE_PACK(win_w, win_h);
+
+         settings->uints.window_position_pos        = g_win32->pos;
+         settings->uints.window_position_dims       = VIDEO_SCALE_PACK(win_w, win_h);
       }
    }
 }
@@ -992,7 +1165,7 @@ static LRESULT CALLBACK wnd_proc_common(
              * WM_CHAR and WM_KEYDOWN properly.
              */
             input_keyboard_event(true, RETROK_UNKNOWN,
-                  wparam, mod, RETRO_DEVICE_KEYBOARD);
+                  (uint32_t)wparam, mod, RETRO_DEVICE_KEYBOARD);
          }
          return TRUE;
       case WM_CLOSE:
@@ -1006,6 +1179,9 @@ static LRESULT CALLBACK wnd_proc_common(
          /* fall-through */
       case WM_MOVE:
          win32_save_position();
+#ifdef HAVE_D3DKMT
+         win32_d3dkmt_follow(hwnd, false);
+#endif
          /* It may be on another monitor now */
          video_driver_window_output_changed();
          break;
@@ -1137,6 +1313,10 @@ static LRESULT CALLBACK wnd_proc_common(
                             | MENU_ST_FLAG_PREVENT_POPULATE;
 #endif
                      }
+#ifdef HAVE_CORE_LOAD_CHECK
+                     else
+                        task_content_park_core_load(td->path);
+#endif
                      break;
                   case WIN32_BROWSER_MODE_LOAD_CONTENT:
                      win32_load_content_from_gui(td->path);
@@ -1450,6 +1630,9 @@ static LRESULT win32_wnd_proc_route(HWND hwnd,
       HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
       if (mon)
          win32_resize_after_display_change(hwnd, mon);
+#ifdef HAVE_D3DKMT
+      win32_d3dkmt_follow(hwnd, true);
+#endif
       video_driver_window_output_changed();
    }
 
@@ -2080,6 +2263,9 @@ static bool win32_window_create(void *data, unsigned style,
    }
    if (!main_window.hwnd)
       return false;
+#ifdef HAVE_D3DKMT
+   win32_d3dkmt_follow(main_window.hwnd, false);
+#endif
 
    window_accelerators = win32_resources_get_accelerator();
 
@@ -2154,8 +2340,10 @@ void win32_check_window(void *data,
    if (g_win32_flags & WIN32_CMN_FLAG_RESIZED)
    {
       *resize             = true;
-      *dims              = VIDEO_SCALE_PACK(g_win32_resize_width, g_win32_resize_height);
+      *dims               = VIDEO_SCALE_PACK(g_win32_resize_width, g_win32_resize_height);
       g_win32_flags      &= ~WIN32_CMN_FLAG_RESIZED;
+      /* Save the current position and size if set so. */
+      win32_save_position();
    }
 }
 #endif
@@ -2235,37 +2423,50 @@ bool win32_has_focus(void *data)
 {
    settings_t *settings           = config_get_ptr();
 
-   /* Ensure window size is big enough for core geometry. */
+   /* Apply/enforce windowed mode size. */
    if (      settings
-         && !settings->bools.video_fullscreen
-         && !settings->bools.video_window_save_positions)
+         && !settings->bools.video_fullscreen)
    {
-      unsigned extra_width        = 0;
-      unsigned extra_height       = 0;
-      unsigned min_width          = 0;
-      unsigned min_height         = 0;
+      bool window_save_positions = settings->bools.video_window_save_positions;
+      unsigned extra_w           = 0;
+      unsigned extra_h           = 0;
+      unsigned win_w             = 0;
+      unsigned win_h             = 0;
 
-      win32_get_av_info_geometry(&min_width, &min_height);
+      /* Follow windowed mode size options in realtime when remembering position. */
+      if (window_save_positions)
+      {
+         win_w = VIDEO_SCALE_W(settings->uints.window_position_dims);
+         win_h = VIDEO_SCALE_H(settings->uints.window_position_dims);
+      }
+      /* Ensure window size is big enough for core geometry. */
+      else
+         win32_get_av_info_geometry(&win_w, &win_h);
 
       if (settings->bools.video_window_show_decorations)
       {
          int border_thickness     = GetSystemMetrics(SM_CXSIZEFRAME);
          int title_bar_height     = GetSystemMetrics(SM_CYCAPTION);
 
-         extra_width             += border_thickness * 2;
-         extra_height            += border_thickness * 2 + title_bar_height;
+         extra_w                 += border_thickness * 2;
+         extra_h                 += border_thickness * 2 + title_bar_height;
       }
 
       if (settings->bools.ui_menubar_enable)
-         extra_height            += GetSystemMetrics(SM_CYMENU);
+         extra_h                 += GetSystemMetrics(SM_CYMENU);
 
-      if (     (     g_win32_resize_width  < min_width
-                  || g_win32_resize_height < min_height)
-            && min_width  - g_win32_resize_width  < MIN_WIDTH  / 1.5f
-            && min_height - g_win32_resize_height < MIN_HEIGHT / 1.5f)
+      if (     (  window_save_positions
+               && (  win_w != g_win32_resize_width
+                  || win_h != g_win32_resize_height))
+            || (  !window_save_positions
+               && (  win_w > g_win32_resize_width
+                  || win_h > g_win32_resize_height)
+               && win_w - g_win32_resize_width  < MIN_WIDTH  / 1.5f
+               && win_h - g_win32_resize_height < MIN_HEIGHT / 1.5f)
+         )
          SetWindowPos(main_window.hwnd, NULL, 0, 0,
-               min_width  + extra_width,
-               min_height + extra_height,
+               win_w + extra_w,
+               win_h + extra_h,
                SWP_NOMOVE);
    }
 
@@ -2439,7 +2640,7 @@ bool win32_set_style(MONITORINFOEX *current_mon, HMONITOR *hm_to_use,
    {
       win32_common_state_t *g_win32    = (win32_common_state_t*)&win32_st;
       bool position_set_from_config    = false;
-      bool video_window_save_positions = settings->bools.video_window_save_positions;
+      bool window_save_positions       = settings->bools.video_window_save_positions;
       bool window_show_decor           = settings->bools.video_window_show_decorations;
 
       *style          = WS_OVERLAPPEDWINDOW | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
@@ -2454,18 +2655,15 @@ bool win32_set_style(MONITORINFOEX *current_mon, HMONITOR *hm_to_use,
 
       AdjustWindowRect(rect, *style, FALSE);
 
-      if (video_window_save_positions)
+      if (window_save_positions)
       {
          /* Set position from config */
          int border_thickness             = window_show_decor ? GetSystemMetrics(SM_CXSIZEFRAME) : 0;
          int title_bar_height             = window_show_decor ? GetSystemMetrics(SM_CYCAPTION) : 0;
-         unsigned window_position_width   =
-               VIDEO_SCALE_W(settings->uints.window_position_dims);
-         unsigned window_position_height  =
-               VIDEO_SCALE_H(settings->uints.window_position_dims);
+         unsigned window_position_width   = VIDEO_SCALE_W(settings->uints.window_position_dims);
+         unsigned window_position_height  = VIDEO_SCALE_H(settings->uints.window_position_dims);
 
-         g_win32->pos                     =
-               settings->uints.window_position_pos;
+         g_win32->pos                     = settings->uints.window_position_pos;
          g_win32->pos_set                 = true;
          g_win32->pos_dims                = VIDEO_SCALE_PACK(
                window_position_width  + border_thickness * 2,

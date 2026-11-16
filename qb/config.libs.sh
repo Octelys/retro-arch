@@ -313,7 +313,7 @@ if [ "$OS" = 'Darwin' ]; then
    #   * HAVE_VULKAN is forced on alongside it. Link-time libvulkan is
    #     not required on Darwin; MoltenVK is loaded dynamically at
    #     runtime by gfx/common/vulkan_common.c.
-   # Skip the force-on on pre-10.7 targets — Metal is 10.11+ and
+   # Skip the force-on on pre-10.7 targets â€” Metal is 10.11+ and
    # MoltenVK is 10.11+, so neither is buildable on Tiger/Leopard.
    if [ "$macos_target_pre_10_7" = 'no' ]; then
       [ "${USER_METAL:-}"  != 'no' ] && HAVE_METAL=yes
@@ -578,6 +578,10 @@ check_val '' FLAC '-lFLAC' '' flac '' '' false
 
 check_enabled SSL RETROSSL 'retro ssl' 'ssl is' false
 check_enabled CRYPTO RETROSSL 'retro ssl' 'crypto is' false
+check_enabled DYNAMIC CORE_SIGNATURES 'core signatures' 'dynamic loading is' false
+check_enabled CRYPTO CORE_SIGNATURES 'core signatures' 'crypto is' false
+check_enabled CORE_SIGNATURES CORE_LOAD_CHECK 'core load check' 'core signatures is' false
+check_enabled CORE_SIGNATURES CORE_SIGNING_TEST_KEY 'core signing test key' 'core signatures is' false
 check_enabled SSL MBEDTLS 'system mbedtls' 'ssl is' false
 check_enabled SSL BEARSSL 'system bearssl' 'ssl is' false
 
@@ -830,12 +834,13 @@ if [ "$HAVE_X11" != 'no' ]; then
 
    check_val '' XEXT -lXext '' xext '' '' false
    check_val '' XF86VM -lXxf86vm '' xxf86vm '' '' false
-   check_val '' XSCRNSAVER -lXss '' xscrnsaver '' '' false
    check_val '' XI2 -lXi '' xi '' '' false
 else
    die : 'Notice: X11 not present. Skipping X11 code paths.'
 fi
 
+check_enabled X11 XSCRNSAVER XScrnSaver 'X11 is' true
+check_enabled DYLIB XSCRNSAVER XScrnSaver 'Dynamic loading is' true
 check_enabled X11 XINERAMA Xinerama 'Xinerama is' false
 check_enabled X11 XSHM XShm 'XShm is' false
 check_enabled X11 XRANDR Xrandr 'Xrandr is' false
@@ -921,6 +926,14 @@ elif [ "$HAVE_VULKAN" != "no" ] && [ "$OS" = 'Darwin' ]; then
 else
    check_lib '' VULKAN -lvulkan vkCreateInstance
 fi
+
+check_platform Linux VAAPI 'VA-API' true
+check_enabled VULKAN VAAPI 'VA-API' 'Vulkan is' false
+check_enabled RMP4 VAAPI 'VA-API' 'RMP4 is' false
+check_enabled THREADS VAAPI 'VA-API' 'Threads are' false
+check_enabled 'DYLIB DYNAMIC' VAAPI 'VA-API' 'Dynamic loading is' false
+check_header '' VAAPI va/va.h va/va_dec_hevc.h va/va_drmcommon.h
+check_macro VAAPI VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 va/va_drmcommon.h
 
 check_platform Linux OPENXR 'OpenXR is' true
 check_enabled 'VULKAN OPENGL OPENGL_CORE' OPENXR OpenXR 'Vulkan and OpenGL are' false
@@ -1049,19 +1062,19 @@ HAVE_CRTSWITCHRES="$HAVE_MODELINE"
 
 check_enabled SLANG GLSLANG glslang 'slang is' false
 check_enabled SLANG SPIRV_CROSS SPIRV-Cross 'slang is' false
-check_enabled SLANG OPENGL_CORE 'OpenGL core' 'slang is' false
+check_enabled 'SLANG GLSL' OPENGL_CORE 'OpenGL core' 'slang and GLSL are' false
 check_enabled SLANG VULKAN vulkan 'slang is' false
 check_enabled SLANG METAL metal 'slang is' false
 
 check_enabled 'GLSLANG RSLC' SLANG slang 'glslang is' false
 check_enabled GLSLANG SPIRV_CROSS SPIRV-Cross 'glslang is' false
-check_enabled 'GLSLANG RSLC' OPENGL_CORE 'OpenGL core' 'glslang is' false
+check_enabled 'GLSLANG RSLC GLSL' OPENGL_CORE 'OpenGL core' 'glslang and GLSL are' false
 check_enabled 'GLSLANG RSLC' VULKAN vulkan 'glslang is' false
 check_enabled 'GLSLANG RSLC' METAL metal 'glslang is' false
 
 check_enabled 'SPIRV_CROSS RSLC' SLANG slang 'SPIRV-Cross is' false
 check_enabled SPIRV_CROSS GLSLANG glslang 'SPIRV-Cross is' false
-check_enabled 'SPIRV_CROSS RSLC' OPENGL_CORE 'OpenGL core' 'SPIRV-Cross is' false
+check_enabled 'SPIRV_CROSS RSLC GLSL' OPENGL_CORE 'OpenGL core' 'SPIRV-Cross and GLSL are' false
 check_enabled 'SPIRV_CROSS RSLC' VULKAN vulkan 'SPIRV-Cross is' false
 check_enabled 'SPIRV_CROSS RSLC' METAL metal 'SPIRV-Cross is' false
 
@@ -1076,6 +1089,15 @@ add_define MAKEFILE OS "$OS"
 if [ "$ARCHITECTURE_NAME" = 'Power Macintosh' ]; then
    HAVE_LANGEXTRA='no'
 fi
+
+# glcore needs a GL 3.2 core context, which no PowerPC Mac OS X has
+# (Leopard stops at GL 2.1). Without slang it was dropped before GLSL
+# could keep it; this keeps it off there, native or cross-built.
+case "$ARCHITECTURE_NAME:${CROSS_COMPILE:-}" in
+   'Power Macintosh:'*|*:powerpc*-apple-darwin*)
+      HAVE_OPENGL_CORE='no'
+      ;;
+esac
 
 if [ "$HAVE_DEBUG" = 'yes' ]; then
    add_define MAKEFILE DEBUG 1
@@ -1102,6 +1124,21 @@ fi
 
 check_enabled NETWORKING RETRONFS 'built-in NFS client' 'Networking is' false
 if [ "$HAVE_RETRONFS" = 'auto' ]; then HAVE_RETRONFS=yes; fi
+
+check_enabled NETWORKING RTMP 'RTMP publishing' 'Networking is' false
+check_enabled CRYPTO RTMP 'RTMP publishing' 'crypto is' false
+if [ "$HAVE_RTMP" = 'auto' ]; then
+   HAVE_RTMP=no
+   if [ "$OS" = 'Darwin' ] && [ "$HAVE_METAL" = 'yes' ] && \
+      [ "$HAVE_AVF" = 'yes' ] && [ "$HAVE_THREADS" = 'yes' ] && \
+      [ "$HAVE_CONFIGFILE" = 'yes' ]; then
+      HAVE_RTMP=yes
+   fi
+fi
+if [ "$HAVE_RFLV" = 'auto' ]; then
+   HAVE_RFLV=no
+   [ "$HAVE_RTMP" = 'yes' ] && HAVE_RFLV=yes
+fi
 
 # The built-in client is used unless a system libsmb2 was asked for
 # (--enable-libsmb, or --enable-smbclient); nothing is bundled any more,

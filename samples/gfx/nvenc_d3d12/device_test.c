@@ -2,6 +2,35 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+#ifdef NVENC_TEST_STREAM
+#include <net/net_socket.h>
+#include <net/net_socket_ssl.h>
+static char *nve_stream_ca;
+static bool nve_stream_trust(void)
+{
+   const char *path = getenv("RTMPS_CA");
+   FILE *file;
+   long size;
+   bool ok;
+   if (!path)
+      return true;
+   file = fopen(path, "rb");
+   if (!file)
+      return false;
+   ok = !fseek(file, 0, SEEK_END) && (size = ftell(file)) > 0
+      && size < 65536 && !fseek(file, 0, SEEK_SET);
+   if (ok)
+   {
+      nve_stream_ca = (char*)malloc((size_t)size);
+      ok = nve_stream_ca && fread(nve_stream_ca, 1, (size_t)size, file) == (size_t)size;
+      if (ok)
+         ssl_socket_retro_set_trust_pem(nve_stream_ca, (size_t)size);
+   }
+   fclose(file);
+   return ok;
+}
+#endif
 #include "../../../gfx/common/nvenc_d3d12.h"
 #include "../../../record/record_gpu_queue.h"
 #include "../../../record/record_gpu_capture_d3d12.h"
@@ -384,7 +413,7 @@ int main(int argc, char **argv)
    ID3D12CommandAllocator *allocator = NULL;
    ID3D12GraphicsCommandList *commands = NULL;
    ID3D12Fence *ready = NULL;
-   ID3D12Resource *upload[4] = {0}, *textures[4] = {0};
+   static ID3D12Resource *upload[NVENC_D3D12_SLOTS], *textures[NVENC_D3D12_SLOTS];
    D3D12_COMMAND_QUEUE_DESC qdesc = {0};
    D3D12_HEAP_PROPERTIES heap = {0};
    D3D12_RESOURCE_DESC desc = {0};
@@ -407,10 +436,19 @@ int main(int argc, char **argv)
    unsigned i, x, y, received = 0, idle = 0;
    int status, ok = 0;
    uint64_t value = 0;
-   unsigned format, metadata, capturing, source_w, source_h;
+   unsigned format, metadata, capturing, source_w, source_h, slots = 4;
+   const char *slot_request = getenv("NVENC_TEST_SLOTS");
    HMODULE runtime;
    memset(&config, 0, sizeof(config));
    if ((argc < 4 || argc > 8)) { puts("usage: device_test codec format output [color [full_range [metadata [capture]]]]"); return 1; }
+   if (slot_request)
+   {
+      char *end;
+      unsigned long requested = strtoul(slot_request, &end, 10);
+      if (!*slot_request || *end || requested < 4 || requested > NVENC_D3D12_SLOTS)
+         return 1;
+      slots = (unsigned)requested;
+   }
    capturing = argc > 7 ? (unsigned)atoi(argv[7]) : 0;
    if (capturing > 2) return 1;
    metadata = argc > 6 ? (unsigned)atoi(argv[6]) : 0;
@@ -424,16 +462,19 @@ int main(int argc, char **argv)
    FreeLibrary(runtime);
    if (FAILED(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void**)&device)))
       return 77;
+#ifdef NVENC_TEST_STREAM
+   CHECK(nve_stream_trust());
+#endif
    CHECK(SUCCEEDED(ID3D12Device_CreateCommandQueue(device, &qdesc, &IID_ID3D12CommandQueue, (void**)&queue)));
    CHECK(SUCCEEDED(ID3D12Device_CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT,
             &IID_ID3D12CommandAllocator, (void**)&allocator)));
    CHECK(SUCCEEDED(ID3D12Device_CreateCommandList(device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT,
             allocator, NULL, &IID_ID3D12GraphicsCommandList, (void**)&commands)));
    CHECK(SUCCEEDED(ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&ready)));
-   config.device = device; config.slots = 4; config.width = W; config.height = H;
+   config.device = device; config.slots = slots; config.width = W; config.height = H;
    config.fps_num = 60; config.fps_den = 1; config.bitrate = 8000000;
    config.format = (enum nvenc_d3d12_format)format; config.codec = (enum nvenc_d3d12_codec)atoi(argv[1]);
-   for (i = 0; i < 4; i++)
+   for (i = 0; i < config.slots; i++)
    {
       D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[2];
       D3D12_TEXTURE_COPY_LOCATION source = {0}, target = {0};
@@ -469,7 +510,7 @@ int main(int argc, char **argv)
                if (format == NVENC_D3D12_BGRA8)
                {
                   p += x * 4;
-                  p[0] = (uint8_t)(24 + i * 48); p[1] = (uint8_t)(32 + ((x >= 8 && capturing ? x - 8 : x) / 40) * 24);
+                  p[0] = (uint8_t)(24 + (i % 4) * 48); p[1] = (uint8_t)(32 + ((x >= 8 && capturing ? x - 8 : x) / 40) * 24);
                   p[2] = (uint8_t)(32 + ((y >= 8 && capturing ? y - 8 : y) / 24) * 24); p[3] = 255;
                   if (capturing == 1)
                   {
@@ -478,7 +519,7 @@ int main(int argc, char **argv)
                }
                else
                {
-                  unsigned sample = plane ? ((x & 1) ? 144 : 112) : 32 + i * 40 + (x / 40) * 3;
+                  unsigned sample = plane ? ((x & 1) ? 144 : 112) : 32 + (i % 4) * 40 + (x / 40) * 3;
                   if (format == NVENC_D3D12_P010)
                   {
                      uint16_t value16 = (uint16_t)((sample * 4 + (plane ? 0 : 1)) << 6);
@@ -599,7 +640,7 @@ int main(int argc, char **argv)
    }
    if (getenv("NVENC_TEST_DISPATCH"))
    {
-      CHECK(capture && !metadata);
+      CHECK(capture);
       producer.frames = FRAMES;
       out = fopen(argv[3], "wb"); CHECK(out != NULL);
       mux_config.timescale = config.fps_num;
@@ -663,8 +704,8 @@ int main(int argc, char **argv)
    }
    CHECK(nvenc_d3d12_submit(encoder, 0, 0, 1, NULL, 1, false) == NVENC_D3D12_ERROR);
    CHECK(nvenc_d3d12_release(encoder) == NVENC_D3D12_ERROR);
-   CHECK(nvenc_d3d12_submit(encoder, 4, 0, 1, ready, 1, false) == NVENC_D3D12_ERROR);
-   producer.queue = capturing ? record_gpu_capture_d3d12_queue(capture) : record_gpu_queue_new(4);
+   CHECK(nvenc_d3d12_submit(encoder, config.slots, 0, 1, ready, 1, false) == NVENC_D3D12_ERROR);
+   producer.queue = capturing ? record_gpu_capture_d3d12_queue(capture) : record_gpu_queue_new(config.slots);
    producer.frames = metadata ? 84 : FRAMES;
    CHECK(producer.queue != NULL);
    retro_atomic_int_init(&producer.stop, 0);
@@ -694,6 +735,7 @@ int main(int argc, char **argv)
       status = record_gpu_worker_d3d12_step(worker, &packet);
       CHECK(status != RECORD_GPU_WORKER_ERROR);
       progress = status == RECORD_GPU_WORKER_PROGRESS;
+      /* Hold four inputs independently of the configured ring capacity. */
       if (!signalled && encoder->count == 4)
       {
          CHECK(!nvenc_d3d12_free(encoder));
@@ -715,7 +757,7 @@ int main(int argc, char **argv)
          CHECK(record_gpu_worker_d3d12_step(worker, &held) == RECORD_GPU_WORKER_PACKET);
          CHECK(held.data == packet.data && held.size == packet.size
                && held.slot == packet.slot && held.timestamp == packet.timestamp);
-         CHECK(packet.size && packet.timestamp == received && packet.duration == 1 && packet.slot == received % 4);
+         CHECK(packet.size && packet.timestamp == received && packet.duration == 1 && packet.slot == received % config.slots);
          CHECK(received != 0 || packet.keyframe);
          CHECK(received != 12 || packet.keyframe);
          CHECK(received != 72 || packet.keyframe);
@@ -795,7 +837,7 @@ done:
    }
    if (producer.queue && !capturing && !worker) record_gpu_queue_free(producer.queue);
    if (capture) record_gpu_capture_d3d12_free(capture);
-   for (i = 0; i < 4; i++)
+   for (i = 0; i < NVENC_D3D12_SLOTS; i++)
    {
       if (textures[i]) ID3D12Resource_Release(textures[i]);
       if (upload[i]) ID3D12Resource_Release(upload[i]);
@@ -805,6 +847,10 @@ done:
    if (ready) ID3D12Fence_Release(ready);
    if (queue) ID3D12CommandQueue_Release(queue);
    if (device) ID3D12Device_Release(device);
+#ifdef NVENC_TEST_STREAM
+   ssl_socket_retro_set_trust_pem(NULL, 0);
+   free(nve_stream_ca);
+#endif
    printf("codec %s: %s (%u packets)\n", argv[1], ok ? "PASS" : "FAIL", received);
    return ok == 77 ? 77 : !ok;
 }

@@ -46,7 +46,7 @@
 /* Required for OpenDingux IPU filter + refresh
  * rate settings */
 #if defined(DINGUX)
-#include "dingux/dingux_utils.h"
+#include "os/dingux/dingux_utils.h"
 #endif
 
 /* Required for 'show inputs on overlay' setting */
@@ -418,7 +418,12 @@
 #define MAXIMUM_SCANLINE_SYNC_OFFSET 3000
 
 /* Vulkan specific */
+#if defined(__PSL1GHT__) || defined(__PS3__)
+/* RSX keeps the core behind each flip with two: lowest input latency */
+#define DEFAULT_MAX_SWAPCHAIN_IMAGES 2
+#else
 #define DEFAULT_MAX_SWAPCHAIN_IMAGES 3
+#endif
 #define MINIMUM_MAX_SWAPCHAIN_IMAGES 2
 #define MAXIMUM_MAX_SWAPCHAIN_IMAGES 4
 
@@ -565,6 +570,15 @@
  * as late as the next refresh allows given measured core and render
  * times. Off: the fixed-timer pacing threaded video always had. */
 #define DEFAULT_VIDEO_THREADED_DISPLAY_PACING false
+
+/* With display pacing, vsync off and a present that tears: release
+ * each core frame on the display's vblank events instead of a timer.
+ * Off: the timer. */
+#define DEFAULT_VIDEO_THREADED_PACING_VBLANK false
+
+/* Leave a frame the core marks as a repeat unpresented, so the display
+ * sees the content's own frame rate. Off: every repeat is presented. */
+#define DEFAULT_VIDEO_SKIP_DUPE_FRAMES false
 
 /* The Direct3D 9 drivers on a Direct3D9Ex device: a window presented
  * through the flip model, and the frame latency settings honoured.
@@ -889,6 +903,7 @@
 #define DEFAULT_SETTINGS_SHOW_ACCESSIBILITY true
 #define DEFAULT_SETTINGS_SHOW_POWER_MANAGEMENT true
 #define DEFAULT_SETTINGS_SHOW_ACHIEVEMENTS true
+#define DEFAULT_SETTINGS_SHOW_BLUETOOTH true
 #define DEFAULT_SETTINGS_SHOW_NETWORK true
 #define DEFAULT_SETTINGS_SHOW_PLAYLISTS true
 #define DEFAULT_SETTINGS_SHOW_USER true
@@ -965,6 +980,8 @@
 #define DEFAULT_MENU_SHOW_SUBLABELS_CURRENT_SELECTION_ONLY false
 #define DEFAULT_MENU_SHOW_CONFIRM true
 #define DEFAULT_MENU_DYNAMIC_WALLPAPER_ENABLE true
+
+#define DEFAULT_MENU_SCROLL_QUICK true
 #define DEFAULT_MENU_SCROLL_FAST false
 #define DEFAULT_MENU_SCROLL_DELAY 256
 
@@ -1059,6 +1076,9 @@
 #endif
 #define DEFAULT_XMB_ICON_THEME XMB_ICON_THEME_MONOCHROME
 #define DEFAULT_XMB_THEME XMB_THEME_ELECTRIC_BLUE
+#define DEFAULT_XMB_PLASTIC_EFFECT_ENABLE false
+#define DEFAULT_XMB_RIBBON_BLOOM_ENABLE false
+#define DEFAULT_XMB_RIBBON_PARTICLES_ENABLE false
 
 #if defined(HAVE_LAKKA) || defined(__arm__) || defined(__PPC64__) || defined(__ppc64__) || defined(__powerpc64__) || defined(__powerpc__) || defined(__ppc__) || defined(__POWERPC__)
 #define DEFAULT_XMB_SHADOWS_ENABLE false
@@ -1352,6 +1372,12 @@
 /* Display a notification when applying an
  * IPS/BPS/UPS/Xdelta patch file */
 #define DEFAULT_NOTIFICATION_SHOW_PATCH_APPLIED true
+
+#ifdef HAVE_CORE_SIGNING_TEST_KEY
+/* Display the reminder that this build trusts
+ * a test signing key */
+#define DEFAULT_NOTIFICATION_SHOW_CORE_SIGNING_TEST_KEY true
+#endif
 
 /* Display a notification when loading an
  * input remap file */
@@ -2175,7 +2201,7 @@
 
 /* Defines the strength of rumble effects
  * on OpenDingux devices */
-#if defined(DINGUX) && defined(HAVE_LIBSHAKE)
+#if defined(DINGUX) && defined(__linux__)
 #define DEFAULT_RUMBLE_GAIN 50
 #else
 #define DEFAULT_RUMBLE_GAIN 100

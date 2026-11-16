@@ -22,12 +22,15 @@ static runloop_state_t runloop_st;
 static bool            hardcore;
 
 bool rcheevos_hardcore_active(void) { return hardcore; }
+bool rcheevos_is_pause_allowed(void) { return !hardcore; }
 settings_t *config_get_ptr(void) { return &settings; }
 runloop_state_t *runloop_state_get_ptr(void) { return &runloop_st; }
+uint32_t runloop_get_flags(void) { return runloop_st.flags; }
 void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
 bool command_event(enum event_command cmd, void *data)
 { (void)cmd; (void)data; return false; }
 bool command_interfaces_held(void) { return false; }
+void command_frame_start(void) { }
 bool netplay_driver_ctl(enum rarch_netplay_ctl_state state, void *data)
 { (void)state; (void)data; return false; }
 bool retroarch_ctl(enum rarch_ctl_state state, void *data)

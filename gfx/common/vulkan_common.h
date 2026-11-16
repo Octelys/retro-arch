@@ -35,6 +35,9 @@
 #include <compat/android_native_window.h>
 #endif
 #include "vksym.h"
+#ifdef HAVE_VAAPI
+#include "vulkan_drm_identity.h"
+#endif
 
 #include <stddef.h>
 #include <boolean.h>
@@ -43,6 +46,7 @@
 #include <retro_miscellaneous.h>
 #include <retro_atomic.h>
 #include <rthreads/retro_eventcount.h>
+#include <rthreads/rthreads.h>
 
 #include <libretro.h>
 #include <libretro_vulkan.h>
@@ -212,7 +216,9 @@ enum vulkan_context_flags
     * to rebuild again. */
    VK_CTX_FLAG_SUBOPTIMAL_REBUILT           = (1 << 8),
    VK_CTX_FLAG_VIDEO_GENERAL                = (1 << 9),
-   VK_CTX_FLAG_ANDROID_IMAGES               = (1 << 10)
+   VK_CTX_FLAG_ANDROID_IMAGES               = (1 << 10),
+   VK_CTX_FLAG_DEFERRED_PRESENT             = (1 << 11),
+   VK_CTX_FLAG_FRAME_SLOT_PENDING           = (1 << 12)
 };
 
 enum gfx_ctx_vulkan_data_flags
@@ -227,7 +233,9 @@ enum gfx_ctx_vulkan_data_flags
    VK_DATA_FLAG_EMULATING_MAILBOX       = (1 << 4),
    /* Used to check if we need to use mailbox emulation or not.
     * Only relevant on Windows for now. */
-   VK_DATA_FLAG_FULLSCREEN              = (1 << 5)
+   VK_DATA_FLAG_FULLSCREEN              = (1 << 5),
+   /* Destroy drops the context even under VIDEO_FLAG_CACHE_CONTEXT. */
+   VK_DATA_FLAG_DROP_CONTEXT            = (1 << 6)
 };
 
 enum vk_texture_flags
@@ -237,7 +245,8 @@ enum vk_texture_flags
    VK_TEX_FLAG_MIPMAP                       = (1 << 2),
    /* Streamed texture in device-local host-visible memory: written by
     * the CPU, never read by it. */
-   VK_TEX_FLAG_BAR_MAPPED                   = (1 << 3)
+   VK_TEX_FLAG_BAR_MAPPED                   = (1 << 3),
+   VK_TEX_FLAG_RETAIN_HANDLE                = (1 << 4)
 };
 
 /* The settings a swapchain is made from.  The thread that draws can
@@ -264,6 +273,10 @@ typedef struct vulkan_context
    /* Headset output, or NULL. Always present, like debug_callback: every
     * translation unit that includes this header shares the layout. */
    struct vulkan_openxr *xr;
+   struct vulkan_session_key *session_instance_key;
+   struct vulkan_session_key *session_device_key;
+   struct vulkan_upscaler *session_upscaler;
+   char *session_upscaler_dir;
 
    VkInstance instance;
    VkPhysicalDevice gpu;
@@ -272,6 +285,13 @@ typedef struct vulkan_context
 
    VkPhysicalDeviceProperties gpu_properties;
    VkPhysicalDeviceMemoryProperties memory_properties;
+#ifdef HAVE_VAAPI
+   VkInstance properties2_instance;
+   vulkan_drm_identity_t drm_identity;
+   uint32_t instance_api_version;
+   bool instance_properties2;
+   bool prime_import_device;
+#endif
 #if defined(ANDROID) \
       && (defined(HAVE_RMP4) || defined(HAVE_RVP9) || defined(HAVE_RAV1) \
             || defined(HAVE_RECORD_MEDIACODEC))
@@ -687,6 +707,12 @@ const char *vulkan_get_moltenvk_version(void);
 void vulkan_context_destroy(gfx_ctx_vulkan_data_t *vk,
       bool destroy_surface);
 
+/* After all video drivers have stopped, including a non-Vulkan one. */
+void vulkan_context_session_cache_free(void);
+/* Keep native NGX from keep_dir until its replacement is ready.
+ * NULL retires all cached sessions. Returns whether a session remains. */
+bool vulkan_context_session_cache_prune(const char *keep_dir);
+
 bool vulkan_surface_create(gfx_ctx_vulkan_data_t *vk,
       enum vulkan_wsi_type type,
       void *display, void *surface,
@@ -707,6 +733,8 @@ retro_time_t vulkan_last_present_time(gfx_ctx_vulkan_data_t *vk);
    ((gfx_ctx_vulkan_data_t*)((char*)(ctx) - offsetof(gfx_ctx_vulkan_data_t, context)))
 
 void vulkan_acquire_next_image(gfx_ctx_vulkan_data_t *vk);
+/* Poll the next offscreen frame slot after a deferred present; never waits. */
+bool vulkan_context_continue_frame(gfx_ctx_vulkan_data_t *vk);
 
 /* Takes the acquire semaphore of the current frame, if one was
  * acquired, and every stale one, into sems[] and stages[] (each with

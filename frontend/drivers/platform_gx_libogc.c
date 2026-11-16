@@ -33,6 +33,8 @@
 #include <sdcard/gcsd.h>
 #include <fat.h>
 #include <rthreads/rthreads.h>
+#include <rthreads/retro_eventcount.h>
+#include <retro_atomic.h>
 
 #include <boolean.h>
 #include <compat/strl.h>
@@ -80,7 +82,7 @@ static enum frontend_fork gx_fork_mode = FRONTEND_FORK_NONE;
 #include <ogc/libversion.h>
 #if defined(BIG_STACK) && _V_MAJOR_ >= 3
 /* libogc 3 starts main on the stack __ppc_main_sp points to the top of;
- * this one is the 512 KiB the bootstrap/gx linker scripts give libogc 2. */
+ * this one is the 512 KiB the os/gekko/libogc linker scripts give libogc 2. */
 static u8 gx_main_stack[0x80000] ATTRIBUTE_ALIGN(32);
 u8 *__ppc_main_sp = gx_main_stack + sizeof(gx_main_stack);
 #endif
@@ -127,19 +129,19 @@ static struct
    const char *name;
 } gx_devices[GX_DEVICE_END];
 
-static slock_t *gx_device_cond_mutex     = NULL;
-static scond_t *gx_device_cond           = NULL;
+/* Nothing reports a card or a drive coming or going: the thread looks
+ * once a second, and is woken early only to stop. */
+static retro_eventcount_t gx_device_wake;
+static retro_atomic_int_t gx_stop_dev_thread;
 static sthread_t *gx_device_thread       = NULL;
-static volatile bool gx_stop_dev_thread  = false;
 
 static void gx_devthread(void *a)
 {
    int i;
 
-   slock_lock(gx_device_cond_mutex);
-
-   while (!gx_stop_dev_thread)
+   for (;;)
    {
+      int key;
       for (i = 0; i < GX_DEVICE_END; i++)
       {
          if (gx_devices[i].mounted)
@@ -158,10 +160,16 @@ static void gx_devthread(void *a)
             gx_devices[i].mounted = fatMountSimple(gx_devices[i].name, gx_devices[i].interface);
       }
 
-      scond_wait_timeout(gx_device_cond, gx_device_cond_mutex, 1000000);
+      if (retro_atomic_load_acquire_int(&gx_stop_dev_thread))
+         break;
+      key = retro_eventcount_prepare_wait(&gx_device_wake);
+      if (retro_atomic_load_acquire_int(&gx_stop_dev_thread))
+      {
+         retro_eventcount_cancel_wait(&gx_device_wake);
+         break;
+      }
+      retro_eventcount_commit_wait_timeout(&gx_device_wake, key, 1000000);
    }
-
-   slock_unlock(gx_device_cond_mutex);
 }
 #endif
 
@@ -400,29 +408,26 @@ static void frontend_gx_init(void *data)
             gx_devices[GX_DEVICE_USB].name,
             gx_devices[GX_DEVICE_USB].interface);
 
-   gx_device_cond_mutex = slock_new();
-   gx_device_cond       = scond_new();
-   gx_device_thread     = sthread_create(gx_devthread, NULL);
+   retro_atomic_int_init(&gx_stop_dev_thread, 0);
+   if (retro_eventcount_init(&gx_device_wake))
+   {
+      if (!(gx_device_thread = sthread_create(gx_devthread, NULL)))
+         retro_eventcount_free(&gx_device_wake);
+   }
 #endif
 }
 
 static void frontend_gx_deinit(void *data)
 {
 #if defined(HW_RVL) && !defined(IS_SALAMANDER)
-   slock_lock(gx_device_cond_mutex);
-   gx_stop_dev_thread = true;
-   slock_unlock(gx_device_cond_mutex);
-   scond_signal(gx_device_cond);
-   sthread_join(gx_device_thread);
-
-   /* Release the sync primitives allocated in frontend_gx_init.
-    * Without this, a frontend re-init (e.g. CMD_EVENT_QUIT followed
-    * by relaunch) leaks a mutex and a cond every cycle. */
-   slock_free(gx_device_cond_mutex);
-   scond_free(gx_device_cond);
-   gx_device_cond_mutex = NULL;
-   gx_device_cond       = NULL;
-   gx_device_thread     = NULL;
+   if (gx_device_thread)
+   {
+      retro_atomic_store_release_int(&gx_stop_dev_thread, 1);
+      retro_eventcount_notify(&gx_device_wake);
+      sthread_join(gx_device_thread);
+      retro_eventcount_free(&gx_device_wake);
+      gx_device_thread = NULL;
+   }
 #endif
 }
 

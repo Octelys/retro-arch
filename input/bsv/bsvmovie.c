@@ -167,6 +167,7 @@ static bool bsv_movie_peek_frame_info(bsv_movie_t *movie, uint8_t *token, uint64
          /* Read compressed encoded size */
          if (intfstream_read(movie->file, &(state_length), sizeof(uint32_t)) != sizeof(uint32_t))
             goto end;
+         state_length = swap_if_big32(state_length);
          /* Seek past the state data */
          if (intfstream_seek(movie->file, state_length, SEEK_CUR) < 0)
             goto end;
@@ -538,40 +539,41 @@ void bsv_movie_frame_rewind(input_driver_state_t *input_st)
 void bsv_movie_push_key_event(bsv_movie_t *movie,
       uint8_t down, uint16_t mod, uint32_t code, uint32_t character)
 {
-   bsv_key_data_t data;
-   data.down                                 = down;
-   data._padding                             = 0;
-   data.mod                                  = swap_if_big16(mod);
-   data.code                                 = swap_if_big32(code);
-   data.character                            = swap_if_big32(character);
+   bsv_key_data_t *data;
    /* A frame's events are staged in fixed arrays; drop what does not
     * fit rather than write past them. */
    if (movie->key_event_count >= ARRAY_SIZE(movie->key_events))
       return;
-   movie->key_events[movie->key_event_count] = data;
-   movie->key_event_count++;
+   data            = &movie->key_events[movie->key_event_count++];
+   data->down      = down;
+   data->_padding  = 0;
+   data->mod       = swap_if_big16(mod);
+   data->code      = swap_if_big32(code);
+   data->character = swap_if_big32(character);
 }
 
 void bsv_movie_push_input_event(bsv_movie_t *movie,
      uint8_t port, uint8_t dev, uint8_t idx, uint16_t id, int16_t val)
 {
-   bsv_input_data_t data;
-   data.port                          = port;
-   data.device                        = dev;
-   data.idx                           = idx;
-   data._padding                      = 0;
-   data.id                            = swap_if_big16(id);
-   data.value                         = swap_if_big16(val);
+   bsv_input_data_t *data;
    if (movie->input_event_count >= ARRAY_SIZE(movie->input_events))
       return;
-   movie->input_events[movie->input_event_count] = data;
-   movie->input_event_count++;
+   data           = &movie->input_events[movie->input_event_count++];
+   data->port     = port;
+   data->device   = dev;
+   data->idx      = idx;
+   data->_padding = 0;
+   data->id       = swap_if_big16(id);
+   data->value    = swap_if_big16(val);
 }
 
 bool bsv_movie_handle_read_input_event(bsv_movie_t *movie,
      uint8_t port, uint8_t dev, uint8_t idx, uint16_t id, int16_t* val)
 {
    int i;
+   /* Events hold their id little-endian: convert the query once
+    * rather than every event it is compared against. */
+   uint16_t id_le = swap_if_big16(id);
    /* if movie is old, just read two bytes and hope for the best */
    if (movie->version == 0)
    {
@@ -581,17 +583,37 @@ bool bsv_movie_handle_read_input_event(bsv_movie_t *movie,
    }
    for (i = 0; i < movie->input_event_count; i++)
    {
-      bsv_input_data_t evt = movie->input_events[i];
-      if (   (evt.port   == port)
-          && (evt.device == dev)
-          && (evt.idx    == idx)
-          && (evt.id     == id))
+      const bsv_input_data_t *evt = &movie->input_events[i];
+      /* id first: it is what differs most between a frame's events */
+      if (   (evt->id     == id_le)
+          && (evt->port   == port)
+          && (evt->device == dev)
+          && (evt->idx    == idx))
       {
-         *val = swap_if_big16(evt.value);
+         *val = swap_if_big16(evt->value);
          return true;
       }
    }
    return false;
+}
+
+/* A checkpoint's scratch buffer @i of at least @need bytes, kept for
+ * the next one. A replay records or plays back a checkpoint every few
+ * seconds, and a fresh state-sized allocation each time - zeroed, for
+ * the compressors' calloc - is a stall in the middle of the game. Its
+ * contents are not kept: grown, it is replaced rather than copied. */
+static uint8_t *bsv_movie_scratch(bsv_movie_t *handle, unsigned i,
+      size_t need)
+{
+   if (need > handle->ckpt_scratch_cap[i])
+   {
+      free(handle->ckpt_scratch[i]);
+      handle->ckpt_scratch_cap[i] = 0;
+      if (!(handle->ckpt_scratch[i] = (uint8_t*)malloc(need)))
+         return NULL;
+      handle->ckpt_scratch_cap[i] = need;
+   }
+   return handle->ckpt_scratch[i];
 }
 
 bool bsv_movie_load_checkpoint(bsv_movie_t *handle, uint8_t compression,
@@ -662,7 +684,8 @@ bool bsv_movie_load_checkpoint(bsv_movie_t *handle, uint8_t compression,
          && encoding == REPLAY_CHECKPOINT2_ENCODING_RAW)
       compressed_data = handle->cur_save;
    else
-      compressed_data = (uint8_t*)malloc(compressed_encoded_size);
+      compressed_data = bsv_movie_scratch(handle, 1,
+            compressed_encoded_size ? compressed_encoded_size : 1);
    if (!handle->cur_save || !compressed_data)
    {
       RARCH_ERR("[Replay] Out of memory for checkpoint, terminating movie\n");
@@ -688,7 +711,10 @@ bool bsv_movie_load_checkpoint(bsv_movie_t *handle, uint8_t compression,
       case REPLAY_CHECKPOINT2_COMPRESSION_ZLIB:
          {
             uLongf uncompressed_size_zlib = encoded_size;
-            encoded_data = (uint8_t*)calloc(encoded_size, sizeof(uint8_t));
+            /* A raw state decodes straight into cur_save */
+            encoded_data = (encoding == REPLAY_CHECKPOINT2_ENCODING_RAW)
+                  ? handle->cur_save
+                  : bsv_movie_scratch(handle, 0, encoded_size ? encoded_size : 1);
             /* Decoded short of its header's size, the rest of the
              * state would be whatever the buffer held */
             if (!encoded_data || uncompress(encoded_data, &uncompressed_size_zlib,
@@ -711,7 +737,10 @@ bool bsv_movie_load_checkpoint(bsv_movie_t *handle, uint8_t compression,
                margin.  but, how could the margin be known without
                calling the function that takes the compressed frames as
                an input?  */
-            encoded_data          = (uint8_t*)calloc(encoded_size, sizeof(uint8_t));
+            /* A raw state decodes straight into cur_save */
+            encoded_data = (encoding == REPLAY_CHECKPOINT2_ENCODING_RAW)
+                  ? handle->cur_save
+                  : bsv_movie_scratch(handle, 0, encoded_size ? encoded_size : 1);
             if (!encoded_data || rzstd_decode(encoded_data, encoded_size,
                      compressed_data, compressed_encoded_size,
                      &uncompressed_size_big) != RZSTD_PROCESS_END
@@ -765,12 +794,11 @@ bool bsv_movie_load_checkpoint(bsv_movie_t *handle, uint8_t compression,
       goto exit;
    handle->checkpoint_ready = true;
  exit:
-   /* Uncompressed raw data is read into cur_save itself, which the
-    * handle keeps. */
-   if (compressed_data && compressed_data != handle->cur_save)
-      free(compressed_data);
-   if (encoded_data && encoded_data != handle->cur_save)
-      free(encoded_data);
+   /* Every buffer here is cur_save or a scratch buffer, which the
+    * handle keeps. A checkpoint that failed part way may have been
+    * decoding into cur_save: it no longer holds a state. */
+   if (!ret)
+      handle->cur_save_valid = false;
    return ret;
 }
 
@@ -782,7 +810,6 @@ static int64_t bsv_movie_write_checkpoint_from_state(bsv_movie_t *handle,
    int64_t ret = -1;
    uint32_t encoded_size = 0, compressed_encoded_size, size_ = 0;
    uint8_t *encoded_data = NULL, *compressed_encoded_data = NULL;
-   bool owns_encoded = false, owns_compressed_encoded = false;
    retro_ctx_serialize_info_t serial_info;
    serial_info.size = state ? size : core_serialize_size();
    if (handle->cur_save_size < serial_info.size)
@@ -818,12 +845,12 @@ static int64_t bsv_movie_write_checkpoint_from_state(bsv_movie_t *handle,
          {
             int64_t deduped_size;
             encoded_size = (uint32_t)(serial_info.size + serial_info.size / 2);
-            if (!(encoded_data = (uint8_t*)malloc(encoded_size)))
+            if (!(encoded_data = bsv_movie_scratch(handle, 0,
+                        encoded_size ? encoded_size : 1)))
             {
                ret = -1;
                goto exit;
             }
-            owns_encoded = true;
             deduped_size = bsv_movie_write_deduped_state(handle,
                   (uint8_t*)serial_info.data, serial_info.size,
                   encoded_data, encoded_size);
@@ -851,8 +878,12 @@ static int64_t bsv_movie_write_checkpoint_from_state(bsv_movie_t *handle,
       case REPLAY_CHECKPOINT2_COMPRESSION_ZLIB:
       {
          uLongf zlib_compressed_encoded_size = compressBound(encoded_size);
-         compressed_encoded_data = (uint8_t*)calloc(zlib_compressed_encoded_size, sizeof(uint8_t));
-         owns_compressed_encoded = true;
+         if (!(compressed_encoded_data = bsv_movie_scratch(handle, 1,
+                     zlib_compressed_encoded_size)))
+         {
+            ret = -1;
+            goto exit;
+         }
          if (compress2(compressed_encoded_data, &zlib_compressed_encoded_size, encoded_data, encoded_size, 6) != Z_OK)
          {
             ret = -1;
@@ -866,8 +897,12 @@ static int64_t bsv_movie_write_checkpoint_from_state(bsv_movie_t *handle,
       case REPLAY_CHECKPOINT2_COMPRESSION_ZSTD:
       {
          size_t compressed_encoded_size_zstd = rzstd_compress_bound(encoded_size);
-         compressed_encoded_data = (uint8_t*)calloc(compressed_encoded_size_zstd, sizeof(uint8_t));
-         owns_compressed_encoded = true;
+         if (!(compressed_encoded_data = bsv_movie_scratch(handle, 1,
+                     compressed_encoded_size_zstd)))
+         {
+            ret = -1;
+            goto exit;
+         }
          if (rzstd_encode(compressed_encoded_data, compressed_encoded_size_zstd,
                   encoded_data, encoded_size, 3,
                   &compressed_encoded_size_zstd) != RZSTD_PROCESS_END)
@@ -921,10 +956,6 @@ exit:
    handle->cur_save       = handle->last_save;
    handle->last_save      = swap;
    handle->cur_save_valid = handle->cur_save != NULL;
-   if (encoded_data && owns_encoded)
-      free(encoded_data);
-   if (compressed_encoded_data && owns_compressed_encoded)
-      free(compressed_encoded_data);
    return ret;
 }
 
@@ -958,7 +989,7 @@ bool bsv_movie_read_next_events(bsv_movie_t *handle,
    /* Start by reading key event */
    if (intfstream_read(handle->file, &(handle->key_event_count), 1) == 1)
    {
-      int i;
+      size_t len;
       /* key_events is a fixed-size bsv_key_data_t[128] (input_driver.h
        * line ~259); key_event_count is uint8_t and read straight from
        * the .bsv file with no inherent bound (max 255).  Pre-this-patch
@@ -978,17 +1009,17 @@ bool bsv_movie_read_next_events(bsv_movie_t *handle,
             bsv_movie_set_end();
          return false;
       }
-      for (i = 0; i < handle->key_event_count; i++)
+      /* The array has the file's layout: read the events straight in */
+      len = handle->key_event_count * sizeof(bsv_key_data_t);
+      if (     len
+            && intfstream_read(handle->file, handle->key_events, len)
+               != (int64_t)len)
       {
-         if (intfstream_read(handle->file, &(handle->key_events[i]),
-                  sizeof(bsv_key_data_t)) != sizeof(bsv_key_data_t))
-         {
-            /* Unnatural EOF */
-            RARCH_ERR("[Replay] Keyboard replay ran out of keyboard inputs too early\n");
-            if (end_movie)
-               bsv_movie_set_end();
-            return false;
-         }
+         /* Unnatural EOF */
+         RARCH_ERR("[Replay] Keyboard replay ran out of keyboard inputs too early\n");
+         if (end_movie)
+            bsv_movie_set_end();
+         return false;
       }
    }
    else
@@ -1003,7 +1034,7 @@ bool bsv_movie_read_next_events(bsv_movie_t *handle,
    {
       if (intfstream_read(handle->file, &(handle->input_event_count), 2) == 2)
       {
-         int i;
+         size_t len;
          handle->input_event_count = swap_if_big16(handle->input_event_count);
          /* Same shape as the key_event_count check above: input_events
           * is bsv_input_data_t[512] (input_driver.h line ~260) but
@@ -1026,17 +1057,16 @@ bool bsv_movie_read_next_events(bsv_movie_t *handle,
                bsv_movie_set_end();
             return false;
          }
-         for (i = 0; i < handle->input_event_count; i++)
+         len = handle->input_event_count * sizeof(bsv_input_data_t);
+         if (     len
+               && intfstream_read(handle->file, handle->input_events, len)
+                  != (int64_t)len)
          {
-            if (intfstream_read(handle->file, &(handle->input_events[i]),
-                     sizeof(bsv_input_data_t)) != sizeof(bsv_input_data_t))
-            {
-               /* Unnatural EOF */
-               RARCH_ERR("[Replay] Input replay ran out of inputs too early\n");
-               if (end_movie)
-                  bsv_movie_set_end();
-               return false;
-            }
+            /* Unnatural EOF */
+            RARCH_ERR("[Replay] Input replay ran out of inputs too early\n");
+            if (end_movie)
+               bsv_movie_set_end();
+            return false;
          }
       }
       else
@@ -1194,7 +1224,6 @@ static void bsv_movie_next_frame_internal(input_driver_state_t *input_st,
 
    if (!handle->playback && !(input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_SEEKING))
    {
-      int i;
       uint16_t evt_count     = swap_if_big16(handle->input_event_count);
       size_t last_pos        = handle->frame_pos[(MAX(handle->frame_counter,2)-2) & handle->frame_mask];
       size_t cur_pos         = intfstream_tell(handle->file);
@@ -1204,16 +1233,16 @@ static void bsv_movie_next_frame_internal(input_driver_state_t *input_st,
       intfstream_write(handle->file, &back_distance, sizeof(uint32_t));
       /* write key events, frame is over */
       intfstream_write(handle->file, &(handle->key_event_count), 1);
-      for (i = 0; i < handle->key_event_count; i++)
-         intfstream_write(handle->file, &(handle->key_events[i]),
-               sizeof(bsv_key_data_t));
+      if (handle->key_event_count)
+         intfstream_write(handle->file, handle->key_events,
+               handle->key_event_count * sizeof(bsv_key_data_t));
       /* Zero out key events when playing back or recording */
       handle->key_event_count = 0;
       /* write input events, frame is over */
       intfstream_write(handle->file, &evt_count, 2);
-      for (i = 0; i < handle->input_event_count; i++)
-         intfstream_write(handle->file, &(handle->input_events[i]),
-               sizeof(bsv_input_data_t));
+      if (handle->input_event_count)
+         intfstream_write(handle->file, handle->input_events,
+               handle->input_event_count * sizeof(bsv_input_data_t));
       /* Zero out input events when playing back or recording */
       handle->input_event_count = 0;
 
@@ -1750,15 +1779,14 @@ void bsv_movie_poll(input_driver_state_t *input_st)
    if (runloop_key_event_is_frontend())
    {
       int i;
-      bsv_key_data_t k;
       for (i = 0; i < handle->key_event_count; i++)
       {
+         const bsv_key_data_t *k = &handle->key_events[i];
 #ifdef HAVE_CHEEVOS
          rcheevos_pause_hardcore();
 #endif
-         k = handle->key_events[i];
-         input_keyboard_event(k.down, swap_if_big32(k.code),
-               swap_if_big32(k.character), swap_if_big16(k.mod),
+         input_keyboard_event(k->down, swap_if_big32(k->code),
+               swap_if_big32(k->character), swap_if_big16(k->mod),
                RETRO_DEVICE_KEYBOARD);
       }
       /* Have to clear here so we don't double-apply key events */
@@ -1892,7 +1920,7 @@ int64_t bsv_movie_write_deduped_state(bsv_movie_t *movie, uint8_t *state,
             rmsgpack_write_int(out_stream, BSV_IFRAME_NEW_BLOCK_TOKEN);
             rmsgpack_write_int(out_stream, found_block.index);
             /* Cast is fine, a single block can't be super big */
-            rmsgpack_write_bin(out_stream, (uint8_t*)uint32s_index_get(movie->blocks, found_block.index), block_byte_size);
+            rmsgpack_write_bin(out_stream, (uint8_t*)uint32s_index_get(movie->blocks, found_block.index), (uint32_t)block_byte_size);
          }
          else
             reused_blocks++;

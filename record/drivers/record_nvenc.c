@@ -4,6 +4,7 @@
 #endif
 #include "record_nvenc.h"
 #include "../../gfx/video_driver.h"
+#include "../record_native_buffer.h"
 #ifdef HAVE_RECORD_NVENC
 #include <stdlib.h>
 #include <string.h>
@@ -70,12 +71,13 @@ static bool record_nvenc_rate(double fps, unsigned *num, unsigned *den)
 }
 
 static bool record_nvenc_config(const char *path, nvenc_d3d12_config_t *encoder,
-      bool *audio_enabled)
+      bool *audio_enabled, bool streaming, bool *legacy)
 {
    config_file_t *config;
    struct config_file_entry entry;
    char codec[16], format[8];
    bool audio = true, ok = false;
+   *legacy = false;
    if (!path || !*path) return false;
    config = config_file_new_from_path_to_string(path);
    if (!config) return false;
@@ -90,7 +92,10 @@ static bool record_nvenc_config(const char *path, nvenc_d3d12_config_t *encoder,
    }
    if (config_get_entry(config, "format")
          && (!config_get_array(config, "format", format, sizeof(format))
-            || !string_is_equal(format, "mp4"))) goto done;
+            || !string_is_equal(format, streaming ? "flv" : "mp4"))) goto done;
+   if (config_get_entry(config, "rtmp_legacy_commands")
+         && (!streaming || !config_get_bool(config, "rtmp_legacy_commands", legacy)))
+      goto done;
    if (config_get_entry(config, "video_bit_rate")
          && (!config_get_uint(config, "video_bit_rate", &encoder->bitrate)
             || !encoder->bitrate)) goto done;
@@ -100,7 +105,8 @@ static bool record_nvenc_config(const char *path, nvenc_d3d12_config_t *encoder,
          if (!string_is_equal(entry.key, "audio_enable")
                && !string_is_equal(entry.key, "vcodec")
                && !string_is_equal(entry.key, "video_bit_rate")
-               && !string_is_equal(entry.key, "format")) goto done;
+               && !string_is_equal(entry.key, "format")
+               && !(streaming && string_is_equal(entry.key, "rtmp_legacy_commands"))) goto done;
       } while (config_get_entry_list_next(&entry));
    *audio_enabled = audio;
    ok = true;
@@ -164,15 +170,23 @@ static void *record_nvenc_init(const struct record_params *params)
    record_nvenc_context_t *ctx;
    settings_t *settings = config_get_ptr();
    size_t length;
-   bool audio_enabled;
+   bool audio_enabled, legacy;
+   bool streaming = recording_state_get_ptr()->streaming_enable;
    if (record_nvenc_active || record_nvenc_retired || !settings || !params
          || !params->filename || !*params->filename) return NULL;
-   if (!params->video_gpu_record || recording_state_get_ptr()->streaming_enable
+   if (!params->video_gpu_record
          || settings->bools.video_record_game_only || audio_driver_has_callback())
    {
-      RARCH_ERR("[NVENC] Requires D3D12 viewport recording without Game Only, streaming or an asynchronous core audio callback.\n");
+      RARCH_ERR("[NVENC] Requires D3D12 viewport recording without Game Only or an asynchronous core audio callback.\n");
       return NULL;
    }
+#if !defined(HAVE_MF_AUDIO) || !defined(HAVE_RTMP) || !defined(HAVE_RFLV) || !defined(HAVE_CRYPTO)
+   if (streaming)
+   {
+      RARCH_ERR("[NVENC] Native streaming is unavailable in this build.\n");
+      return NULL;
+   }
+#endif
    memset(&encoder, 0, sizeof(encoder)); memset(&output, 0, sizeof(output));
    if (!video_driver_get_device(&device) || device.api != VIDEO_DEVICE_D3D12
          || !device.device || !device.queue) return NULL;
@@ -180,14 +194,22 @@ static void *record_nvenc_init(const struct record_params *params)
    hdr.version = 1; hdr.size = sizeof(hdr);
    if (!video_driver_get_display_metadata(RETRO_ENVIRONMENT_GET_HDR_METADATA, &hdr))
       return NULL;
-   encoder.device = device.device; encoder.slots = 4;
+   encoder.device = device.device;
+   encoder.slots = recording_native_buffer_count("nvenc", params->video_fifo_frames);
    encoder.width = VIDEO_SCALE_W(params->out_dims);
    encoder.height = VIDEO_SCALE_H(params->out_dims);
    encoder.bitrate = 16000000;
    if (!record_nvenc_rate(params->fps, &encoder.fps_num, &encoder.fps_den)
-         || !record_nvenc_config(params->config, &encoder, &audio_enabled))
+         || !record_nvenc_config(params->config, &encoder, &audio_enabled, streaming, &legacy))
    {
-      RARCH_ERR("[NVENC] Requires a valid frame rate and a native MP4 config with an explicit audio_enable setting.\n");
+      RARCH_ERR("[NVENC] Requires a valid frame rate and native MP4/FLV config with an explicit audio_enable setting.\n");
+      return NULL;
+   }
+   if (streaming && ((encoder.codec != NVENC_D3D12_H264 && encoder.codec != NVENC_D3D12_HEVC)
+            || (strncmp(params->filename, "rtmp://", 7)
+               && strncmp(params->filename, "rtmps://", 8))))
+   {
+      RARCH_ERR("[NVENC] Streaming requires H.264 or HEVC and an RTMP/RTMPS URL.\n");
       return NULL;
    }
    if (!record_nvenc_color(&encoder, &hdr)
@@ -205,6 +227,11 @@ static void *record_nvenc_init(const struct record_params *params)
          RARCH_ERR("[NVENC] Audio requires an AC-3 speaker layout (up to six channels) at 32, 44.1 or 48 kHz.\n");
          return NULL;
       }
+      if (streaming && (params->samplerate == 32000.0 || params->channels > 2))
+      {
+         RARCH_ERR("[NVENC] AAC streaming requires mono/stereo at 44.1 or 48 kHz.\n");
+         return NULL;
+      }
       output.audio_rate = (unsigned)params->samplerate;
       output.audio_layout = recording_state_get_ptr()->layout;
       output.audio_kbps = params->channels > 2 ? 448 : 192;
@@ -217,7 +244,7 @@ static void *record_nvenc_init(const struct record_params *params)
    ctx->path = (char*)(ctx + 1); memcpy(ctx->path, params->filename, length + 1);
    ctx->audio_rate = output.audio_rate;
    ctx->audio_enabled = audio_enabled;
-   ctx->armed = !audio_enabled;
+   ctx->armed = false;
    ctx->device = device.device; ctx->dims = params->out_dims;
    ctx->output_mode = hdr.output_mode;
    ctx->duration = encoder.fps_den; ctx->allow_drop = params->allow_frame_drop;
@@ -229,16 +256,20 @@ static void *record_nvenc_init(const struct record_params *params)
       return NULL;
    }
    output.video.timescale = encoder.fps_num;
-   output.video.max_packet_size = 16 * 1024 * 1024;
-   ctx->job = record_gpu_dispatch_d3d12_new_owned(capture, &encoder, &output, ctx->path);
+   output.video.max_packet_size = streaming
+      ? encoder.codec == NVENC_D3D12_HEVC ? 0xfffff7 : 0xfffffa : 16 * 1024 * 1024;
+   ctx->job = streaming
+      ? record_gpu_dispatch_d3d12_new_stream_owned(capture, &encoder, &output, ctx->path, legacy)
+      : record_gpu_dispatch_d3d12_new_owned(capture, &encoder, &output, ctx->path);
    if (!ctx->job)
    {
       record_gpu_capture_d3d12_free(capture);
       free(ctx); return NULL;
    }
    record_nvenc_active = ctx;
-   RARCH_LOG("[NVENC] Starting native %s %u/%u fps recording.\n",
-         audio_enabled ? "AC-3/video" : "video-only", encoder.fps_num, encoder.fps_den);
+   RARCH_LOG("[NVENC] Starting native %s %u/%u fps %s.\n",
+         audio_enabled ? streaming ? "AAC/video" : "AC-3/video" : "video-only",
+         encoder.fps_num, encoder.fps_den, streaming ? "streaming" : "recording");
    return ctx;
 }
 
@@ -383,7 +414,9 @@ void record_nvenc_poll(void)
    if (record_nvenc_start_requested)
    {
       struct video_viewport vp;
-      memset(&vp, 0, sizeof(vp));
+      vp.pos         = 0;
+      vp.dims        = 0;
+      vp.full_dims   = 0;
       if (!recording_state_get_ptr()->enable)
          record_nvenc_start_requested = false;
       else if (video_driver_get_viewport_info(&vp) && VIDEO_SCALE_W(vp.dims)
@@ -485,3 +518,13 @@ void record_nvenc_gpu_capture(void *data, void *source, unsigned state,
       unsigned pos, unsigned dims, uint64_t timestamp, unsigned output_mode)
 { (void)data; (void)source; (void)state; (void)pos; (void)dims; (void)timestamp; (void)output_mode; }
 #endif
+
+bool record_nvenc_can_stream(void)
+{
+#if defined(HAVE_RECORD_NVENC) && defined(HAVE_NETWORKING) && defined(HAVE_MF_AUDIO) \
+      && defined(HAVE_RTMP) && defined(HAVE_RFLV) && defined(HAVE_CRYPTO)
+   return true;
+#else
+   return false;
+#endif
+}

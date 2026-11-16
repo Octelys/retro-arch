@@ -50,7 +50,6 @@ build-retroarch-windows-x64:
         --enforcedir /usr/lib/mxe/usr/x86_64-w64-mingw32.shared/qt5/plugins/styles/
         --copy
         --objdump x86_64-w64-mingw32.shared-objdump"
-    - "cp -f nvdaControllerClient64.dll ${MEDIA_PATH}/${CI_PROJECT_NAME}/redist/nvdaControllerClient64.dll"
     - "rm -f ${MEDIA_PATH}/${CI_PROJECT_NAME}/redist/opengl32.dll"
 
 build-retroarch-windows-i686:
@@ -699,6 +698,23 @@ build-retroarch-android-playstore-plus:
       cp -r ./* .retroarch-precompiled/
       mv .retroarch-precompiled/ retroarch-precompiled/
 
+build-retroarch-android-quest-aarch64:
+  image: $CI_SERVER_HOST:5050/libretro-infrastructure/libretro-build-android:latest
+  stage: build
+  artifacts:
+    paths:
+    - retroarch-precompiled/
+    expire_in: 10 min
+  script:
+    - |
+      set -e
+      cd pkg/android/phoenix
+      ./gradlew assembleQuestRelease
+      cd -
+      mkdir .retroarch-precompiled
+      cp -r ./* .retroarch-precompiled/
+      mv .retroarch-precompiled/ retroarch-precompiled/
+
 build-static-retroarch-libnx-aarch64:
   image: $CI_SERVER_HOST:5050/libretro-infrastructure/libretro-build-libnx-devkitpro:v4-10-0
   stage: prepare-for-static-cores
@@ -755,7 +771,7 @@ build-static-retroarch-psp:
     - build-static-retroarch-dummy-psp
   script:
     # We need to boostrap before compile
-    - "(cd bootstrap/psp1/kernel_functions_prx/ && make && cd -)"
+    - "(cd os/psp1/kernel_functions_prx/ && make && cd -)"
     # Allow failure since we don't have a core
     - "make -f Makefile.psp1 -j$NUMPROC ||:"
     - "mkdir .retroarch-precompiled"
@@ -777,9 +793,9 @@ build-static-retroarch-dummy-psp:
     expire_in: 10 min
   dependencies: []
   script:
-    - "(cd bootstrap/psp1/kernel_functions_prx/ && make && cd -)"
+    - "(cd os/psp1/kernel_functions_prx/ && make && cd -)"
     - "make -f Makefile.psp1.salamander -j$NUMPROC"
-    - "make -C bootstrap/psp1/kernel_functions_prx/"
+    - "make -C os/psp1/kernel_functions_prx/"
     - "mkdir -p ${MEDIA_PATH}/${CI_PROJECT_NAME}/pkg"
     - "cp -f pkg/psp1/ICON0.PNG ${MEDIA_PATH}/${CI_PROJECT_NAME}/pkg"
     - "cp -f pkg/psp1/PIC1.PNG ${MEDIA_PATH}/${CI_PROJECT_NAME}/pkg"

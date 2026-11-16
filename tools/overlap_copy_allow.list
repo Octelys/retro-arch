@@ -10,8 +10,8 @@
 # Every entry below was audited in the e942ee2 sweep. The recurring
 # safe patterns are:
 #  - LZ-style self-copies with explicit disjoint/periodic-chunk
-#    guards (r7z_lzma, encoding_vcdiff, encoding_rlz4, task_patch
-#    BPS TARGET_COPY)
+#    guards (r7z_lzma, encoding_vcdiff, encoding_rlz4, encoding_rzstd,
+#    task_patch BPS TARGET_COPY)
 #  - copies between provably distinct elements/rows/members of one
 #    array or struct (decoder state rotation, dirs[] defaults,
 #    channel/grid structs)
@@ -24,12 +24,16 @@
 # fix those with memmove, a staging buffer, or an alias-guarded
 # helper instead.
 audio/drivers/wiiu_audio.c|memcpy|offsets|offsets
-ctr/ctr_svchax.c|memcpy|flush_buffer|flush_buffer
+os/ctr/ctr_svchax.c|memcpy|flush_buffer|flush_buffer
 frontend/drivers/platform_gx_libogc.c|strlcpy|g_defaults.dirs|g_defaults.dirs
 gfx/drivers/sdl_rs90_gfx.c|memcpy|target|target
 gfx/video_filters/ntsc_crt.c|memcpy|v->out|v->out
 libretro-common/encodings/encoding_rlz4.c|memcpy|to|to
 libretro-common/encodings/encoding_rlz4.c|rlz4_copy_match_blind|dst|dst
+# rzstd_match_copy: each copy it makes is disjoint -- periods doubled
+# while short, 16 and 8-byte words staged through a local, wide copies
+# only from 32 or more bytes back
+libretro-common/encodings/encoding_rzstd.c|rzstd_match_copy|dst|dst
 libretro-common/encodings/encoding_vcdiff.c|memcpy|d->out|d->out
 libretro-common/formats/7z/r7z_lzma.c|memcpy|dst|dst
 libretro-common/formats/aac/raac.c|memcpy|c->bs_invf_mode|c->bs_invf_mode
@@ -56,3 +60,22 @@ network/netplay/netplay_frontend.c|memcpy|netplay->buffer|netplay->buffer
 tasks/task_patch.c|memcpy|bps.target_data|bps.target_data
 ui/drivers/ui_qt_widgets.cpp|memcpy|menu_shader->pass|menu_shader->pass
 ui/drivers/ui_qt_widgets.cpp|memcpy|video_shader->pass|video_shader->pass
+# rinf_build doubles the fast table in place: fast[cur..2cur) from
+# fast[0..cur), disjoint halves of one array
+libretro-common/encodings/encoding_deflate.c|memcpy|h->fast|h->fast
+libretro-common/encodings/encoding_deflate.c|memcpy|h->pfast|h->pfast
+# place_d[2].name from place_d[1].name: distinct elements
+samples/gfx/video_windows/video_windows_test.c|memcpy|place_d|place_d
+# raac parametric stereo: a parameter row from another row (src != num_env
+# is checked), matrix [0] from [num_env_old] (num_env_old > 0 is checked),
+# and in_buf[i][32..37] down to [0..5]: always distinct ranges
+libretro-common/formats/aac/raac.c|memcpy|ps->iid_par|ps->iid_par
+libretro-common/formats/aac/raac.c|memcpy|ps->icc_par|ps->icc_par
+libretro-common/formats/aac/raac.c|memcpy|ps->ipd_par|ps->ipd_par
+libretro-common/formats/aac/raac.c|memcpy|ps->opd_par|ps->opd_par
+libretro-common/formats/aac/raac.c|memcpy|ps->in_buf|ps->in_buf
+libretro-common/formats/aac/raac.c|memcpy|ps->H|ps->H
+# rh264 encoder border: the rows above and below a plane copied from its
+# first and last rows; y >= 1 rows away at a stride wider than the
+# copied width plus both borders, so never the same row
+libretro-common/formats/h264/rh264_encode.c|memcpy|o|o

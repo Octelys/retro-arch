@@ -433,6 +433,7 @@ static const struct
    char s_9329c64c[13];
    char s_f8883f70[11];
    char s_09ba892e[17];
+   char s_047623ff[11];
    char s_58b9d895[25];
    char s_ffd0dac4[13];
    char s_91dd478e[33];
@@ -570,8 +571,10 @@ static const struct
    char s_59f183c9[33];
    char s_b45e4c28[36];
    char s_61213f1d[26];
+   char s_99b1b2f6[11];
    char s_caf61308[13];
    char s_c7a27b20[13];
+   char s_d6611158[15];
    char s_57665cff[11];
    char s_b3d1e989[13];
    char s_50eb4c56[9];
@@ -609,6 +612,7 @@ static const struct
    char s_b7ef9e17[38];
    char s_8f379310[46];
    char s_6c52dfb1[41];
+   char s_334daaaa[11];
    char s_84c46931[47];
    char s_ebf10493[27];
    char s_a64b3a0b[37];
@@ -806,6 +810,7 @@ static const struct
    char s_46f6a65d[11];
    char s_543fcabd[20];
    char s_03c57bc8[20];
+   char s_c52621db[11];
    char s_1a5c880d[20];
 } msg_hash_fa_blob =
 {
@@ -1456,6 +1461,7 @@ static const struct
    "\330\247\331\205\330\252\333\214\330\247\330\262",
    "\330\263\330\261\333\214\330\247\331\204",
    "\330\263\330\247\331\205\330\247\331\206\330\257\331\207\333\214",
+   "\330\250\330\261\332\206\330\263\330\250",
    "\330\257\330\261\330\254\331\207\342\200\214\330\250\331\206\330\257\333\214 TGDB",
    "\330\257\333\214\330\257\330\247\330\261\333\214",
    "\331\276\333\214\332\251\330\261\330\250\331\206\330\257\333\214\342\200\214\331\207\330\247\333"
@@ -1661,8 +1667,10 @@ static const struct
    "\267 \330\250\330\247 GPU",
    "\330\247\331\206\330\257\333\214\330\263 \331\206\331\205\330\247\333\214\330\264\332\257\330"
    "\261",
+   "\331\205\330\252\331\210\330\263\330\267",
    "\330\256\331\210\330\257\332\251\330\247\330\261",
    "\330\256\331\210\330\257\332\251\330\247\330\261",
+   "\331\207\333\214\332\206\332\251\330\257\330\247\331\205",
    "\330\256\330\261\331\210\330\254\333\214",
    "\330\263\331\201\330\247\330\261\330\264\333\214",
    "\330\250\330\247\331\204\330\247",
@@ -1714,6 +1722,7 @@ static const struct
    "\264\333\214 (\331\205\331\210\331\202\330\271\333\214\330\252 Y)",
    "\331\207\331\205\332\257\330\247\331\205\342\200\214\330\263\330\247\330\262\333\214 \330\271"
    "\331\205\331\210\330\257\333\214 (VSync)",
+   "\330\263\333\214\330\263\330\252\331\205",
    "\330\255\330\247\331\204\330\252 \331\276\331\206\330\254\330\261\331\207\342\200\214\330\247"
    "\333\214 \330\252\331\205\330\247\331\205\342\200\214\330\265\331\201\330\255\331\207",
    "\330\255\330\247\331\204\330\252 \331\276\331\206\330\254\330\261\331\207\342\200\214\330\247"
@@ -2356,6 +2365,7 @@ static const struct
    "\330\252\330\271\331\204\333\214\331\202",
    "\330\247\330\252\331\205\330\247\331\205 \331\205\331\207\331\204\330\252",
    "\330\257\330\263\330\252\332\257\330\247\331\207\342\200\214\331\207\330\247",
+   "\331\201\331\207\330\261\330\263\330\252",
    "\330\264\333\214\330\247\330\261 \331\210\330\266\330\271\333\214\330\252",
 };
 
@@ -2363,7 +2373,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_fa_blob_check[
-      (sizeof(msg_hash_fa_blob) == (27978u
+      (sizeof(msg_hash_fa_blob) == (28037u
 #ifdef HAVE_LAKKA
        + 13u
 #endif
@@ -2873,6 +2883,7 @@ static const msg_hash_id_t msg_hash_fa_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_RDB_ENTRY_SCORE,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_RDB_ENTRY_SERIAL,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_RDB_ENTRY_SETTING,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_RDB_ENTRY_TAGS,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_RDB_ENTRY_TGDB_RATING,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_RDB_ENTRY_VISUAL,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_RECORDING_CONFIG_DIRECTORY,
@@ -3010,8 +3021,10 @@ static const msg_hash_id_t msg_hash_fa_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_FULLSCREEN_Y,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_GPU_RECORD,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_MONITOR_INDEX,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_SMOOTHING_MEDIUM,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_AUTO,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_REFRESH_AUTO,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_HANDS_NONE,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OUTPUT_SETTINGS,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_RECORD_CONFIG_TYPE_RECORDING_CUSTOM,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_RECORD_CONFIG_TYPE_RECORDING_HIGH_QUALITY,
@@ -3049,6 +3062,7 @@ static const msg_hash_id_t msg_hash_fa_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_CUSTOM_WIDTH,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_CUSTOM_Y,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VSYNC,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VULKAN_DRIVER_PATH_SYSTEM,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOWED_FULLSCREEN,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOWED_MODE_SETTINGS,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_AUTO_HEIGHT_MAX,
@@ -3246,5 +3260,6 @@ static const msg_hash_id_t msg_hash_fa_ids[] =
    (msg_hash_id_t)MSG_INPUT_BIND_HOLD,
    (msg_hash_id_t)MSG_INPUT_BIND_TIMEOUT,
    (msg_hash_id_t)MSG_NETPLAY_CLIENT_DEVICES,
+   (msg_hash_id_t)MSG_OPENXR_EDIT_TAG_MENU,
    (msg_hash_id_t)MSG_STATE_SLOT,
 };

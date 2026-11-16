@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include <queues/task_queue.h>
+#include <compat/strl.h>
 #include <lists/dir_list.h>
 
 #include "../../../core_info.h"
@@ -239,7 +240,7 @@ int main(int argc, char *argv[])
 
    /* The return value matters: false means no task exists, so nothing
     * will ever call main_db_cb and the loop below would never end. */
-   if (!task_push_dbscan(input_dir, main_db_cb))
+   if (!task_push_dbscan(input_dir, main_db_cb, NULL))
    {
       fprintf(stderr, "task_push_dbscan refused to start a scan\n");
       goto done;

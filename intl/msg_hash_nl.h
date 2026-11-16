@@ -103,7 +103,6 @@ static const struct
    char s_7607974d[16];
    char s_bdf1165f[23];
    char s_6a15d029[22];
-   char s_3817de39[385];
    char s_16ae54ac[293];
    char s_b3e89428[278];
    char s_7af11c30[92];
@@ -2092,6 +2091,8 @@ static const struct
 #endif
 #endif
    char s_f4341e25[31];
+   char s_e09bad69[10];
+   char s_f66c7b67[10];
    char s_b9d37039[173];
    char s_d0a04fe4[13];
    char s_c682e4e2[13];
@@ -2136,10 +2137,16 @@ static const struct
    char s_4b582a0b[27];
    char s_4b582a0c[27];
    char s_95e4b29f[71];
+   char s_fa462638[9];
+   char s_569b11b0[4];
+   char s_328ddae3[4];
    char s_60258de0[7];
    char s_caf61308[12];
+   char s_5410e874[7];
+   char s_9eb59c3e[4];
    char s_34b2592a[4];
    char s_c7a27b20[12];
+   char s_d6611158[5];
    char s_317b17ed[6];
    char s_94c8d15f[6];
    char s_de16b5d2[8];
@@ -2180,6 +2187,7 @@ static const struct
    char s_69b801ef[8];
    char s_a40653a7[24];
    char s_52e3d6ea[28];
+   char s_3253994e[7];
    char s_f5911f43[23];
    char s_55f488d2[14];
    char s_d5901b68[36];
@@ -2216,10 +2224,6 @@ static const struct
    char s_482ee1f1[13];
    char s_f90edcc2[49];
    char s_ad14307a[11];
-#if defined(RARCH_MOBILE)
-   char s_774121c7[47];
-   char s_774121c8[47];
-#endif
    char s_b0fb58d3[26];
    char s_b0fb58d4[26];
    char s_92a02470[36];
@@ -2228,6 +2232,7 @@ static const struct
    char s_8f379310[39];
    char s_6a9b757c[28];
    char s_6c52dfb1[33];
+   char s_334daaaa[8];
 #if defined (WIIU)
 #ifdef WIIU
    char s_afb881f7[61];
@@ -2372,7 +2377,6 @@ static const struct
    char s_aa08c6d6[78];
 #endif
 #endif
-   char s_27aef25c[45];
 #ifdef _3DS
    char s_2873cef1[76];
    char s_b4816da6[64];
@@ -2564,7 +2568,6 @@ static const struct
    char s_5bdf892a[45];
    char s_aa39aae6[77];
    char s_deab66ee[123];
-   char s_5ce79fca[183];
 #ifdef HAVE_GAME_AI
    char s_328f4fd8[22];
    char s_328f4fd9[22];
@@ -3201,7 +3204,6 @@ static const struct
    char s_a55bf936[32];
    char s_c519f84d[31];
    char s_48aefa30[32];
-   char s_5d383a58[42];
    char s_dcf8bd8b[39];
    char s_bce9b94f[38];
    char s_d32f5a63[30];
@@ -3427,10 +3429,8 @@ static const struct
    char s_7e96b5ce[44];
    char s_c2314d30[192];
 #if defined(RARCH_MOBILE)
-   char s_82c9e375[175];
-   char s_82c9e376[159];
+   char s_82c9e376[138];
 #endif
-   char s_73658ec1[153];
    char s_73658ec2[138];
    char s_8010a29e[115];
    char s_81120e85[116];
@@ -3665,7 +3665,6 @@ static const struct
    char s_a363d07a[32];
    char s_9e5bd759[36];
    char s_8d7296ed[27];
-   char s_21580d7c[90];
    char s_fc5e1d2c[78];
    char s_51b22327[54];
    char s_2f6a6e51[18];
@@ -4126,11 +4125,6 @@ static const struct
    "Shader bestand.",
    "Shader preset-bestand.",
    "Configuratie bestand.",
-   "Het inschakelen van Linux GameMode kan de latentie verbeteren, kraken van geluid oplossen en de "
-   "algehele prestaties maximaliseren door uw CPU en GPU automatisch te configureren voor de beste p"
-   "restaties.\nDe GameMode software moet worden ge\303\257nstalleerd om dit te laten werken. Zie ht"
-   "tps://github.com/FeralInteractive/gamemode voor informatie over hoe GameMode kan worden ge\303"
-   "\257nstalleerd.",
    "Gebruik gespecificeerde analoge stick voor D-Pad invoer. Als de core native analoge ondersteunin"
    "g heeft, wordt D-Pad toewijzing uitgeschakeld, tenzij een \"'(Geforceerd)\"-optie is geselecteer"
    "d. Als D-Pad toewijzing wordt geforceerd, ontvangt de core geen analoge invoer van de opgegeven "
@@ -6267,6 +6261,8 @@ static const struct
 #endif
 #endif
    "Desktop Compositie Deactiveren",
+   "Standaard",
+   "Standaard",
    "Uw grafische stuurprogramma is niet compatibel met de huidige video driver in RetroArch, die ter"
    "ugvalt op de %s driver. Herstart RetroArch om de wijzigingen door te voeren.",
    "Videofilters",
@@ -6312,10 +6308,16 @@ static const struct
    "OSD Berichten X-as positie",
    "OSD Berichten Y-as positie",
    "Volledig scherm inschakelen over de notch op Android- en iOS-apparaten",
+   "Pauzeren",
+   "UIT",
+   "UIT",
    "Altijd",
    "Automatisch",
+   "Altijd",
+   "UIT",
    "UIT",
    "Automatisch",
+   "Geen",
    "180\302\272",
    "270\302\272",
    "Normaal",
@@ -6356,6 +6358,7 @@ static const struct
    "Schalen",
    "Scanlijn Synchronisatie",
    "Rollende scanlijn simulatie",
+   "Schaal",
    "Auto-Shader Vertraging",
    "Shader passes",
    "Voorbeeldweergave Shader Parameters",
@@ -6392,10 +6395,6 @@ static const struct
    "Gebalanceerd",
    "Gebruik Metal-Argumentbuffers (herstart vereist)",
    "Ontflikker",
-#if defined(RARCH_MOBILE)
-   "Viewport Anker Voorkeur X (portretori\303\253ntatie)",
-   "Viewport Anker Voorkeur Y (portretori\303\253ntatie)",
-#endif
    "Viewport Anker Voorkeur X",
    "Viewport Anker Voorkeur Y",
    "Aangepaste Beeldverhouding (Hoogte)",
@@ -6404,6 +6403,7 @@ static const struct
    "Aangepaste Beeldverhouding (Y-positie)",
    "VI Scherm Breedte Instellen",
    "Verticale synchronisatie (Vsync)",
+   "Systeem",
 #if defined (WIIU)
 #ifdef WIIU
    "Optimaliseren voor Wii U GamePad (Opnieuw opstarten vereist)",
@@ -6570,7 +6570,6 @@ static const struct
    "Schakel Bluetooth ERTM uit om de koppeling van sommige apparaten te repareren",
 #endif
 #endif
-   "Scan naar bluetooth apparaten en verbind ze.",
 #ifdef _3DS
    "De map met assets voor het onderste scherm moet \"bottom_menu.png\" bevatten.",
    "Pas de blauwe kleur van het lettertype onderaan het scherm aan.",
@@ -6819,8 +6818,6 @@ static const struct
    "Instellingen voor terugspoelen, snel vooruitspoelen en slow motion wijzigen.",
    "Stel het logniveau in voor de front-end. Als een logniveau van de front-end lager is dan deze wa"
    "arde, wordt het genegeerd.",
-   "Kan de prestaties verbeteren, latentie verminderen en problemen met het kraken van geluid oploss"
-   "en. Je hebt https://github.com/FeralInteractive/gamemode nodig om dit te laten werken.",
 #ifdef HAVE_GAME_AI
    "Overschrijf speler 01",
    "Overschrijf speler 02",
@@ -7718,7 +7715,6 @@ static const struct
    "Toon de \"Latentie\" instellingen",
    "Toon de \"Loggen\" instellingen.",
    "Toon de \"Netwerk\" instellingen.",
-   "Toon de \"Onscreen Weergave\" instellingen.",
    "Toon de \"Afspeellijsten\" instellingen.",
    "Toon de \"Energiebeheer\" instellingen.",
    "Toon de \"Opname\" instellingen",
@@ -8020,13 +8016,9 @@ static const struct
    "Probeer de prestaties te verbeteren door de Metal-argumentbuffers te gebruiken. Voor sommige cor"
    "es kan dit nodig zijn. Dit kan sommige shaders breken, met name op oude hardware of OS versies.",
 #if defined(RARCH_MOBILE)
-   "Horizontale positie van inhoud wanneer de viewport breder is dan de breedte van de inhoud. 0.0 i"
-   "s helemaal links, 0.5 is center, 1.0 is helemaal rechts.  (portretori\303\253ntatie)",
    "Verticale positie van content wanneer de viewport groter is dan de hoogte van de inhoud. 0.0 is "
-   "vanboven, 0.5 is center, 1.0 is vanonder. (portretori\303\253ntatie)",
+   "vanboven, 0.5 is center, 1.0 is vanonder.",
 #endif
-   "Horizontale positie van inhoud wanneer de viewport breder is dan de breedte van de inhoud. 0.0 i"
-   "s helemaal links, 0.5 is center, 1.0 is helemaal rechts.",
    "Verticale positie van content wanneer de viewport groter is dan de hoogte van de inhoud. 0.0 is "
    "vanboven, 0.5 is center, 1.0 is vanonder.",
    "Aangepaste weergave-hoogte die wordt gebruikt als de Beeldverhouding is ingesteld op 'Aangepaste"
@@ -8288,7 +8280,6 @@ static const struct
    "Verbinding met de host mislukt.",
    "Het aanmaken van de map is mislukt.",
    "GameMode gebruiken mislukt",
-   "GameMode gebruiken mislukt - zorg ervoor dat GameMode daemon is ge\303\257nstalleerd/uitgevoerd",
    "Het is niet gelukt om de inhoud uit het gecomprimeerde bestand te extraheren.",
    "Het ophalen van de nickname van de client is mislukt.",
    "Laden is mislukt.",
@@ -8645,7 +8636,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_nl_blob_check[
-      (sizeof(msg_hash_nl_blob) == (173060u
+      (sizeof(msg_hash_nl_blob) == (172230u
 #ifdef ANDROID
        + 375u
 #endif
@@ -8865,10 +8856,6 @@ typedef char msg_hash_nl_blob_check[
 #ifdef HAVE_ODROIDGO2
        + 12u
 #endif
-#if defined(RARCH_MOBILE)
-       + 47u
-       + 47u
-#endif
 #if defined (WIIU)
 #ifdef WIIU
        + 61u
@@ -9059,8 +9046,7 @@ typedef char msg_hash_nl_blob_check[
        + 53u
 #endif
 #if defined(RARCH_MOBILE)
-       + 175u
-       + 159u
+       + 138u
 #endif
 #if defined (WIIU)
 #ifdef WIIU
@@ -9185,7 +9171,6 @@ static const msg_hash_id_t msg_hash_nl_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_HELP_FILE_BROWSER_SHADER,
    (msg_hash_id_t)MENU_ENUM_LABEL_HELP_FILE_BROWSER_SHADER_PRESET,
    (msg_hash_id_t)MENU_ENUM_LABEL_HELP_FILE_CONFIG,
-   (msg_hash_id_t)MENU_ENUM_LABEL_HELP_GAMEMODE_ENABLE,
    (msg_hash_id_t)MENU_ENUM_LABEL_HELP_INPUT_ADC_TYPE,
    (msg_hash_id_t)MENU_ENUM_LABEL_HELP_INPUT_DRIVER_LINUXRAW,
    (msg_hash_id_t)MENU_ENUM_LABEL_HELP_INPUT_DRIVER_NO_DETAILS,
@@ -11170,6 +11155,8 @@ static const msg_hash_id_t msg_hash_nl_ids[] =
 #endif
 #endif
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_DISABLE_COMPOSITION,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_DLSS_NR_PRESET_DEFAULT,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_DLSS_NR_STYLE_DEFAULT,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_DRIVER_FALLBACK,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_FILTER,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_FILTER_DIR,
@@ -11214,10 +11201,16 @@ static const msg_hash_id_t msg_hash_nl_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_MESSAGE_POS_X,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_MESSAGE_POS_Y,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_NOTCH_WRITE_OVER,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_PAUSE_ON,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_SMOOTHING_OFF,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_SNAP_ANGLES_OFF,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_ALWAYS,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_AUTO,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_BEAM_ALWAYS,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_BEAM_OFF,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_OFF,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_REFRESH_AUTO,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_HANDS_NONE,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED_ROTATED,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_NORMAL,
@@ -11258,6 +11251,7 @@ static const msg_hash_id_t msg_hash_nl_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCALING_SETTINGS,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCANLINE_SYNC,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCAN_SUBFRAMES,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_XR_SCALE,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_DELAY,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_NUM_PASSES,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_PARAMETERS,
@@ -11294,10 +11288,6 @@ static const msg_hash_id_t msg_hash_nl_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_QUALITY_BALANCED,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_USE_METAL_ARG_BUFFERS,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VFILTER,
-#if defined(RARCH_MOBILE)
-   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_BIAS_PORTRAIT_X,
-   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_BIAS_PORTRAIT_Y,
-#endif
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_BIAS_X,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_BIAS_Y,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_CUSTOM_HEIGHT,
@@ -11306,6 +11296,7 @@ static const msg_hash_id_t msg_hash_nl_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_CUSTOM_Y,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VI_WIDTH,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VSYNC,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VULKAN_DRIVER_PATH_SYSTEM,
 #if defined (WIIU)
 #ifdef WIIU
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WIIU_PREFER_DRC,
@@ -11450,7 +11441,6 @@ static const msg_hash_id_t msg_hash_nl_ids[] =
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_BLUETOOTH_ERTM_DISABLE,
 #endif
 #endif
-   (msg_hash_id_t)MENU_ENUM_SUBLABEL_BLUETOOTH_SETTINGS,
 #ifdef _3DS
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_BOTTOM_ASSETS_DIRECTORY,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_BOTTOM_FONT_COLOR_BLUE,
@@ -11642,7 +11632,6 @@ static const msg_hash_id_t msg_hash_nl_ids[] =
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_FRAMECOUNT_SHOW,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_FRAME_THROTTLE_SETTINGS,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_FRONTEND_LOG_LEVEL,
-   (msg_hash_id_t)MENU_ENUM_SUBLABEL_GAMEMODE_ENABLE_LINUX,
 #ifdef HAVE_GAME_AI
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_GAME_AI_OVERRIDE_P1,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_GAME_AI_OVERRIDE_P2,
@@ -12279,7 +12268,6 @@ static const msg_hash_id_t msg_hash_nl_ids[] =
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_SETTINGS_SHOW_LATENCY,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_SETTINGS_SHOW_LOGGING,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_SETTINGS_SHOW_NETWORK,
-   (msg_hash_id_t)MENU_ENUM_SUBLABEL_SETTINGS_SHOW_ONSCREEN_DISPLAY,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_SETTINGS_SHOW_PLAYLISTS,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_SETTINGS_SHOW_POWER_MANAGEMENT,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_SETTINGS_SHOW_RECORDING,
@@ -12505,10 +12493,8 @@ static const msg_hash_id_t msg_hash_nl_ids[] =
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_SYNCHRONIZATION_SETTINGS,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_USE_METAL_ARG_BUFFERS,
 #if defined(RARCH_MOBILE)
-   (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_BIAS_PORTRAIT_X,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_BIAS_PORTRAIT_Y,
 #endif
-   (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_BIAS_X,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_BIAS_Y,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_CUSTOM_HEIGHT,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_CUSTOM_WIDTH,
@@ -12743,7 +12729,6 @@ static const msg_hash_id_t msg_hash_nl_ids[] =
    (msg_hash_id_t)MSG_FAILED_TO_CONNECT_TO_HOST,
    (msg_hash_id_t)MSG_FAILED_TO_CREATE_THE_DIRECTORY,
    (msg_hash_id_t)MSG_FAILED_TO_ENTER_GAMEMODE,
-   (msg_hash_id_t)MSG_FAILED_TO_ENTER_GAMEMODE_LINUX,
    (msg_hash_id_t)MSG_FAILED_TO_EXTRACT_CONTENT_FROM_COMPRESSED_FILE,
    (msg_hash_id_t)MSG_FAILED_TO_GET_NICKNAME_FROM_CLIENT,
    (msg_hash_id_t)MSG_FAILED_TO_LOAD,

@@ -177,7 +177,16 @@ static char fixture_root[4096];
 static void rm_rf(const char *path)
 {
    char cmd[4352];
+#ifdef _WIN32
+   /* A native Windows build's system() runs cmd.exe */
+   char *c;
+   snprintf(cmd, sizeof(cmd), "rmdir /s /q \"%s\" >nul 2>&1", path);
+   for (c = cmd; *c; c++)
+      if (*c == '/')
+         *c = '\\';
+#else
    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
+#endif
    if (system(cmd) != 0) { /* best effort */ }
 }
 
@@ -527,7 +536,7 @@ static bool run_scan(const char *content_dir, const char *dat_path,
       return false;
 
    t0 = cpu_features_get_time_usec();
-   if (!task_push_manual_content_scan(false, scan_cb))
+   if (!task_push_manual_content_scan(false, scan_cb, NULL))
    {
       fprintf(stderr, "task_push_manual_content_scan refused\n");
       return false;
@@ -547,8 +556,8 @@ static bool run_scan(const char *content_dir, const char *dat_path,
          if (task_queue_find(&finder) && found_task)
          {
             /* Through the accessors: both fields are written by the
-             * worker under property_lock, and this runs on the main
-             * thread while that worker is live.  Reading them raw is
+             * worker, and this runs on the main thread while that
+             * worker is live.  Reading them raw is
              * a data race even when it happens to hold. */
             const char *title = task_get_title(found_task);
             if ((title && *title) || task_get_progress(found_task) > 0)
@@ -628,7 +637,7 @@ static bool run_db_scan(const char *content_dir, const char *db_dir,
       return false;
 
    t0 = cpu_features_get_time_usec();
-   if (!task_push_manual_content_scan(false, scan_cb))
+   if (!task_push_manual_content_scan(false, scan_cb, NULL))
    {
       fprintf(stderr, "database scan: push refused\n");
       return false;
@@ -693,7 +702,7 @@ static bool run_scan_threaded(const char *content_dir, const char *dat_path,
 
    task_queue_init(true, msgq_push);
 
-   if (!task_push_manual_content_scan(false, scan_cb))
+   if (!task_push_manual_content_scan(false, scan_cb, NULL))
    {
       fprintf(stderr, "threaded: task_push_manual_content_scan refused\n");
       task_queue_deinit();
@@ -742,7 +751,7 @@ static bool run_scan_cancelled(const char *content_dir, const char *dat_path,
 
    task_queue_init(false, msgq_push);
 
-   if (!task_push_manual_content_scan(false, scan_cb))
+   if (!task_push_manual_content_scan(false, scan_cb, NULL))
    {
       fprintf(stderr, "cancel lane: push refused\n");
       task_queue_deinit();
@@ -1102,8 +1111,21 @@ int main(int argc, char *argv[])
    (void)argc;
    (void)argv;
 
-   snprintf(fixture_root, sizeof(fixture_root), "%s/scan_begin_fixture",
-         getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+   {
+      /* The system's temporary folder: a native Windows build has no
+       * /tmp */
+#ifdef _WIN32
+      const char *tmp = getenv("TEMP");
+      if (!tmp || !*tmp)
+         tmp = getenv("TMP");
+#else
+      const char *tmp = getenv("TMPDIR");
+#endif
+      if (!tmp || !*tmp)
+         tmp = "/tmp";
+      snprintf(fixture_root, sizeof(fixture_root), "%s/scan_begin_fixture",
+            tmp);
+   }
    rm_rf(fixture_root);
 
    /* Logging stays off for the measured lanes: the reference costs

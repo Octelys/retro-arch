@@ -845,6 +845,8 @@ static const struct
    char s_ff960910[18];
    char s_61213f1d[13];
    char s_60258de0[7];
+   char s_5410e874[7];
+   char s_d6611158[6];
    char s_317b17ed[11];
    char s_94c8d15f[11];
    char s_1f66aac3[10];
@@ -922,7 +924,6 @@ static const struct
    char s_8a24406f[28];
    char s_5977d6d8[44];
    char s_f6adf4ee[39];
-   char s_27aef25c[53];
 #ifdef _3DS
    char s_f441f728[37];
 #endif
@@ -1259,6 +1260,7 @@ static const struct
    char s_cdfe701e[8];
    char s_a181214b[34];
    char s_8ab54d62[86];
+   char s_c52621db[5];
    char s_bd039188[23];
    char s_9c7aa654[23];
    char s_ca174246[25];
@@ -2124,6 +2126,8 @@ static const struct
    "Varslingsbakgrunn",
    "Skjermindeks",
    "Alltid",
+   "Alltid",
+   "Ingen",
    "180 grader",
    "270 grader",
    "90 grader",
@@ -2203,7 +2207,6 @@ static const struct
    "Demp all lyd i stillemodus.",
    "Endre innstillinger for lyd inngang/utgang.",
    "Vis n\303\245v\303\246rende batteriniv\303\245 i menyen.",
-   "Skann etter bluetooth-enheter og opprett tilkobling.",
 #ifdef _3DS
    "Juster skriftskalaen for bunnskjerm.",
 #endif
@@ -2593,6 +2596,7 @@ static const struct
    "Ingen miniatyrbilder tilgjengelig",
    "Alle mulige miniatyrbilder nedlastinger ble allerede fors\303\270kt p\303\245 denne spillelisten"
    ".",
+   "Meny",
    "Rengj\303\270r spilleliste: ",
    "Kjerner Tilbakestilt: ",
    "Tilbakestiller kjerner: ",
@@ -2625,7 +2629,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_no_blob_check[
-      (sizeof(msg_hash_no_blob) == (29312u
+      (sizeof(msg_hash_no_blob) == (29277u
 #ifdef HAVE_LAKKA
        + 178u
 #endif
@@ -3600,6 +3604,8 @@ static const msg_hash_id_t msg_hash_no_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_MESSAGE_BGCOLOR_ENABLE,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_MONITOR_INDEX,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_ALWAYS,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_BEAM_ALWAYS,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_HANDS_NONE,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED_ROTATED,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_VERTICAL,
@@ -3677,7 +3683,6 @@ static const msg_hash_id_t msg_hash_no_ids[] =
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_AUDIO_RESPECT_SILENT_MODE,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_AUDIO_SETTINGS,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_BATTERY_LEVEL_ENABLE,
-   (msg_hash_id_t)MENU_ENUM_SUBLABEL_BLUETOOTH_SETTINGS,
 #ifdef _3DS
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_BOTTOM_FONT_SCALE,
 #endif
@@ -4014,6 +4019,7 @@ static const msg_hash_id_t msg_hash_no_ids[] =
    (msg_hash_id_t)MSG_NETPLAY_STATUS_PLAYING,
    (msg_hash_id_t)MSG_NO_THUMBNAIL_AVAILABLE,
    (msg_hash_id_t)MSG_NO_THUMBNAIL_DOWNLOAD_POSSIBLE,
+   (msg_hash_id_t)MSG_OPENXR_EDIT_TAG_MENU,
    (msg_hash_id_t)MSG_PLAYLIST_MANAGER_CLEANING_PLAYLIST,
    (msg_hash_id_t)MSG_PLAYLIST_MANAGER_CORES_RESET,
    (msg_hash_id_t)MSG_PLAYLIST_MANAGER_RESETTING_CORES,

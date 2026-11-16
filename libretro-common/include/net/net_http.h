@@ -49,7 +49,28 @@ void net_http_connection_free(struct http_connection_t *conn);
 
 void net_http_connection_set_user_agent(struct http_connection_t *conn, const char *user_agent);
 
+/* Pre-formatted "Name: value\r\n" lines. An Accept-Encoding or
+ * User-Agent among them replaces net_http's own. */
 void net_http_connection_set_headers(struct http_connection_t *conn, const char *headers);
+
+/* false: a 3xx response is returned as it is (status, headers and
+ * body), for a caller applying its own redirect rules. Followed by
+ * default. */
+void net_http_connection_set_redirects(struct http_connection_t *conn, bool follow);
+
+struct ssl_socket_retro_config;
+
+/**
+ * net_http_connection_set_tls:
+ *
+ * TLS settings of the request's own (net_socket_ssl.h), for the
+ * built-in client: its trust anchors, a client certificate, its
+ * suites. @cfg is borrowed for as long as the transfer runs. Such a
+ * transfer runs on a connection of its own, neither taken from the
+ * pool nor left in it. With another TLS backend the request fails.
+ **/
+void net_http_connection_set_tls(struct http_connection_t *conn,
+      const struct ssl_socket_retro_config *cfg);
 
 /**
  * net_http_sink_t:
@@ -100,6 +121,39 @@ typedef bool (*net_http_sink_t)(void *userdata, const void *data, size_t len);
  **/
 void net_http_connection_set_sink(struct http_connection_t *conn,
       net_http_sink_t cb, void *userdata);
+
+/* The most runs a spans sink is handed in one call */
+#define NET_HTTP_SINK_SPANS_MAX 16
+
+/* One run of decoded body bytes, in the receive buffer */
+struct net_http_span
+{
+   const void *data;
+   size_t      len;
+};
+
+/**
+ * net_http_sink_spans_t:
+ *
+ * As net_http_sink_t, with the decoded bytes as up to
+ * NET_HTTP_SINK_SPANS_MAX runs, in order, where they were received.
+ * A chunked body's long chunks are left in place rather than slid
+ * together over the chunk headers between them, so a sink that writes
+ * the runs with one gathered write (filestream_writev) gets them to
+ * the file with no copy in between.  The runs are only valid for the
+ * call.
+ **/
+typedef bool (*net_http_sink_spans_t)(void *userdata,
+      const struct net_http_span *spans, size_t count);
+
+/**
+ * net_http_connection_set_sink_spans:
+ *
+ * As net_http_connection_set_sink, with a sink that takes runs; it
+ * replaces a sink set before, and the other way round.
+ **/
+void net_http_connection_set_sink_spans(struct http_connection_t *conn,
+      net_http_sink_spans_t cb, void *userdata);
 
 void net_http_connection_set_content(struct http_connection_t *conn, const char *content_type,
       size_t content_length, const void *content);

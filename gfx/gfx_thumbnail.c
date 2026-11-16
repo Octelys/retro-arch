@@ -992,11 +992,46 @@ static bool gfx_thumb_frame_budget(void *ud, size_t avail, size_t len)
    return cpu_features_get_time_usec() - *(int64_t*)ud < 2000;
 }
 
+/* 64-bit FNV-1a; never 0 for a non-empty path, so 0 means "none". */
+static uint64_t gfx_thumbnail_file_hash(const char *path)
+{
+   uint64_t h = 0xcbf29ce484222325ULL;
+   if (!path || !*path)
+      return 0;
+   while (*path)
+      h = (h ^ (unsigned char)*path++) * 0x100000001b3ULL;
+   return h ? h : 1;
+}
+
+/* Whether @thumbnail already holds @path, shown or on its way.
+ *
+ * Asking only the animation session left out every still - and every
+ * animation the preview budget refused, which lands as a still - so
+ * opening the viewer on the image the file browser was showing reset
+ * the thumbnail and read and decoded the file all over again. */
 bool gfx_thumbnail_has_file(const gfx_thumbnail_t *thumbnail, const char *path)
 {
-   const gfx_anim_preview_t *session = thumbnail
-      ? (const gfx_anim_preview_t*)thumbnail->anim_sess : NULL;
-   return session && string_is_equal(session->path, path);
+   const gfx_anim_preview_t *session;
+   if (!thumbnail || !path || !*path)
+      return false;
+   if ((session = (const gfx_anim_preview_t*)thumbnail->anim_sess))
+      return string_is_equal(session->path, path);
+   if (!thumbnail->file_hash)
+      return false;
+   switch (GFX_THUMB_STATUS_LOAD(
+         (retro_atomic_int_t*)&thumbnail->status))
+   {
+      case GFX_THUMBNAIL_STATUS_AVAILABLE:
+         break;
+      case GFX_THUMBNAIL_STATUS_PENDING:
+         /* superseded: nothing will ever deliver it */
+         if (thumbnail->list_id != gfx_thumb_st.list_id)
+            return false;
+         break;
+      default:
+         return false;
+   }
+   return thumbnail->file_hash == gfx_thumbnail_file_hash(path);
 }
 
 /* Main-thread transport command; the audio mixer applies its request
@@ -1717,6 +1752,9 @@ void gfx_thumbnail_request(
             {
                gfx_thumbnail_tag_t *thumbnail_tag;
 
+               thumbnail->file_hash = gfx_thumbnail_file_hash(
+                     thumbnail_path);
+
                /* A WebM or MP4 that serves as its own thumbnail takes
                 * the sliding window rather than the whole-file still
                 * decode; see gfx_thumbnail_try_video_open. */
@@ -1839,6 +1877,8 @@ void gfx_thumbnail_request_file(
        || !path_is_valid(file_path))
       return;
 
+   thumbnail->file_hash = gfx_thumbnail_file_hash(file_path);
+
    /* Video containers take the sliding window before the still task
     * is ever queued; see gfx_thumbnail_try_video_open. */
    if (gfx_thumbnail_try_video_open(thumbnail, file_path))
@@ -1941,6 +1981,7 @@ void gfx_thumbnail_reset(gfx_thumbnail_t *thumbnail)
     * thread learn on delivery that this reset happened. */
    GFX_THUMB_STATUS_STORE(&thumbnail->status, GFX_THUMBNAIL_STATUS_UNKNOWN);
    thumbnail->texture     = 0;
+   thumbnail->file_hash   = 0;
    thumbnail->dims        = 0;
    thumbnail->alpha       = 0.0f;
    thumbnail->delay_timer = 0.0f;
@@ -2532,6 +2573,7 @@ void gfx_thumbnail_draw(
       draw.matrix_data     = &mymat;
       draw.texture         = thumb_texture;
       draw.pipeline_id     = 0;
+      draw.effect          = NULL;
 
       /* Set thumbnail alignment within bounding box */
       switch (alignment)
@@ -3497,9 +3539,6 @@ void gfx_savestate_thumbnail_get_path(
 
    s[0] = '\0';
 
-   if (!state_name || !*state_name)
-      return;
-
 #ifdef HAVE_MENU
    if (playlist)
    {
@@ -3513,8 +3552,8 @@ void gfx_savestate_thumbnail_get_path(
       if (entry && *entry->path)
       {
          size_t _len;
-         /* Four path buffers in one heap block: even at the console
-          * PATH_MAX_LENGTH of 512 the set is a whole 2 KiB stack
+         /* Three path buffers in one heap block: even at the console
+          * PATH_MAX_LENGTH of 512 the set is most of a 2 KiB stack
           * budget, and this runs from the menu task path.  On
           * allocation failure the thumbnail path is simply not
           * resolved -- the caller already treats an empty result as
@@ -3523,41 +3562,81 @@ void gfx_savestate_thumbnail_get_path(
          {
             char new_path[PATH_MAX_LENGTH];
             char entry_basename[PATH_MAX_LENGTH];
-            char old_savefile_dir[PATH_MAX_LENGTH];
-            char old_savestate_dir[PATH_MAX_LENGTH];
+            char new_savestate_dir[PATH_MAX_LENGTH];
          } *pb = (struct gfx_ss_thumb_paths*)calloc(1, sizeof(*pb));
          char *new_path          = pb ? pb->new_path : NULL;
          char *entry_basename    = pb ? pb->entry_basename : NULL;
-         char *old_savefile_dir  = pb ? pb->old_savefile_dir : NULL;
-         char *old_savestate_dir = pb ? pb->old_savestate_dir : NULL;
+         char *new_savestate_dir = pb ? pb->new_savestate_dir : NULL;
+         settings_t *settings    = config_get_ptr();
+         const char *core        = runloop_st->system.info.library_name;
+         bool sorted             = false;
+         char *delim;
 
          if (!pb)
             return;
 
-         strlcpy(old_savefile_dir, runloop_st->savefile_dir, PATH_MAX_LENGTH);
-         strlcpy(old_savestate_dir, runloop_st->savestate_dir, PATH_MAX_LENGTH);
+         /* The configured folder, as a content load starts from: the
+          * current one is whatever the last content was redirected to,
+          * or empty when none has run. */
+         strlcpy(new_savestate_dir, dir_get_ptr(RARCH_DIR_SAVESTATE),
+               PATH_MAX_LENGTH);
 
-         strlcpy(new_path, entry->path, PATH_MAX_LENGTH);
+         fill_pathname_expand_special(new_path, entry->path, PATH_MAX_LENGTH);
+         if ((delim = (char*)path_get_archive_delim(new_path)))
+         {
+            *delim = '\0';
+            if (!runloop_st->system.info.block_extract)
+            {
+               path_basedir(new_path);
+               fill_pathname_dir(new_path, entry->path, "", PATH_MAX_LENGTH);
+            }
+         }
          path_remove_extension(new_path);
 
          _len = strlcpy(entry_basename, path_basename(new_path), PATH_MAX_LENGTH);
          _len = strlcpy_lit(entry_basename + _len, ".state", PATH_MAX_LENGTH - _len);
 
-         /* Set temporary save redirection paths */
-         runloop_path_set_redirect(config_get_ptr(), old_savefile_dir, old_savestate_dir);
+         if (settings->bools.savestates_in_content_dir || !*new_savestate_dir)
+            fill_pathname_basedir(new_savestate_dir, new_path, PATH_MAX_LENGTH);
+
+         _len = strcspn(new_path, "/\\");
+
+         if (     *new_savestate_dir
+               && core && *core
+               && !string_is_equal(core, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NO_CORE))
+               && !(   settings->bools.sort_savestates_by_content_enable
+                    && _len && new_path[_len - 1] == ':'
+                    && path_basename(new_path) == new_path + _len + 1))
+         {
+            if (settings->bools.sort_savestates_by_content_enable)
+            {
+               _len = fill_pathname_slash(new_savestate_dir, PATH_MAX_LENGTH);
+               fill_pathname_parent_dir_name(new_savestate_dir + _len,
+                     new_path, PATH_MAX_LENGTH - _len);
+            }
+            if (settings->bools.sort_savestates_enable)
+               fill_pathname_join(new_savestate_dir, new_savestate_dir,
+                     core, PATH_MAX_LENGTH);
+            sorted =    settings->bools.sort_savestates_enable
+                     || settings->bools.sort_savestates_by_content_enable;
+         }
+
+         /* A load creates a sorted folder; an unsorted one that is
+          * missing leaves states named after the content, beside it */
+         if (!sorted && !path_is_directory(new_savestate_dir))
+            fill_pathname_basedir(new_savestate_dir, new_path, PATH_MAX_LENGTH);
 
          fill_pathname_join_special(new_path,
-               runloop_st->savestate_dir, entry_basename, PATH_MAX_LENGTH);
-
-         /* Restore current save redirection paths */
-         dir_set(RARCH_DIR_CURRENT_SAVEFILE, old_savefile_dir);
-         dir_set(RARCH_DIR_CURRENT_SAVESTATE, old_savestate_dir);
+               new_savestate_dir, entry_basename, PATH_MAX_LENGTH);
 
          state_name = new_path;
          owned      = pb;
       }
    }
 #endif /* HAVE_MENU */
+
+   if (!state_name || !*state_name)
+      return;
 
    _len = strlcpy(s, state_name, len);
 

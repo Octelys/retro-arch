@@ -818,16 +818,9 @@ static bool sdl2_views_setup(sdl2_video_t *vid,
       sdl2_vv_target_drop(vid, &vid->views.canvas_target,
             &vid->views.canvas);
    per_eye = video_views_ui_per_eye(&video_info->views, layout, true);
-   /* No directive inside the macro's arguments: MSVC's preprocessor
-    * takes it as tokens. */
-#ifdef HAVE_GFX_WIDGETS
    ui = VIDEO_VIEWS_UI_WANTED(per_eye, vid->menu.active, msg,
          video_info->statistics_show,
-         video_info->widgets_active && gfx_widgets_visible(video_info));
-#else
-   ui = VIDEO_VIEWS_UI_WANTED(per_eye, vid->menu.active, msg,
-         video_info->statistics_show, false);
-#endif
+         video_info->widgets_visible);
 #ifdef HAVE_MENU
    ui = ui || (per_eye
          && (video_info->menu_st_flags & MENU_ST_FLAG_ALIVE));
@@ -993,13 +986,14 @@ static void sdl2_views_menu_rect(sdl2_video_t *vid, unsigned dims,
       SDL_Rect *out)
 {
    struct video_viewport vp;
-   memset(&vp, 0, sizeof(vp));
+   vp.pos       = 0;
+   vp.dims      = 0;
    vp.full_dims = dims;
    video_driver_update_viewport(&vp, false, vid->video.force_aspect, true);
-   out->x = VIDEO_POS_X(vp.pos);
-   out->y = VIDEO_POS_Y(vp.pos);
-   out->w = (int)VIDEO_SCALE_W(vp.dims);
-   out->h = (int)VIDEO_SCALE_H(vp.dims);
+   out->x       = VIDEO_POS_X(vp.pos);
+   out->y       = VIDEO_POS_Y(vp.pos);
+   out->w       = (int)VIDEO_SCALE_W(vp.dims);
+   out->h       = (int)VIDEO_SCALE_H(vp.dims);
 }
 
 static void sdl2_set_view_count(void *data, unsigned count)
@@ -1013,6 +1007,129 @@ static void sdl2_set_view_count(void *data, unsigned count)
       vid->views.chains.stock[i] = NULL;
 }
 #endif
+
+/* Whether @frame lies in the texture lent to the core */
+static bool sdl2_sw_lend_holds(const sdl2_video_t *vid, const void *frame)
+{
+   uintptr_t base = (uintptr_t)vid->sw_lend.pixels;
+   uintptr_t p    = (uintptr_t)frame;
+   return base && p >= base && p - base
+      < VIDEO_SCALE_H(vid->sw_lend.dims) * vid->sw_lend.pitch;
+}
+
+/* Unlocked, its memory gone: a cached frame in it goes first */
+static void sdl2_sw_lend_close(sdl2_video_t *vid, bool retire)
+{
+   if (!vid->sw_lend.pixels)
+      return;
+   if (retire)
+      video_driver_cached_frame_retire();
+   SDL_UnlockTexture(vid->frame.tex);
+   vid->sw_lend.pixels = NULL;
+}
+
+/* A frame pushed with the texture lent. True when it is the loan, now
+ * in the texture. A window of the loan comes out into scratch first;
+ * one that cannot be is dropped, *frame NULL. A core pushing windows
+ * is lent no more. */
+static bool sdl2_sw_lend_take(sdl2_video_t *vid, const void **frame,
+      unsigned dims, unsigned *pitch)
+{
+   bool held;
+   if (!vid->sw_lend.pixels)
+      return false;
+   held = sdl2_sw_lend_holds(vid, *frame);
+   if (     *frame == vid->sw_lend.pixels && dims == vid->sw_lend.dims
+         && *pitch == vid->sw_lend.pitch)
+   {
+      sdl2_sw_lend_close(vid, true);
+      vid->frame.pitch = *pitch;
+      return true;
+   }
+   if (held)
+   {
+      unsigned y;
+      unsigned bpp      = vid->video.rgb32 ? 4 : 2;
+      size_t tight      = (size_t)VIDEO_SCALE_W(dims) * bpp;
+      size_t rows       = VIDEO_SCALE_H(dims);
+      size_t room       = VIDEO_SCALE_H(vid->sw_lend.dims) * vid->sw_lend.pitch
+         - (size_t)((uintptr_t)*frame - (uintptr_t)vid->sw_lend.pixels);
+      const uint8_t *in = (const uint8_t*)*frame;
+      if (     !tight || !rows || room < tight
+            || rows * tight > vid->sw_lend.scratch_size
+            || (rows - 1) * (size_t)*pitch > room - tight)
+         *frame = NULL;
+      else
+      {
+         for (y = 0; y < rows; y++, in += *pitch)
+            memcpy(vid->sw_lend.scratch + y * tight, in, tight);
+         *frame = vid->sw_lend.scratch;
+         *pitch = (unsigned)tight;
+      }
+      /* The texture goes to the window's size for this and would have
+       * to be remade, blank, for every loan: not lent at this size again */
+      vid->sw_lend.declined_dims = vid->sw_lend.dims;
+   }
+   sdl2_sw_lend_close(vid, held);
+   return false;
+}
+
+/* Lends the frame texture itself where SDL hands out memory at the
+ * frame's tight pitch. Write only: what SDL hands out may be a mapping
+ * that reads back slowly or not at all. A loan left open across a dupe
+ * is lent again. */
+static bool sdl2_get_current_software_framebuffer(void *data,
+      struct retro_framebuffer *fb)
+{
+   sdl2_video_t *vid = (sdl2_video_t*)data;
+   unsigned dims, bpp;
+   size_t tight, size;
+   void *pixels;
+   int pitch;
+
+   if (     !vid || !fb || !vid->renderer || !fb->width || !fb->height
+         || (fb->access_flags & RETRO_MEMORY_ACCESS_READ))
+      return false;
+   dims  = VIDEO_SCALE_PACK(fb->width, fb->height);
+   bpp   = vid->video.rgb32 ? 4 : 2;
+   tight = (size_t)fb->width * bpp;
+   if (vid->sw_lend.pixels && vid->sw_lend.dims != dims)
+      sdl2_sw_lend_close(vid, false);
+   if (!vid->sw_lend.pixels)
+   {
+      if (vid->sw_lend.declined_dims == dims)
+         return false;
+      size = tight * fb->height;
+      if (size > vid->sw_lend.scratch_size)
+      {
+         uint8_t *tmp = (uint8_t*)realloc(vid->sw_lend.scratch, size);
+         if (!tmp)
+            return false;
+         vid->sw_lend.scratch      = tmp;
+         vid->sw_lend.scratch_size = size;
+      }
+      sdl_refresh_input_size(vid, false, vid->video.rgb32, dims,
+            (unsigned)tight);
+      if (     !vid->frame.tex
+            || SDL_LockTexture(vid->frame.tex, NULL, &pixels, &pitch) != 0)
+         return false;
+      if ((size_t)pitch != tight)
+      {
+         SDL_UnlockTexture(vid->frame.tex);
+         vid->sw_lend.declined_dims = dims;
+         return false;
+      }
+      vid->sw_lend.pixels = pixels;
+      vid->sw_lend.pitch  = tight;
+      vid->sw_lend.dims   = dims;
+   }
+   fb->data         = vid->sw_lend.pixels;
+   fb->pitch        = vid->sw_lend.pitch;
+   fb->format       = vid->video.rgb32
+      ? RETRO_PIXEL_FORMAT_XRGB8888 : RETRO_PIXEL_FORMAT_RGB565;
+   fb->memory_flags = 0;
+   return true;
+}
 
 static bool sdl2_gfx_frame(void *data, const void *frame,
       unsigned dims, uint64_t frame_count,
@@ -1061,18 +1178,25 @@ static bool sdl2_gfx_frame(void *data, const void *frame,
          vid->views.drawn[i] = view_chains[i];
       SDL_RenderClear(vid->renderer);
       if (frame)
+      {
          sdl2_views_write(vid, &video_info->views, view_chains, frame,
                pitch);
+         sdl2_sw_lend_close(vid, sdl2_sw_lend_holds(vid, frame));
+      }
       sdl2_views_render(vid);
    }
    else
 #endif
    {
+      bool in_place = frame && sdl2_sw_lend_take(vid, &frame, dims, &pitch);
       if (frame)
       {
          SDL_RenderClear(vid->renderer);
-         sdl_refresh_input_size(vid, false, vid->video.rgb32, dims, pitch);
-         SDL_UpdateTexture(vid->frame.tex, NULL, frame, pitch);
+         if (!in_place)
+         {
+            sdl_refresh_input_size(vid, false, vid->video.rgb32, dims, pitch);
+            SDL_UpdateTexture(vid->frame.tex, NULL, frame, pitch);
+         }
       }
 
       sdl2_blit_frame(vid);
@@ -1085,17 +1209,10 @@ static bool sdl2_gfx_frame(void *data, const void *frame,
          &video_info->views_layout, true);
    if (!views_per_eye)
       sdl2_vv_target_drop(vid, &vid->views.ui_target, &vid->views.ui);
-   /* Drawn and composited only when there is UI; overlays are hidden.
-    * No directive inside the macro's arguments: MSVC's preprocessor
-    * takes it as tokens. */
-#ifdef HAVE_GFX_WIDGETS
+   /* Drawn and composited only when there is UI; overlays are hidden. */
    views_ui = VIDEO_VIEWS_UI_WANTED(views_per_eye, vid->menu.active, msg,
          video_info->statistics_show,
-         video_info->widgets_active && gfx_widgets_visible(video_info));
-#else
-   views_ui = VIDEO_VIEWS_UI_WANTED(views_per_eye, vid->menu.active, msg,
-         video_info->statistics_show, false);
-#endif
+         video_info->widgets_visible);
 #ifdef HAVE_MENU
    views_ui = views_ui || (views_per_eye && menu_is_alive);
 #endif
@@ -1354,6 +1471,10 @@ static void sdl2_gfx_free(void *data)
       sdl2_views_release(vid);
 #endif
 
+   if (vid->frame.tex)
+      sdl2_sw_lend_close(vid, true);
+   free(vid->sw_lend.scratch);
+
    if (vid->renderer)
       SDL_DestroyRenderer(vid->renderer);
 
@@ -1472,6 +1593,7 @@ static void sdl2_poke_set_filtering(void *data, unsigned index, bool smooth, boo
    sdl2_video_t *vid = (sdl2_video_t*)data;
    vid->video.smooth = smooth;
 
+   sdl2_sw_lend_close(vid, true);
    sdl_tex_zero(&vid->frame);
 #ifdef SDL2_VIEWS
    {
@@ -1688,7 +1810,7 @@ static video_poke_interface_t sdl2_video_poke_interface = {
    sdl2_show_mouse,
    sdl2_grab_mouse_toggle,
    NULL, /* get_current_shader */
-   NULL, /* get_current_software_framebuffer */
+   sdl2_get_current_software_framebuffer,
    NULL, /* get_hw_render_interface */
    NULL, /* set_hdr_menu_nits */
    NULL, /* set_hdr_paper_white_nits */
@@ -2199,7 +2321,6 @@ typedef struct
    uint32_t                      *staging;
    /* The atlas texture's pixel size, packed. */
    unsigned                       tex_dims;
-   bool                           atlas_dirty;
 
    /* The chunk a line is built into before it is handed over. Here
     * rather than on the stack of the function that fills it: a glyph
@@ -2258,7 +2379,7 @@ static void sdl2_raster_font_upload_atlas(sdl2_raster_t *font)
     * rectangles drawn into since the last upload change */
    tex_w = VIDEO_SCALE_W(font->tex_dims);
    tex_h = VIDEO_SCALE_H(font->tex_dims);
-   rects = (whole || font->atlas_dirty || !font->atlas->dirty)
+   rects = (whole || !font->atlas->dirty)
       ? 1 : font_atlas_dirty_rects(font->atlas);
    for (r = 0; r < rects; r++)
    {
@@ -2268,7 +2389,6 @@ static void sdl2_raster_font_upload_atlas(sdl2_raster_t *font)
       x1    = VIDEO_SCALE_W(xy1);
       y1    = VIDEO_SCALE_H(xy1);
       if (     whole
-            || font->atlas_dirty
             || !font->atlas->dirty
             || x1 <= x0 || y1 <= y0 || x1 > tex_w || y1 > tex_h)
       {
@@ -2300,7 +2420,6 @@ static void sdl2_raster_font_upload_atlas(sdl2_raster_t *font)
    }
 
    font->atlas->dirty = false;
-   font->atlas_dirty  = false;
 }
 
 static void *sdl2_raster_font_init(void *data, const char *font_path,
@@ -2391,8 +2510,10 @@ static int sdl2_raster_font_get_message_width(void *data, const char *msg,
 static void sdl2_raster_font_render_message(
       sdl2_raster_t *font, const char *msg, size_t msg_len, float scale,
       const SDL_Color col, float pos_x, float pos_y,
-      enum text_alignment align, unsigned width, unsigned height)
+      enum text_alignment align, unsigned width, unsigned height,
+      float x_scale)
 {
+   float scale_x                          = scale * x_scale;
    struct font_line_metrics *line_metrics = NULL;
    float line_height_norm                 = 0.0f;
    SDL_Vertex *verts                      = font->verts;
@@ -2422,6 +2543,24 @@ static void sdl2_raster_font_render_message(
 
 #define FONT_LAYOUT_ALIGNED (align == TEXT_ALIGN_RIGHT \
       || align == TEXT_ALIGN_CENTER)
+/* A glyph cached mid-line lands in the atlas after the line's upload:
+ * what is batched goes out first, on the texture it was laid out for. */
+#define FONT_LAYOUT_DIRTY(glyph) \
+   do \
+   { \
+      (void)(glyph); \
+      if (font->atlas->dirty) \
+      { \
+         if (line_ok && n_glyphs > 0) \
+            SDL_RenderGeometry(font->vid->renderer, font->tex, \
+                  verts, n_glyphs * 4, idx, n_glyphs * 6); \
+         n_glyphs = 0; \
+         sdl2_raster_font_upload_atlas(font); \
+         line_ok  = line_ok && font->tex; \
+         inv_w    = 1.0f / (float)VIDEO_SCALE_W(font->tex_dims); \
+         inv_h    = 1.0f / (float)VIDEO_SCALE_H(font->tex_dims); \
+      } \
+   } while (0)
 #define FONT_LAYOUT_LINE(line, line_width, count, bytes) \
    do \
    { \
@@ -2429,15 +2568,15 @@ static void sdl2_raster_font_render_message(
       line_ok = ((bytes) > 0 && font->tex); \
       if (!line_ok) \
          break; \
-      if (font->atlas_dirty || font->atlas->dirty) \
+      if (font->atlas->dirty) \
          sdl2_raster_font_upload_atlas(font); \
       x = pos_x * (float)width; \
       y = (1.0f - (pos_y - (float)(line) * line_height_norm)) \
          * (float)height; \
       if (align == TEXT_ALIGN_RIGHT) \
-         x -= (int)((float)(line_width) * scale); \
+         x -= (int)((float)(line_width) * scale_x); \
       else if (align == TEXT_ALIGN_CENTER) \
-         x -= (int)((float)(line_width) * scale) * 0.5f; \
+         x -= (int)((float)(line_width) * scale_x) * 0.5f; \
       inv_w = 1.0f / (float)VIDEO_SCALE_W(font->tex_dims); \
       inv_h = 1.0f / (float)VIDEO_SCALE_H(font->tex_dims); \
       n_glyphs = 0; \
@@ -2452,9 +2591,9 @@ static void sdl2_raster_font_render_message(
       (void)(pen_y); \
       if (!line_ok) \
          break; \
-      gx = x + (glyph)->draw_offset_x * scale; \
+      gx = x + (glyph)->draw_offset_x * scale_x; \
       gy = y + (glyph)->draw_offset_y * scale; \
-      gw = VIDEO_SCALE_W((glyph)->dims) * scale; \
+      gw = VIDEO_SCALE_W((glyph)->dims) * scale_x; \
       gh = VIDEO_SCALE_H((glyph)->dims) * scale; \
       u0 = (float)VIDEO_SCALE_W((glyph)->atlas_pos) * inv_w; \
       v0 = (float)VIDEO_SCALE_H((glyph)->atlas_pos) * inv_h; \
@@ -2487,7 +2626,7 @@ static void sdl2_raster_font_render_message(
       idx[n_glyphs * 6 + 3] = base + 2; \
       idx[n_glyphs * 6 + 4] = base + 1; \
       idx[n_glyphs * 6 + 5] = base + 3; \
-      x += (glyph)->advance_x * scale; \
+      x += (glyph)->advance_x * scale_x; \
       if (++n_glyphs >= SDL2_FONT_MAX_GLYPHS) \
       { \
          SDL_RenderGeometry(font->vid->renderer, font->tex, \
@@ -2569,14 +2708,14 @@ static void sdl2_raster_font_render_msg(
 
       sdl2_raster_font_render_message(font, msg, msg_len, scale,
             col_drop,
-            x + scale * drop_x / (float)width,
+            x + scale * drop_x * rp.x_scale / (float)width,
             y + scale * drop_y / (float)height,
-            align, width, height);
+            align, width, height, rp.x_scale);
    }
 
    sdl2_raster_font_render_message(font, msg, msg_len, scale,
          col,
-         x, y, align, width, height);
+         x, y, align, width, height, rp.x_scale);
 }
 
 static const struct font_glyph *sdl2_raster_font_get_glyph(

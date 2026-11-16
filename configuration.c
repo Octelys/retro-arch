@@ -39,6 +39,7 @@
 #include "file_path_special.h"
 #include "command.h"
 #include "configuration.h"
+#include "gfx/video_views.h"
 #include "gfx/video_windows.h"
 #include "content.h"
 #include "config.def.h"
@@ -85,17 +86,17 @@ void android_app_set_window_settings(bool notch_write_over,
 #include "list_special.h"
 
 #if defined(__WINRT__) || defined(WINAPI_FAMILY) && WINAPI_FAMILY == WINAPI_FAMILY_PHONE_APP
-#include "uwp/uwp_func.h"
+#include "os/uwp/uwp_func.h"
 #endif
 
-#include "lakka.h"
+#include "os/lakka/lakka.h"
 
 #ifdef HAVE_LAKKA_SWITCH
-#include "lakka-switch.h"
+#include "os/lakka/lakka-switch.h"
 #endif
 
 #if defined(HAVE_LIBNX)
-#include "switch_performance_profiles.h"
+#include "os/libnx/switch_performance_profiles.h"
 #endif
 
 #if __APPLE__
@@ -455,6 +456,7 @@ const struct input_bind_map input_config_bind_map[RARCH_BIND_LIST_END_NULL] = {
    DECLARE_META_BIND(2, headset_recenter,      RARCH_HEADSET_RECENTER,       MENU_ENUM_LABEL_VALUE_INPUT_META_HEADSET_RECENTER),
    DECLARE_META_BIND(2, laser_pointer_toggle,  RARCH_LASER_POINTER_TOGGLE,   MENU_ENUM_LABEL_VALUE_INPUT_META_LASER_POINTER_TOGGLE),
    DECLARE_META_BIND(2, headset_view_toggle,   RARCH_HEADSET_VIEW_TOGGLE,    MENU_ENUM_LABEL_VALUE_INPUT_META_HEADSET_VIEW_TOGGLE),
+   DECLARE_META_BIND(2, headset_edit_screens,  RARCH_HEADSET_EDIT_SCREENS,   MENU_ENUM_LABEL_VALUE_INPUT_META_HEADSET_EDIT_SCREENS),
    DECLARE_META_BIND(2, fps_toggle,            RARCH_FPS_TOGGLE,             MENU_ENUM_LABEL_VALUE_INPUT_META_FPS_TOGGLE),
    DECLARE_META_BIND(2, toggle_statistics,     RARCH_STATISTICS_TOGGLE,      MENU_ENUM_LABEL_VALUE_INPUT_META_STATISTICS_TOGGLE),
    DECLARE_META_BIND(2, ai_service,            RARCH_AI_SERVICE,             MENU_ENUM_LABEL_VALUE_INPUT_META_AI_SERVICE),
@@ -2207,6 +2209,9 @@ static struct config_path_setting *populate_settings_path(
 #endif
    SETTING_PATH("video_filter",                  settings->paths.path_softfilter_plugin, false, NULL, true);
    SETTING_PATH("video_font_path",               settings->paths.path_font, false, NULL, true);
+#ifdef HAVE_VULKAN_CUSTOM_DRIVER
+   SETTING_PATH("video_vulkan_driver_path",      settings->paths.path_vulkan_driver, false, NULL, true);
+#endif
    SETTING_PATH("video_record_config",           settings->paths.path_record_config, false, NULL, true);
    SETTING_PATH("video_stream_config",           settings->paths.path_stream_config, false, NULL, true);
    SETTING_PATH("video_stream_url",              settings->paths.path_stream_url, false, NULL, true);
@@ -2505,6 +2510,7 @@ static const struct config_bool_row config_bool_rows[] = {
 #include "settings/settings_def_input_bind_timeouts.h"
 #include "settings/settings_def_video_hdr_toggles.h"
 #include "settings/settings_def_video_upscaler.h"
+#include "settings/settings_def_vulkan_driver_path.h"
 #include "settings/settings_def_video_stereo.h"
 #include "settings/settings_def_video_headset.h"
 #include "settings/settings_def_rewind.h"
@@ -2966,6 +2972,7 @@ static struct config_bool_setting *populate_settings_bool(
 #else
    SETTING_BOOL("core_info_cache_enable",        &settings->bools.core_info_cache_enable, true, DEFAULT_CORE_INFO_CACHE_ENABLE, false);
 #endif
+   SETTING_BOOL("core_firmware_notification_enable", &settings->bools.core_firmware_notification_enable, true, true, false);
    SETTING_BOOL("core_set_supports_no_game_enable", &settings->bools.set_supports_no_game_enable, true, true, false);
 #ifndef HAVE_DYNAMIC
    SETTING_BOOL("always_reload_core_on_run_content", &settings->bools.always_reload_core_on_run_content, true, DEFAULT_ALWAYS_RELOAD_CORE_ON_RUN_CONTENT, false);
@@ -3343,6 +3350,7 @@ static const struct config_float_row config_float_rows[] = {
 #include "settings/settings_def_input_bind_timeouts.h"
 #include "settings/settings_def_video_hdr_toggles.h"
 #include "settings/settings_def_video_upscaler.h"
+#include "settings/settings_def_vulkan_driver_path.h"
 #include "settings/settings_def_video_stereo.h"
 #include "settings/settings_def_video_headset.h"
 #include "settings/settings_def_rewind.h"
@@ -3987,6 +3995,7 @@ static const struct config_uint_row config_uint_rows[] = {
 #include "settings/settings_def_input_bind_timeouts.h"
 #include "settings/settings_def_video_hdr_toggles.h"
 #include "settings/settings_def_video_upscaler.h"
+#include "settings/settings_def_vulkan_driver_path.h"
 #include "settings/settings_def_video_stereo.h"
 #include "settings/settings_def_video_headset.h"
 #include "settings/settings_def_rewind.h"
@@ -4786,6 +4795,7 @@ static const struct config_int_row config_int_rows[] = {
 #include "settings/settings_def_input_bind_timeouts.h"
 #include "settings/settings_def_video_hdr_toggles.h"
 #include "settings/settings_def_video_upscaler.h"
+#include "settings/settings_def_vulkan_driver_path.h"
 #include "settings/settings_def_video_stereo.h"
 #include "settings/settings_def_video_headset.h"
 #include "settings/settings_def_rewind.h"
@@ -5429,6 +5439,7 @@ static struct config_int_setting *populate_settings_int(
 #include "settings/settings_def_input_bind_timeouts.h"
 #include "settings/settings_def_video_hdr_toggles.h"
 #include "settings/settings_def_video_upscaler.h"
+#include "settings/settings_def_vulkan_driver_path.h"
 #include "settings/settings_def_video_stereo.h"
 #include "settings/settings_def_video_headset.h"
 #include "settings/settings_def_rewind.h"
@@ -5890,6 +5901,127 @@ static struct config_int_setting *populate_settings_int(
       strlcpy(playlist_path, new_file, sizeof(playlist_path)); \
 } \
 
+void config_reset_video_screen_xr(settings_t *settings,
+      unsigned first, unsigned count)
+{
+   video_screen_xr_t screen;
+   unsigned i;
+
+   if (!settings || first >= RETRO_VIDEO_VIEWS_MAX)
+      return;
+   if (count > RETRO_VIDEO_VIEWS_MAX - first)
+      count = RETRO_VIDEO_VIEWS_MAX - first;
+
+   video_views_xr_reset(&screen, 1);
+   for (i = first; i < first + count; i++)
+   {
+      settings->floats.video_screen_xr_x[i] = screen.x;
+      settings->floats.video_screen_xr_y[i] = screen.y;
+      settings->floats.video_screen_xr_z[i] = screen.z;
+      settings->floats.video_screen_xr_yaw[i] = screen.yaw;
+      settings->floats.video_screen_xr_pitch[i] = screen.pitch;
+      settings->floats.video_screen_xr_roll[i] = screen.roll;
+      settings->floats.video_screen_xr_scale[i] = screen.scale;
+      settings->bools.video_screen_xr_visible[i] = screen.visible;
+   }
+}
+
+void config_reset_video_menu_xr(settings_t *settings)
+{
+   video_screen_xr_t menu;
+   if (!settings)
+      return;
+   video_views_xr_reset(&menu, 1);
+   settings->floats.video_openxr_menu_xr_x     = menu.x;
+   settings->floats.video_openxr_menu_xr_y     = menu.y;
+   settings->floats.video_openxr_menu_xr_z     = menu.z;
+   settings->floats.video_openxr_menu_xr_yaw   = menu.yaw;
+   settings->floats.video_openxr_menu_xr_pitch = menu.pitch;
+   settings->floats.video_openxr_menu_xr_roll  = menu.roll;
+   settings->floats.video_openxr_menu_xr_scale = menu.scale;
+   settings->bools.video_openxr_menu_placed    = false;
+}
+
+void config_get_video_screen_xr(unsigned screen, video_screen_xr_t *out)
+{
+   settings_t *settings = config_get_ptr();
+   video_views_xr_reset(out, 1);
+   if (!settings || screen >= RETRO_VIDEO_VIEWS_MAX)
+      return;
+   out->x       = settings->floats.video_screen_xr_x[screen];
+   out->y       = settings->floats.video_screen_xr_y[screen];
+   out->z       = settings->floats.video_screen_xr_z[screen];
+   out->yaw     = settings->floats.video_screen_xr_yaw[screen];
+   out->pitch   = settings->floats.video_screen_xr_pitch[screen];
+   out->roll    = settings->floats.video_screen_xr_roll[screen];
+   out->scale   = settings->floats.video_screen_xr_scale[screen];
+   out->visible = settings->bools.video_screen_xr_visible[screen];
+}
+
+bool config_get_video_menu_xr(video_screen_xr_t *out)
+{
+   settings_t *settings = config_get_ptr();
+   video_views_xr_reset(out, 1);
+   if (!settings)
+      return false;
+   out->x     = settings->floats.video_openxr_menu_xr_x;
+   out->y     = settings->floats.video_openxr_menu_xr_y;
+   out->z     = settings->floats.video_openxr_menu_xr_z;
+   out->yaw   = settings->floats.video_openxr_menu_xr_yaw;
+   out->pitch = settings->floats.video_openxr_menu_xr_pitch;
+   out->roll  = settings->floats.video_openxr_menu_xr_roll;
+   out->scale = settings->floats.video_openxr_menu_xr_scale;
+   return settings->bools.video_openxr_menu_placed;
+}
+
+void config_set_video_screen_xr(unsigned screen,
+      const video_screen_xr_t *values)
+{
+   video_screen_xr_t s;
+   settings_t *settings = config_get_ptr();
+   if (!settings || screen >= RETRO_VIDEO_VIEWS_MAX)
+      return;
+   if (!values)
+      config_reset_video_screen_xr(settings, screen, 1);
+   else
+   {
+      s = *values;
+      video_views_xr_normalize(&s);
+      settings->floats.video_screen_xr_x[screen]     = s.x;
+      settings->floats.video_screen_xr_y[screen]     = s.y;
+      settings->floats.video_screen_xr_z[screen]     = s.z;
+      settings->floats.video_screen_xr_yaw[screen]   = s.yaw;
+      settings->floats.video_screen_xr_pitch[screen] = s.pitch;
+      settings->floats.video_screen_xr_roll[screen]  = s.roll;
+      settings->floats.video_screen_xr_scale[screen] = s.scale;
+   }
+   settings->flags |= SETTINGS_FLG_MODIFIED;
+}
+
+void config_set_video_menu_xr(const video_screen_xr_t *values)
+{
+   video_screen_xr_t s;
+   settings_t *settings = config_get_ptr();
+   if (!settings)
+      return;
+   if (!values)
+      config_reset_video_menu_xr(settings);
+   else
+   {
+      s = *values;
+      video_views_xr_normalize(&s);
+      settings->floats.video_openxr_menu_xr_x     = s.x;
+      settings->floats.video_openxr_menu_xr_y     = s.y;
+      settings->floats.video_openxr_menu_xr_z     = s.z;
+      settings->floats.video_openxr_menu_xr_yaw   = s.yaw;
+      settings->floats.video_openxr_menu_xr_pitch = s.pitch;
+      settings->floats.video_openxr_menu_xr_roll  = s.roll;
+      settings->floats.video_openxr_menu_xr_scale = s.scale;
+      settings->bools.video_openxr_menu_placed    = true;
+   }
+   settings->flags |= SETTINGS_FLG_MODIFIED;
+}
+
 /**
  * config_set_defaults:
  *
@@ -6244,16 +6376,19 @@ void config_set_defaults(settings_t *target)
       settings->uints.input_touchpad_right[i] = RETRO_DEVICE_ID_JOYPAD_START;
    }
 
+   config_reset_video_screen_xr(settings, 0, RETRO_VIDEO_VIEWS_MAX);
+   config_reset_video_menu_xr(settings);
+
 #ifdef HAVE_VIDEO_WINDOWS
    for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
    {
-      settings->uints.video_screen_window_mode[i] = i
-         ? VIDEO_WINDOW_SEPARATE : VIDEO_WINDOW_ATTACHED;
       settings->uints.video_screen_window_pos[i] = 0;
       settings->uints.video_screen_window_dims[i] = 0;
       settings->uints.video_screen_window_monitor[i] = 0;
       settings->bools.video_screen_window_fullscreen[i] = false;
+      settings->arrays.video_screen_display[i][0] = '\0';
    }
+   settings->arrays.video_menu_display[0] = '\0';
 #endif
 
    custom_vp->dims   = 0;
@@ -6327,6 +6462,9 @@ void config_set_defaults(settings_t *target)
    *settings->paths.path_softfilter_plugin = '\0';
 
    *settings->paths.path_audio_dsp_plugin = '\0';
+#ifdef HAVE_VULKAN_CUSTOM_DRIVER
+   *settings->paths.path_vulkan_driver    = '\0';
+#endif
 
    *settings->paths.log_dir = '\0';
 
@@ -6951,17 +7089,14 @@ CONFIG_NOINLINE static void config_load_video_windows(settings_t *settings, conf
       char cfg[64];
       int x = 0, y = 0;
       unsigned width = 0, height = 0;
+      unsigned old_mode = VIDEO_WINDOW_ATTACHED;
       size_t len = snprintf(cfg, sizeof(cfg), "video_screen%u_window_", i + 1);
 
-      settings->uints.video_screen_window_mode[i] = i
-         ? VIDEO_WINDOW_SEPARATE : VIDEO_WINDOW_ATTACHED;
       settings->uints.video_screen_window_monitor[i] = 0;
       settings->bools.video_screen_window_fullscreen[i] = false;
+      settings->arrays.video_screen_display[i][0] = '\0';
       strlcpy_lit(cfg + len, "mode", sizeof(cfg) - len);
-      config_get_uint(conf, cfg, &settings->uints.video_screen_window_mode[i]);
-      if (!i || settings->uints.video_screen_window_mode[i] > VIDEO_WINDOW_HIDDEN)
-         settings->uints.video_screen_window_mode[i] = i
-            ? VIDEO_WINDOW_SEPARATE : VIDEO_WINDOW_ATTACHED;
+      config_get_uint(conf, cfg, &old_mode);
       strlcpy_lit(cfg + len, "x", sizeof(cfg) - len);
       config_get_int(conf, cfg, &x);
       strlcpy_lit(cfg + len, "y", sizeof(cfg) - len);
@@ -6980,7 +7115,27 @@ CONFIG_NOINLINE static void config_load_video_windows(settings_t *settings, conf
       settings->uints.video_screen_window_dims[i] =
          width && height && VIDEO_SCALE_FITS(width, height)
          ? VIDEO_SCALE_PACK(width, height) : 0;
+      snprintf(cfg, sizeof(cfg), "video_screen%u_display", i + 1);
+      config_get_array(conf, cfg, settings->arrays.video_screen_display[i],
+            sizeof(settings->arrays.video_screen_display[i]));
+      /* Hidden, saved before a display could be Off. Auto does not
+       * stop it: a full save writes every display, "" included */
+      if (     old_mode == VIDEO_WINDOW_HIDDEN
+            && !settings->arrays.video_screen_display[i][0])
+         strlcpy(settings->arrays.video_screen_display[i],
+               VIDEO_WINDOW_DISPLAY_OFF,
+               sizeof(settings->arrays.video_screen_display[i]));
    }
+   settings->arrays.video_menu_display[0] = '\0';
+   config_get_array(conf, "video_menu_display",
+         settings->arrays.video_menu_display,
+         sizeof(settings->arrays.video_menu_display));
+   if (settings->uints.video_menu_follows > VIDEO_MENU_FOLLOWS_SEPARATE)
+      settings->uints.video_menu_follows = 0;
+   if (settings->uints.video_notifications_window
+         > VIDEO_NOTIFICATIONS_WITH_MENU)
+      settings->uints.video_notifications_window =
+         VIDEO_NOTIFICATIONS_WITH_GAME;
 }
 
 #undef CONFIG_NOINLINE
@@ -7175,6 +7330,10 @@ static bool config_load_file(const char *path, settings_t *settings)
       check_verbosity_settings(conf, settings);
    }
 
+   /* the controllers' own players, the main config's; each override's
+    * go over them by controller as it is appended */
+   input_plays_as_read(conf);
+
    if (!path_is_empty(RARCH_PATH_CONFIG_OVERRIDE) && !without_overrides)
    {
       char tmp_append_path[PATH_MAX_LENGTH];
@@ -7194,7 +7353,14 @@ static bool config_load_file(const char *path, settings_t *settings)
             *next++ = '\0';
 
          {
-            bool result = config_append_file(conf, extra_path);
+            bool result          = false;
+            config_file_t *extra =
+               config_file_new_from_path_to_string(extra_path);
+            if (extra)
+            {
+               input_plays_as_merge(extra);
+               result = config_file_append_conf(conf, extra);
+            }
             if (!first_load)
             {
                RARCH_LOG("[Config] Appending override config: \"%s\".\n", extra_path);
@@ -7213,6 +7379,9 @@ static bool config_load_file(const char *path, settings_t *settings)
          retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_OVERLAY_PRESET, NULL);
 #endif
    }
+
+   /* once every override is in, against the entries before the read */
+   input_plays_as_hand_out();
 
    /* Special case for perfcnt_enable */
    {
@@ -7310,6 +7479,63 @@ static bool config_load_file(const char *path, settings_t *settings)
 #ifdef HAVE_VIDEO_WINDOWS
    config_load_video_windows(settings, conf);
 #endif
+
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+   {
+      video_screen_xr_t screen;
+      char prefix[64];
+      size_t len = snprintf(prefix, sizeof(prefix), "video_screen%u_xr_", i + 1);
+
+      video_views_xr_reset(&screen, 1);
+      strlcpy_lit(prefix + len, "x", sizeof(prefix) - len);
+      config_get_float(conf, prefix, &screen.x);
+      strlcpy_lit(prefix + len, "y", sizeof(prefix) - len);
+      config_get_float(conf, prefix, &screen.y);
+      strlcpy_lit(prefix + len, "z", sizeof(prefix) - len);
+      config_get_float(conf, prefix, &screen.z);
+      strlcpy_lit(prefix + len, "yaw", sizeof(prefix) - len);
+      config_get_float(conf, prefix, &screen.yaw);
+      strlcpy_lit(prefix + len, "pitch", sizeof(prefix) - len);
+      config_get_float(conf, prefix, &screen.pitch);
+      strlcpy_lit(prefix + len, "roll", sizeof(prefix) - len);
+      config_get_float(conf, prefix, &screen.roll);
+      strlcpy_lit(prefix + len, "scale", sizeof(prefix) - len);
+      config_get_float(conf, prefix, &screen.scale);
+      strlcpy_lit(prefix + len, "visible", sizeof(prefix) - len);
+      config_get_bool(conf, prefix, &screen.visible);
+      video_views_xr_normalize(&screen);
+      settings->floats.video_screen_xr_x[i] = screen.x;
+      settings->floats.video_screen_xr_y[i] = screen.y;
+      settings->floats.video_screen_xr_z[i] = screen.z;
+      settings->floats.video_screen_xr_yaw[i] = screen.yaw;
+      settings->floats.video_screen_xr_pitch[i] = screen.pitch;
+      settings->floats.video_screen_xr_roll[i] = screen.roll;
+      settings->floats.video_screen_xr_scale[i] = screen.scale;
+      settings->bools.video_screen_xr_visible[i] = screen.visible;
+   }
+
+   {
+      video_screen_xr_t menu;
+      bool placed = false;
+      video_views_xr_reset(&menu, 1);
+      config_get_float(conf, "video_openxr_menu_xr_x", &menu.x);
+      config_get_float(conf, "video_openxr_menu_xr_y", &menu.y);
+      config_get_float(conf, "video_openxr_menu_xr_z", &menu.z);
+      config_get_float(conf, "video_openxr_menu_xr_yaw", &menu.yaw);
+      config_get_float(conf, "video_openxr_menu_xr_pitch", &menu.pitch);
+      config_get_float(conf, "video_openxr_menu_xr_roll", &menu.roll);
+      config_get_float(conf, "video_openxr_menu_xr_scale", &menu.scale);
+      config_get_bool(conf, "video_openxr_menu_placed", &placed);
+      video_views_xr_normalize(&menu);
+      settings->floats.video_openxr_menu_xr_x     = menu.x;
+      settings->floats.video_openxr_menu_xr_y     = menu.y;
+      settings->floats.video_openxr_menu_xr_z     = menu.z;
+      settings->floats.video_openxr_menu_xr_yaw   = menu.yaw;
+      settings->floats.video_openxr_menu_xr_pitch = menu.pitch;
+      settings->floats.video_openxr_menu_xr_roll  = menu.roll;
+      settings->floats.video_openxr_menu_xr_scale = menu.scale;
+      settings->bools.video_openxr_menu_placed    = placed;
+   }
 
    {
       char prefix[64];
@@ -7685,6 +7911,10 @@ static bool config_load_file(const char *path, settings_t *settings)
             settings->paths.directory_bottom_assets,
             g_defaults.dirs[DEFAULT_DIR_BOTTOM_ASSETS]);
 #endif
+   if (string_is_equal(settings->paths.directory_input_remapping, "default"))
+      configuration_set_string(settings,
+            settings->paths.directory_input_remapping,
+            g_defaults.dirs[DEFAULT_DIR_REMAP]);
    if (string_is_equal(settings->paths.directory_dynamic_wallpapers, "default"))
       *settings->paths.directory_dynamic_wallpapers = '\0';
    if (string_is_equal(settings->paths.directory_thumbnails, "default"))
@@ -7967,13 +8197,11 @@ static bool config_load_file(const char *path, settings_t *settings)
    if (!config_get_entry(conf, "user_language"))
       msg_hash_set_uint(MSG_HASH_USER_LANGUAGE, frontend_driver_get_user_language());
 
-   /* If GameMode is enabled in the config but libgamemode is not
-    * available, warn once. Do NOT clear the setting: that would
-    * silently overwrite the user's preference in retroarch.cfg, so
-    * a transient failure (sandbox path issue, library not yet
-    * installed, etc.) would force them to re-enable it manually on
-    * every subsequent launch. The probe is latched inside the
-    * frontend driver, so it will not be retried this session. */
+   /* Enter Game Mode when the config asks for it. Do NOT clear the
+    * setting when part of it is unavailable (no power profile
+    * service, say): that would silently overwrite the user's
+    * preference in retroarch.cfg. Entering again on a later config
+    * load is a no-op in the frontend driver. */
    if (     settings->bools.gamemode_enable
          && frontend_driver_has_gamemode())
       frontend_driver_set_gamemode(true);
@@ -8522,36 +8750,14 @@ static void config_parse_file(void)
    {
       RARCH_ERR("[Config] Config not found at: \"%s\".\n",
             config_path);
+#ifdef ANDROID
+      /* No config at all: a fresh install's first start.  A config
+       * that exists but would not open is not one, and keeps the
+       * built-in defaults. */
+      if (config_path && *config_path && !path_is_valid(config_path))
+         android_apply_device_defaults(config_st);
+#endif
    }
-}
-
-static void save_keybind_hat(config_file_t *conf, const char *key,
-      const struct retro_keybind *bind)
-{
-   size_t _len;
-   char s[16];
-   s[0]      = '\0';
-   _len      = snprintf(s, sizeof(s), "h%u", GET_HAT(bind->joykey));
-
-   switch (GET_HAT_DIR(bind->joykey))
-   {
-      case HAT_UP_MASK:
-         strlcpy_lit(s + _len, "up", sizeof(s) - _len);
-         break;
-      case HAT_DOWN_MASK:
-         strlcpy_lit(s + _len, "down", sizeof(s) - _len);
-         break;
-      case HAT_LEFT_MASK:
-         strlcpy_lit(s + _len, "left", sizeof(s) - _len);
-         break;
-      case HAT_RIGHT_MASK:
-         strlcpy_lit(s + _len, "right", sizeof(s) - _len);
-         break;
-      default:
-         break;
-   }
-
-   config_set_string(conf, key, s);
 }
 
 static void save_keybind_joykey(config_file_t *conf,
@@ -8561,19 +8767,15 @@ static void save_keybind_joykey(config_file_t *conf,
       bool save_empty)
 {
    char key[64];
+   char val[16];
    size_t _len = fill_pathname_join_delim(key, prefix,
          base, '_', sizeof(key));
    strlcpy_lit(key + _len, "_btn", sizeof(key) - _len);
 
-   if (bind->joykey == NO_BTN)
-   {
-       if (save_empty)
-         config_set_string(conf, key, "nul");
-   }
-   else if (GET_HAT_DIR(bind->joykey))
-      save_keybind_hat(conf, key, bind);
-   else
-      config_set_uint64(conf, key, bind->joykey);
+   if (bind->joykey == NO_BTN && !save_empty)
+      return;
+   input_config_format_joykey(val, sizeof(val), bind->joykey);
+   config_set_string(conf, key, val);
 }
 
 static void save_keybind_joykey_label(config_file_t *conf,
@@ -8603,23 +8805,9 @@ static void save_keybind_axis(config_file_t *conf,
    size_t _len = fill_pathname_join_delim(key, prefix, base, '_', sizeof(key));
    strlcpy_lit(key + _len, "_axis", sizeof(key) - _len);
 
-   if (bind->joyaxis == AXIS_NONE)
-   {
-      if (save_empty)
-         config_set_string(conf, key, "nul");
+   if (bind->joyaxis == AXIS_NONE && !save_empty)
       return;
-   }
-
-   if (AXIS_NEG_GET(bind->joyaxis) != AXIS_DIR_NONE)
-   {
-      snprintf(config, sizeof(config), "-%lu",
-            (unsigned long)AXIS_NEG_GET(bind->joyaxis));
-   }
-   else if (AXIS_POS_GET(bind->joyaxis) != AXIS_DIR_NONE)
-   {
-      snprintf(config, sizeof(config), "+%lu",
-            (unsigned long)AXIS_POS_GET(bind->joyaxis));
-   }
+   input_config_format_joyaxis(config, sizeof(config), bind->joyaxis);
    config_set_string(conf, key, config);
 }
 
@@ -9768,12 +9956,10 @@ bool config_save_file(const char *path)
       char cfg[64];
       size_t len = snprintf(cfg, sizeof(cfg), "video_screen%u_window_", i + 1);
 
+      /* Migrated on load; one left in the file would hide the screen
+       * again */
       strlcpy_lit(cfg + len, "mode", sizeof(cfg) - len);
-      if (   !minimal
-          || settings->uints.video_screen_window_mode[i] != defaults->uints.video_screen_window_mode[i])
-         config_set_int(conf, cfg, settings->uints.video_screen_window_mode[i]);
-      else
-         config_unset(conf, cfg);
+      config_unset(conf, cfg);
 
       strlcpy_lit(cfg + len, "x", sizeof(cfg) - len);
       if (   !minimal
@@ -9816,8 +10002,128 @@ bool config_save_file(const char *path)
          config_set_string(conf, cfg, settings->bools.video_screen_window_fullscreen[i] ? "true" : "false");
       else
          config_unset(conf, cfg);
+
+      snprintf(cfg, sizeof(cfg), "video_screen%u_display", i + 1);
+      if (   !minimal
+          || !string_is_equal(settings->arrays.video_screen_display[i],
+                defaults->arrays.video_screen_display[i]))
+         config_set_string(conf, cfg, settings->arrays.video_screen_display[i]);
+      else
+         config_unset(conf, cfg);
    }
+   if (   !minimal
+       || !string_is_equal(settings->arrays.video_menu_display,
+             defaults->arrays.video_menu_display))
+      config_set_string(conf, "video_menu_display",
+            settings->arrays.video_menu_display);
+   else
+      config_unset(conf, "video_menu_display");
 #endif
+
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+   {
+      char cfg[64];
+      size_t len = snprintf(cfg, sizeof(cfg), "video_screen%u_xr_", i + 1);
+
+      strlcpy_lit(cfg + len, "x", sizeof(cfg) - len);
+      if (   !minimal
+          || settings->floats.video_screen_xr_x[i] != defaults->floats.video_screen_xr_x[i])
+         config_set_float(conf, cfg, settings->floats.video_screen_xr_x[i]);
+      else
+         config_unset(conf, cfg);
+
+      strlcpy_lit(cfg + len, "y", sizeof(cfg) - len);
+      if (   !minimal
+          || settings->floats.video_screen_xr_y[i] != defaults->floats.video_screen_xr_y[i])
+         config_set_float(conf, cfg, settings->floats.video_screen_xr_y[i]);
+      else
+         config_unset(conf, cfg);
+
+      strlcpy_lit(cfg + len, "z", sizeof(cfg) - len);
+      if (   !minimal
+          || settings->floats.video_screen_xr_z[i] != defaults->floats.video_screen_xr_z[i])
+         config_set_float(conf, cfg, settings->floats.video_screen_xr_z[i]);
+      else
+         config_unset(conf, cfg);
+
+      strlcpy_lit(cfg + len, "yaw", sizeof(cfg) - len);
+      if (   !minimal
+          || settings->floats.video_screen_xr_yaw[i] != defaults->floats.video_screen_xr_yaw[i])
+         config_set_float(conf, cfg, settings->floats.video_screen_xr_yaw[i]);
+      else
+         config_unset(conf, cfg);
+
+      strlcpy_lit(cfg + len, "pitch", sizeof(cfg) - len);
+      if (   !minimal
+          || settings->floats.video_screen_xr_pitch[i] != defaults->floats.video_screen_xr_pitch[i])
+         config_set_float(conf, cfg, settings->floats.video_screen_xr_pitch[i]);
+      else
+         config_unset(conf, cfg);
+
+      strlcpy_lit(cfg + len, "roll", sizeof(cfg) - len);
+      if (   !minimal
+          || settings->floats.video_screen_xr_roll[i] != defaults->floats.video_screen_xr_roll[i])
+         config_set_float(conf, cfg, settings->floats.video_screen_xr_roll[i]);
+      else
+         config_unset(conf, cfg);
+
+      strlcpy_lit(cfg + len, "scale", sizeof(cfg) - len);
+      if (   !minimal
+          || settings->floats.video_screen_xr_scale[i] != defaults->floats.video_screen_xr_scale[i])
+         config_set_float(conf, cfg, settings->floats.video_screen_xr_scale[i]);
+      else
+         config_unset(conf, cfg);
+
+      strlcpy_lit(cfg + len, "visible", sizeof(cfg) - len);
+      if (   !minimal
+          || settings->bools.video_screen_xr_visible[i] != defaults->bools.video_screen_xr_visible[i])
+         config_set_string(conf, cfg,
+               settings->bools.video_screen_xr_visible[i] ? "true" : "false");
+      else
+         config_unset(conf, cfg);
+   }
+
+   if (   !minimal
+       || settings->floats.video_openxr_menu_xr_x != defaults->floats.video_openxr_menu_xr_x)
+      config_set_float(conf, "video_openxr_menu_xr_x", settings->floats.video_openxr_menu_xr_x);
+   else
+      config_unset(conf, "video_openxr_menu_xr_x");
+   if (   !minimal
+       || settings->floats.video_openxr_menu_xr_y != defaults->floats.video_openxr_menu_xr_y)
+      config_set_float(conf, "video_openxr_menu_xr_y", settings->floats.video_openxr_menu_xr_y);
+   else
+      config_unset(conf, "video_openxr_menu_xr_y");
+   if (   !minimal
+       || settings->floats.video_openxr_menu_xr_z != defaults->floats.video_openxr_menu_xr_z)
+      config_set_float(conf, "video_openxr_menu_xr_z", settings->floats.video_openxr_menu_xr_z);
+   else
+      config_unset(conf, "video_openxr_menu_xr_z");
+   if (   !minimal
+       || settings->floats.video_openxr_menu_xr_yaw != defaults->floats.video_openxr_menu_xr_yaw)
+      config_set_float(conf, "video_openxr_menu_xr_yaw", settings->floats.video_openxr_menu_xr_yaw);
+   else
+      config_unset(conf, "video_openxr_menu_xr_yaw");
+   if (   !minimal
+       || settings->floats.video_openxr_menu_xr_pitch != defaults->floats.video_openxr_menu_xr_pitch)
+      config_set_float(conf, "video_openxr_menu_xr_pitch", settings->floats.video_openxr_menu_xr_pitch);
+   else
+      config_unset(conf, "video_openxr_menu_xr_pitch");
+   if (   !minimal
+       || settings->floats.video_openxr_menu_xr_roll != defaults->floats.video_openxr_menu_xr_roll)
+      config_set_float(conf, "video_openxr_menu_xr_roll", settings->floats.video_openxr_menu_xr_roll);
+   else
+      config_unset(conf, "video_openxr_menu_xr_roll");
+   if (   !minimal
+       || settings->floats.video_openxr_menu_xr_scale != defaults->floats.video_openxr_menu_xr_scale)
+      config_set_float(conf, "video_openxr_menu_xr_scale", settings->floats.video_openxr_menu_xr_scale);
+   else
+      config_unset(conf, "video_openxr_menu_xr_scale");
+   if (   !minimal
+       || settings->bools.video_openxr_menu_placed != defaults->bools.video_openxr_menu_placed)
+      config_set_string(conf, "video_openxr_menu_placed",
+            settings->bools.video_openxr_menu_placed ? "true" : "false");
+   else
+      config_unset(conf, "video_openxr_menu_placed");
 
    for (i = 0; i < MAX_USERS; i++)
    {
@@ -10066,6 +10372,8 @@ bool config_save_file(const char *path)
 
    /* the entries and macros, as they are now */
    input_entries_write(conf);
+   /* and the controllers' own players */
+   input_plays_as_write(conf);
 
    /* Remove unused "quit_press_twice" after migrating to "confirm_quit" */
    {
@@ -10086,6 +10394,10 @@ bool config_save_file(const char *path)
 
    ret = config_file_write(conf, path, true);
    config_file_free(conf);
+
+   /* the session's Plays As entries as the main config now has them */
+   if (ret && string_is_equal(path, path_get(RARCH_PATH_CONFIG)))
+      input_plays_as_lay_out();
 
 #if TARGET_OS_TV
    if (ret && string_is_equal(path, path_get(RARCH_PATH_CONFIG)))
@@ -10145,6 +10457,7 @@ int8_t config_save_overrides(enum override_type type,
    unsigned i                                  = 0;
    int8_t ret                                  = 0;
    input_config_binds_copy_t *input_override_binds = NULL;
+   input_plays_as_copy_t *input_override_plays_as  = NULL;
    config_file_t *conf                         = NULL;
    settings_t *settings                        = NULL;
    struct config_bool_setting *bool_settings   = NULL;
@@ -10193,11 +10506,12 @@ int8_t config_save_overrides(enum override_type type,
 
    settings = (settings_t*)calloc(1, sizeof(settings_t));
    conf     = config_file_new_alloc();
-   /* A copy of the binds is kept off the stack (this function is
-    * reachable on small-stack platforms such as the 3DS). Made here so
-    * it shares the OOM bail below and is freed at the function-end
-    * cleanup. */
-   input_override_binds = input_config_binds_copy_new();
+   /* A copy of the binds, and one of the Plays As entries, is kept off
+    * the stack (this function is reachable on small-stack platforms
+    * such as the 3DS). Made here so it shares the OOM bail below and is
+    * freed at the function-end cleanup. */
+   input_override_binds    = input_config_binds_copy_new();
+   input_override_plays_as = input_plays_as_copy_new();
 
    /* NULL-check: both calloc and config_file_new_alloc can
     * return NULL on OOM.  config_load_file at line ~6552
@@ -10211,13 +10525,15 @@ int8_t config_save_overrides(enum override_type type,
     * Return -1 to signal hard failure (as distinct from
     * 'override was not needed' = false/0 at line 6529).
     * int8_t return value accommodates -1. */
-   if (!settings || !conf || !input_override_binds)
+   if (!settings || !conf || !input_override_binds || !input_override_plays_as)
    {
       if (conf)
          config_file_free(conf);
       free(settings);
       if (input_override_binds)
          input_config_binds_copy_free(input_override_binds);
+      if (input_override_plays_as)
+         input_plays_as_copy_free(input_override_plays_as);
       return -1;
    }
 
@@ -10453,10 +10769,6 @@ int8_t config_save_overrides(enum override_type type,
          char cfg[64];
          size_t len = snprintf(cfg, sizeof(cfg), "video_screen%u_window_", i + 1);
 
-         strlcpy_lit(cfg + len, "mode", sizeof(cfg) - len);
-         if (settings->uints.video_screen_window_mode[i] != overrides->uints.video_screen_window_mode[i])
-            config_set_int(conf, cfg, overrides->uints.video_screen_window_mode[i]);
-
          strlcpy_lit(cfg + len, "x", sizeof(cfg) - len);
          if (VIDEO_POS_X(settings->uints.video_screen_window_pos[i]) != VIDEO_POS_X(overrides->uints.video_screen_window_pos[i]))
             config_set_int(conf, cfg, VIDEO_POS_X(overrides->uints.video_screen_window_pos[i]));
@@ -10480,8 +10792,90 @@ int8_t config_save_overrides(enum override_type type,
          strlcpy_lit(cfg + len, "fullscreen", sizeof(cfg) - len);
          if (settings->bools.video_screen_window_fullscreen[i] != overrides->bools.video_screen_window_fullscreen[i])
             config_set_string(conf, cfg, overrides->bools.video_screen_window_fullscreen[i] ? "true" : "false");
+
+         snprintf(cfg, sizeof(cfg), "video_screen%u_display", i + 1);
+         if (!string_is_equal(settings->arrays.video_screen_display[i],
+                  overrides->arrays.video_screen_display[i]))
+            config_set_string(conf, cfg, overrides->arrays.video_screen_display[i]);
       }
+      if (!string_is_equal(settings->arrays.video_menu_display,
+               overrides->arrays.video_menu_display))
+         config_set_string(conf, "video_menu_display",
+               overrides->arrays.video_menu_display);
 #endif
+
+      for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+      {
+         char cfg[64];
+         size_t len = snprintf(cfg, sizeof(cfg), "video_screen%u_xr_", i + 1);
+
+         if (settings->floats.video_screen_xr_x[i] != overrides->floats.video_screen_xr_x[i])
+         {
+            strlcpy_lit(cfg + len, "x", sizeof(cfg) - len);
+            config_set_float(conf, cfg, overrides->floats.video_screen_xr_x[i]);
+         }
+
+         if (settings->floats.video_screen_xr_y[i] != overrides->floats.video_screen_xr_y[i])
+         {
+            strlcpy_lit(cfg + len, "y", sizeof(cfg) - len);
+            config_set_float(conf, cfg, overrides->floats.video_screen_xr_y[i]);
+         }
+
+         if (settings->floats.video_screen_xr_z[i] != overrides->floats.video_screen_xr_z[i])
+         {
+            strlcpy_lit(cfg + len, "z", sizeof(cfg) - len);
+            config_set_float(conf, cfg, overrides->floats.video_screen_xr_z[i]);
+         }
+
+         if (settings->floats.video_screen_xr_yaw[i] != overrides->floats.video_screen_xr_yaw[i])
+         {
+            strlcpy_lit(cfg + len, "yaw", sizeof(cfg) - len);
+            config_set_float(conf, cfg, overrides->floats.video_screen_xr_yaw[i]);
+         }
+
+         if (settings->floats.video_screen_xr_pitch[i] != overrides->floats.video_screen_xr_pitch[i])
+         {
+            strlcpy_lit(cfg + len, "pitch", sizeof(cfg) - len);
+            config_set_float(conf, cfg, overrides->floats.video_screen_xr_pitch[i]);
+         }
+
+         if (settings->floats.video_screen_xr_roll[i] != overrides->floats.video_screen_xr_roll[i])
+         {
+            strlcpy_lit(cfg + len, "roll", sizeof(cfg) - len);
+            config_set_float(conf, cfg, overrides->floats.video_screen_xr_roll[i]);
+         }
+
+         if (settings->floats.video_screen_xr_scale[i] != overrides->floats.video_screen_xr_scale[i])
+         {
+            strlcpy_lit(cfg + len, "scale", sizeof(cfg) - len);
+            config_set_float(conf, cfg, overrides->floats.video_screen_xr_scale[i]);
+         }
+
+         if (settings->bools.video_screen_xr_visible[i] != overrides->bools.video_screen_xr_visible[i])
+         {
+            strlcpy_lit(cfg + len, "visible", sizeof(cfg) - len);
+            config_set_string(conf, cfg,
+                  overrides->bools.video_screen_xr_visible[i] ? "true" : "false");
+         }
+      }
+
+      if (settings->floats.video_openxr_menu_xr_x != overrides->floats.video_openxr_menu_xr_x)
+         config_set_float(conf, "video_openxr_menu_xr_x", overrides->floats.video_openxr_menu_xr_x);
+      if (settings->floats.video_openxr_menu_xr_y != overrides->floats.video_openxr_menu_xr_y)
+         config_set_float(conf, "video_openxr_menu_xr_y", overrides->floats.video_openxr_menu_xr_y);
+      if (settings->floats.video_openxr_menu_xr_z != overrides->floats.video_openxr_menu_xr_z)
+         config_set_float(conf, "video_openxr_menu_xr_z", overrides->floats.video_openxr_menu_xr_z);
+      if (settings->floats.video_openxr_menu_xr_yaw != overrides->floats.video_openxr_menu_xr_yaw)
+         config_set_float(conf, "video_openxr_menu_xr_yaw", overrides->floats.video_openxr_menu_xr_yaw);
+      if (settings->floats.video_openxr_menu_xr_pitch != overrides->floats.video_openxr_menu_xr_pitch)
+         config_set_float(conf, "video_openxr_menu_xr_pitch", overrides->floats.video_openxr_menu_xr_pitch);
+      if (settings->floats.video_openxr_menu_xr_roll != overrides->floats.video_openxr_menu_xr_roll)
+         config_set_float(conf, "video_openxr_menu_xr_roll", overrides->floats.video_openxr_menu_xr_roll);
+      if (settings->floats.video_openxr_menu_xr_scale != overrides->floats.video_openxr_menu_xr_scale)
+         config_set_float(conf, "video_openxr_menu_xr_scale", overrides->floats.video_openxr_menu_xr_scale);
+      if (settings->bools.video_openxr_menu_placed != overrides->bools.video_openxr_menu_placed)
+         config_set_string(conf, "video_openxr_menu_placed",
+               overrides->bools.video_openxr_menu_placed ? "true" : "false");
 
       for (i = 0; i < MAX_USERS; i++)
       {
@@ -10586,6 +10980,9 @@ int8_t config_save_overrides(enum override_type type,
          }
       }
 
+      /* the controllers' own players and hotkeys, where they differ */
+      input_plays_as_write_changed(conf, input_override_plays_as);
+
       ret = 0;
 
       switch (type)
@@ -10672,6 +11069,8 @@ int8_t config_save_overrides(enum override_type type,
 
    /* Since config_load_file resets binds, restore overrides back to current binds */
    input_config_binds_copy_restore(input_override_binds);
+   /* and the Plays As entries it replaced */
+   input_plays_as_copy_restore(input_override_plays_as);
 
    if (bool_settings)
       free(bool_settings);
@@ -10703,6 +11102,7 @@ int8_t config_save_overrides(enum override_type type,
       free(size_overrides);
    free(settings);
    input_config_binds_copy_free(input_override_binds);
+   input_plays_as_copy_free(input_override_plays_as);
 
    return ret;
 }
@@ -11476,29 +11876,11 @@ void input_config_parse_joy_axis(char *s,
 
    fill_pathname_join_delim(key, s, "axis", '_', sizeof(key));
 
-   if (config_get_array(conf, key, tmp, sizeof(tmp)))
-   {
-      if (     tmp[0] == 'n'
-            && tmp[1] == 'u'
-            && tmp[2] == 'l'
-            && tmp[3] == '\0'
-         )
-         bind->joyaxis = AXIS_NONE;
-      else if
-         (     tmp[0] != '\0'
-          &&   tmp[1] != '\0'
-          && (*tmp    == '+'
-          ||  *tmp    == '-'))
-      {
-         int i_axis = (int)strtol(tmp + 1, NULL, 0);
-         if (*tmp == '+')
-            bind->joyaxis = AXIS_POS(i_axis);
-         else
-            bind->joyaxis = AXIS_NEG(i_axis);
-
-         RETRO_KEYBIND_SET_VALID(bind, true);
-      }
-   }
+   /* "nul" clears it; an axis read makes the bind a set one */
+   if (     config_get_array(conf, key, tmp, sizeof(tmp))
+         && input_config_parse_joyaxis(tmp, &bind->joyaxis)
+         && !string_is_equal(tmp, "nul"))
+      RETRO_KEYBIND_SET_VALID(bind, true);
 
    fill_pathname_join_delim(key, s,
          "axis_label", '_', sizeof(key));
@@ -11511,42 +11893,6 @@ void input_config_parse_joy_axis(char *s,
          free(label->joyaxis);
       label->joyaxis = strdup(tmp_a->value);
    }
-}
-
-static uint16_t input_config_parse_hat(const char *dir)
-{
-   if (     dir[0] == 'u'
-         && dir[1] == 'p'
-         && dir[2] == '\0'
-      )
-      return HAT_UP_MASK;
-   else if (
-            dir[0] == 'd'
-         && dir[1] == 'o'
-         && dir[2] == 'w'
-         && dir[3] == 'n'
-         && dir[4] == '\0'
-         )
-      return HAT_DOWN_MASK;
-   else if (
-            dir[0] == 'l'
-         && dir[1] == 'e'
-         && dir[2] == 'f'
-         && dir[3] == 't'
-         && dir[4] == '\0'
-         )
-      return HAT_LEFT_MASK;
-   else if (
-            dir[0] == 'r'
-         && dir[1] == 'i'
-         && dir[2] == 'g'
-         && dir[3] == 'h'
-         && dir[4] == 't'
-         && dir[5] == '\0'
-         )
-      return HAT_RIGHT_MASK;
-
-   return 0;
 }
 
 void input_config_parse_joy_button(
@@ -11563,32 +11909,10 @@ void input_config_parse_joy_button(
    fill_pathname_join_delim(key, s, "btn", '_', sizeof(key));
    if (config_get_array(conf, key, tmp, sizeof(tmp)))
    {
-      btn = tmp;
-      if (     btn[0] == 'n'
-            && btn[1] == 'u'
-            && btn[2] == 'l'
-            && btn[3] == '\0'
-         )
-         bind->joykey = NO_BTN;
-      else
-      {
-         if (*btn == 'h')
-         {
-            const char *str = btn + 1;
-            /* Parse hat? */
-            if (str && *str >= '0' && *str <= '9')
-            {
-               char        *dir = NULL;
-               uint16_t     hat = strtoul(str, &dir, 0);
-               uint16_t hat_dir = dir ? input_config_parse_hat(dir) : 0;
-               if (hat_dir)
-                  bind->joykey = HAT_MAP(hat, hat_dir);
-            }
-         }
-         else
-            bind->joykey = strtoull(tmp, NULL, 0);
+      input_config_parse_joykey(tmp, &bind->joykey);
+      /* any value but "nul" makes the bind a set one, read or not */
+      if (!string_is_equal(tmp, "nul"))
          RETRO_KEYBIND_SET_VALID(bind, true);
-      }
    }
    fill_pathname_join_delim(key, s,
          "btn_label", '_', sizeof(key));

@@ -197,6 +197,8 @@ static retro_vfs_rename_t filestream_rename_cb     = NULL;
 static retro_vfs_copy_begin_t filestream_copy_begin_cb = NULL;
 static retro_vfs_copy_step_t  filestream_copy_step_cb  = NULL;
 static retro_vfs_copy_close_t filestream_copy_close_cb = NULL;
+static retro_vfs_read_at_t  filestream_read_at_cb  = NULL;
+static retro_vfs_write_at_t filestream_write_at_cb = NULL;
 static bool filestream_copy_unavailable                = false;
 
 /* VFS Initialization */
@@ -221,6 +223,8 @@ void filestream_vfs_init(const struct retro_vfs_interface_info* vfs_info)
    filestream_copy_begin_cb = NULL;
    filestream_copy_step_cb  = NULL;
    filestream_copy_close_cb = NULL;
+   filestream_read_at_cb    = NULL;
+   filestream_write_at_cb   = NULL;
    filestream_copy_unavailable = false;
 
    if (
@@ -251,6 +255,13 @@ void filestream_vfs_init(const struct retro_vfs_interface_info* vfs_info)
    }
    else
       filestream_copy_unavailable = true;
+
+   /* v6: positional I/O; a frontend before it has none to offer */
+   if (vfs_info->required_interface_version >= 6)
+   {
+      filestream_read_at_cb  = vfs_iface->read_at;
+      filestream_write_at_cb = vfs_iface->write_at;
+   }
 }
 
 /* Callback wrappers */
@@ -1677,7 +1688,7 @@ static int filestream_copy_loop(const char *src, const char *dst)
    if (!fp_src)
       goto end;
    fp_dst = filestream_open(dst, RETRO_VFS_FILE_ACCESS_WRITE,
-         RETRO_VFS_FILE_ACCESS_HINT_NONE);
+         RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK);
    if (!fp_dst)
       goto end;
 
@@ -1730,12 +1741,35 @@ int filestream_copy_close(struct retro_vfs_copy_handle *handle)
 
 /* Pre-v5 helper, kept for its existing callers.  Blocks by design;
  * new code uses filestream_copy_begin/poll/close. */
+/* The VFS copy, run to the end: the platform's own primitive where
+ * there is one (copy_file_range, clonefile), so the bytes never enter
+ * user space.  Returns 1 when copied, -1 when the copy failed, and 0
+ * when it could not start: no VFS v5 behind a core, or a target that
+ * cannot be removed to make way (on Windows, one that another process
+ * holds open), which the loop may still write in place. */
+static int filestream_copy_vfs(const char *src, const char *dst)
+{
+   int status;
+   struct retro_vfs_copy_handle *h = filestream_copy_begin(src, dst,
+         RETRO_VFS_COPY_OVERWRITE);
+   if (!h)
+      return 0;
+   do
+   {
+      status = filestream_copy_step(h, (int64_t)1 << 40, NULL, NULL);
+   } while (status == RETRO_VFS_COPY_RUNNING);
+   return filestream_copy_close(h) == 0 ? 1 : -1;
+}
+
 int filestream_copy(const char *src, const char *dst)
 {
+   int ret;
    if (!src || !*src || !dst || !*dst || string_is_equal(src, dst))
       return -1;
    if (!path_is_valid(src) || path_is_directory(src) || path_is_directory(dst))
       return -1;
+   if ((ret = filestream_copy_vfs(src, dst)) != 0)
+      return ret > 0 ? 0 : -1;
    return filestream_copy_loop(src, dst);
 }
 
@@ -1988,6 +2022,82 @@ int64_t filestream_write(RFILE *stream, const void *s, int64_t len)
    else
       output = retro_vfs_file_write_impl(
             (libretro_vfs_implementation_file*)stream->hfile, s, len);
+
+   if (output == VFS_ERROR_RETURN_VALUE)
+      stream->err_flag = true;
+
+   return output;
+}
+
+int64_t filestream_read_at(RFILE *stream, void *data, int64_t len,
+      int64_t offset)
+{
+   if (!stream || len < 0)
+      return -1;
+   /* The file itself, at the offset: the stream's position, its
+    * read-ahead and its last operation are not touched, which is what
+    * lets several threads call this at once */
+   if (filestream_read_cb)
+      return filestream_read_at_cb
+         ? filestream_read_at_cb(stream->hfile, data, (uint64_t)len, offset)
+         : -1;
+   return retro_vfs_file_read_at_impl(
+         (libretro_vfs_implementation_file*)stream->hfile,
+         data, (uint64_t)len, offset);
+}
+
+int64_t filestream_write_at(RFILE *stream, const void *data, int64_t len,
+      int64_t offset)
+{
+   if (!stream || len < 0)
+      return -1;
+   if (filestream_write_cb)
+      return filestream_write_at_cb
+         ? filestream_write_at_cb(stream->hfile, data, (uint64_t)len, offset)
+         : -1;
+   return retro_vfs_file_write_at_impl(
+         (libretro_vfs_implementation_file*)stream->hfile,
+         data, (uint64_t)len, offset);
+}
+
+int64_t filestream_writev(RFILE *stream,
+      const struct retro_vfs_span *spans, size_t count)
+{
+   int64_t output = 0;
+   size_t  i;
+
+   if (!stream || (count && !spans))
+      return -1;
+
+   /* As filestream_write: back on the logical position first */
+   filestream_rbuf_discard(stream);
+   if (stream->last_io == FILESTREAM_LAST_IO_READ)
+      filestream_raw_seek(stream, 0, RETRO_VFS_SEEK_POSITION_CURRENT);
+   stream->last_io = FILESTREAM_LAST_IO_WRITE;
+
+   if (!filestream_write_cb)
+      output = retro_vfs_file_writev_impl(
+            (libretro_vfs_implementation_file*)stream->hfile, spans, count);
+   else
+   {
+      /* A core's VFS has no gathered write: one piece at a time */
+      for (i = 0; i < count; i++)
+      {
+         int64_t one;
+         if (!spans[i].len)
+            continue;
+         if ((one = filestream_write_cb(stream->hfile, spans[i].data,
+                     (uint64_t)spans[i].len)) < 0)
+         {
+            if (!output)
+               output = VFS_ERROR_RETURN_VALUE;
+            break;
+         }
+         output += one;
+         if ((uint64_t)one < spans[i].len)
+            break;
+      }
+   }
 
    if (output == VFS_ERROR_RETURN_VALUE)
       stream->err_flag = true;

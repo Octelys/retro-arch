@@ -17,15 +17,28 @@
 bool input_config_get_sdl3_system_keyboard(void) { return false; }
 bool input_driver_keyboard_line_enabled(void) { return false; }
 bool input_driver_poll_viewport(struct video_viewport *vp) { (void)vp; return false; }
+input_pointer_frame_t *input_driver_pointers_lend(void)
+{
+   static input_pointer_frame_t lent[MAX_USERS];
+   return lent;
+}
+
 void input_driver_publish_pointers(const input_pointer_frame_t *frames,
       unsigned count, unsigned flags) { (void)frames; (void)count; (void)flags; }
+uint32_t *input_driver_touches_lend(void)
+{
+   static uint32_t lent[32];
+   return lent;
+}
+
 void input_driver_publish_touches(const uint32_t *pos, unsigned count,
       unsigned present, unsigned down) { (void)pos; (void)count; (void)present; (void)down; }
 void input_driver_set_native_keyboard_available(bool available) { (void)available; }
 void input_driver_set_native_keyboard_shown(bool shown) { (void)shown; }
 enum input_text_type input_driver_text_entry_type(void) { return (enum input_text_type)0; }
 SDL_Window *sdl3_get_window(void) { return NULL; }
-void sdl3_pump_input_events(void) { SDL_PumpEvents(); }
+bool sdl3_next_window_is_sdl3(void) { return false; }
+bool sdl3_pump_input_events(void) { SDL_PumpEvents(); return true; }
 bool sdl3_uses_screen_keyboard(void) { return false; }
 uint32_t utf8_walk(const char **string) { return (uint32_t)(unsigned char)*(*string)++; }
 

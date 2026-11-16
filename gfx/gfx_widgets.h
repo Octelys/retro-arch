@@ -531,6 +531,10 @@ void gfx_widget_set_load_content_progress(int8_t progress);
 
 void gfx_widgets_frame(void *data);
 
+/* The idle logo: @texture centred at a quarter of the frame's shorter
+ * side. @data is the frame's video_frame_info_t. */
+void gfx_widgets_draw_idle_logo(void *data, uintptr_t texture);
+
 #ifdef HAVE_THREADS
 /* Threaded video worker, before the driver's frame: what the runloop
  * does for the widgets without the wrapper, less the layout. */
@@ -547,6 +551,11 @@ void gfx_widgets_status_text_to_frame(void *data, char *status_text);
  * runs the rest: what a relayout on the worker asks of it. */
 void gfx_widgets_iterate_main(void);
 #endif
+
+/* dims at display_aspect, same height: what the widgets lay out at
+ * at a super resolution; dims when display_aspect is 0 or dims is
+ * less than twice that wide */
+unsigned gfx_widgets_layout_dims(unsigned dims, float display_aspect);
 
 /* The scale the widgets lay out at, from the settings, for @dims */
 float gfx_widgets_scale_factor(void *data_disp, void *settings_data,

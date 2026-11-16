@@ -24,6 +24,7 @@
 #include <string/stdstring.h>
 
 #include <sys/stat.h>
+#include <assert.h>
 
 #include "../frontend/frontend_driver.h"
 #include "../tasks/tasks_internal.h"
@@ -248,12 +249,14 @@ typedef struct rc_client_http_task_data_t
    void* callback_data;
 } rc_client_http_task_data_t;
 
+/* libretro-common retires HTTP task callbacks on the client owner thread. */
 static void rcheevos_client_http_task_callback(retro_task_t* task,
    void* task_data, void* user_data, const char* error)
 {
    rc_client_http_task_data_t* callback_data = (rc_client_http_task_data_t*)user_data;
    http_transfer_data_t* http_data = (http_transfer_data_t*)task_data;
    rc_api_server_response_t server_response;
+   assert(task_is_on_main_thread());
    memset(&server_response, 0, sizeof(server_response));
 
    if (!http_data)
@@ -420,15 +423,12 @@ void rcheevos_client_server_call(const rc_api_request_t* request,
  * downloading badges       *
  ****************************/
 
+/* The main thread's: started from the menu, advanced by the downloads'
+ * task callbacks. */
 typedef struct rc_client_download_queue_t
 {
    const rc_client_t* client;
    const rc_client_game_t* game;
-
-#ifdef HAVE_THREADS
-   slock_t* lock;
-#endif
-
    rc_client_achievement_list_t* list;
    uint32_t pass;
    uint32_t bucket_index;
@@ -484,14 +484,7 @@ static void rcheevos_client_download_task_callback(retro_task_t* task,
 
    if (callback_data->queue)
    {
-#ifdef HAVE_THREADS
-      slock_lock(callback_data->queue->lock);
-#endif
       callback_data->queue->count++;
-#ifdef HAVE_THREADS
-      slock_unlock(callback_data->queue->lock);
-#endif
-
       rcheevos_client_fetch_next_badge(callback_data->queue);
    }
 
@@ -635,9 +628,6 @@ static void rcheevos_client_fetch_next_badge(rc_client_download_queue_t* queue)
    {
       next_badge = NULL;
 
-#ifdef HAVE_THREADS
-      slock_lock(queue->lock);
-#endif
       /* if the game is no longer loaded, stop processing the queue */
       if (queue->game != rc_client_get_game_info(queue->client))
          queue->pass = 3;
@@ -707,10 +697,6 @@ static void rcheevos_client_fetch_next_badge(rc_client_download_queue_t* queue)
          }
       }
 
-#ifdef HAVE_THREADS
-      slock_unlock(queue->lock);
-#endif
-
       /* If the badge already exists (download_badge returns false), continue
        * looping to the next item. otherwise, a download was queued, so break
        * out of the loop. */
@@ -731,11 +717,6 @@ static void rcheevos_client_fetch_next_badge(rc_client_download_queue_t* queue)
       rc_client_destroy_achievement_list(queue->list);
 
       get_rcheevos_locals()->badges_loading = false;
-
-#ifdef HAVE_THREADS
-      slock_free(queue->lock);
-#endif
-
       free(queue);
    }
 }
@@ -769,10 +750,6 @@ void rcheevos_client_download_achievement_badges(rc_client_t* client)
       RC_CLIENT_ACHIEVEMENT_CATEGORY_CORE_AND_UNOFFICIAL,
       RC_CLIENT_ACHIEVEMENT_LIST_GROUPING_PROGRESS);
    queue->outstanding_requests = RCHEEVOS_CONCURRENT_BADGE_DOWNLOADS;
-
-#ifdef HAVE_THREADS
-   queue->lock = slock_new();
-#endif
 
    for (i = 0; i < RCHEEVOS_CONCURRENT_BADGE_DOWNLOADS; i++)
       rcheevos_client_fetch_next_badge(queue);

@@ -1337,6 +1337,59 @@ static void resampler_sinc_reset(void *data)
    resamp->fade_left  = 0;
 }
 
+/* The stream state: main_buffer whole (every ring, the shadow's, the
+ * blocks), then the clocks and counters of the instance, each stage
+ * and the shadow. The tables are configuration and stay. */
+#define SINC_STATE_WORDS (6 + 2 * (SINC_DEC_STAGES + 1))
+
+static size_t resampler_sinc_state(void *data, void *buf, size_t len,
+      int write)
+{
+   rarch_sinc_resampler_t *re = (rarch_sinc_resampler_t*)data;
+   uint32_t w[SINC_STATE_WORDS];
+   size_t ring, size;
+   unsigned s;
+   if (!re)
+      return 0;
+   ring = sizeof(float) * sinc_state_elems(re->taps, re->dec[0].taps);
+   size = ring + sizeof(w);
+   if (!buf)
+      return size;
+   if (len != size)
+      return 0;
+   if (write)
+   {
+      memcpy(re->main_buffer, buf, ring);
+      memcpy(w, (const unsigned char*)buf + ring, sizeof(w));
+      re->ptr         = w[0];
+      re->time        = w[1];
+      re->dec_stages  = w[2];
+      re->fade_left   = w[3];
+      re->fade_stages = w[4];
+      re->fade_len    = w[5];
+      for (s = 0; s <= SINC_DEC_STAGES; s++)
+      {
+         re->dec[s].ptr  = w[6 + 2 * s];
+         re->dec[s].time = w[7 + 2 * s];
+      }
+      return size;
+   }
+   w[0] = re->ptr;
+   w[1] = re->time;
+   w[2] = re->dec_stages;
+   w[3] = re->fade_left;
+   w[4] = re->fade_stages;
+   w[5] = re->fade_len;
+   for (s = 0; s <= SINC_DEC_STAGES; s++)
+   {
+      w[6 + 2 * s] = re->dec[s].ptr;
+      w[7 + 2 * s] = re->dec[s].time;
+   }
+   memcpy(buf, re->main_buffer, ring);
+   memcpy((unsigned char*)buf + ring, w, sizeof(w));
+   return size;
+}
+
 /* Clean rings, and a clock that takes input before it emits: a joining
  * path then produces no output ahead of the frames it was given. */
 static void sinc_dec_restart(rarch_sinc_resampler_t *stage)
@@ -1977,6 +2030,48 @@ static void resampler_sinc_process(void *re_, struct resampler_data *data)
       resampler_sinc_process_decimated(re, data);
 }
 
+/* The output of the nominal kernels is the phase clock's: an input
+ * frame is pushed while time is a phase or more, and a frame comes out
+ * at each step of the integer ratio until it is again, so what the next
+ * process() makes of each input frame follows from time alone. Walked
+ * here as the kernels walk it, input frame by input frame, up to the
+ * last one whose output still fits. The decimated path, which the
+ * design ratio's fast-forward takes, is not this clock: 0 there. */
+static size_t resampler_sinc_fit(void *re_, double ratio_d,
+      size_t max_output, size_t max_input)
+{
+   rarch_sinc_resampler_t *re = (rarch_sinc_resampler_t*)re_;
+   unsigned phases, step;
+   uint32_t time;
+   size_t   in, out = 0;
+
+   if (!sinc_resampler_ratio_valid(ratio_d, re->phase_bits, re->subphase_bits))
+      return 0;
+   if (     re->dec_stages || re->fade_left
+         || ratio_d < re->design_ratio * SINC_DEC_ENGAGE_FIRST)
+      return 0;
+   phases = 1 << (re->phase_bits + re->subphase_bits);
+   step   = (unsigned)(phases / ratio_d);
+   time   = re->time;
+   for (in = 0; in < max_input; in++)
+   {
+      /* this frame pushed, and what comes out before the next one */
+      size_t emit = 0;
+      if (time < phases)
+         break; /* the kernels never leave time here between calls */
+      time -= phases;
+      while (time < phases)
+      {
+         emit++;
+         time += step;
+      }
+      if (out + emit > max_output)
+         break;
+      out += emit;
+   }
+   return in;
+}
+
 retro_resampler_t sinc_resampler = {
    resampler_sinc_new,
    resampler_sinc_process,
@@ -1986,7 +2081,9 @@ retro_resampler_t sinc_resampler = {
    "sinc",
    resampler_sinc_reset,
    RESAMPLER_CAP_QUALITY | RESAMPLER_CAP_HQ_OVERSAMPLE,
-   resampler_sinc_sibling
+   resampler_sinc_sibling,
+   resampler_sinc_fit,
+   resampler_sinc_state
 };
 
 #if defined(__GNUC__) && defined(__OPTIMIZE__) && !defined(__clang__)

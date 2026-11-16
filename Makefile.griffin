@@ -153,13 +153,13 @@ else ifeq ($(libogc_platform), 1)
       LDFLAGS += $(MACHDEP) -Wl,-Map,$(notdir $(EXT_INTER_TARGET)).map
 
       ifeq ($(BIG_STACK), 1)
-         LDFLAGS += -T bootstrap/gx/ogc.ld
+         LDFLAGS += -T os/gekko/libogc/ogc.ld
       endif
    else ifeq ($(platform), wii)
       LDFLAGS += $(MACHDEP) -Wl,-Map,$(notdir $(EXT_INTER_TARGET)).map,-wrap,malloc,-wrap,free,-wrap,memalign,-wrap,calloc,-wrap,realloc,-wrap,strdup,-wrap,strndup,-wrap,malloc_usable_size
 
       ifeq ($(BIG_STACK), 1)
-        LDFLAGS += -T bootstrap/gx/rvl.ld
+        LDFLAGS += -T os/gekko/libogc/rvl.ld
       endif
    endif
 
@@ -196,6 +196,7 @@ else ifeq ($(libogc_platform), 1)
    HAVE_RJPEG               := 1
    HAVE_RBMP                := 1
    HAVE_RTGA                := 1
+   HAVE_RGIF                := 1
    HAVE_RMODTRACKER                := 1
    HAVE_OVERLAY             := 1
    HAVE_7ZIP                := 1
@@ -216,7 +217,7 @@ else ifeq ($(libogc_platform), 1)
       HAVE_RARCH_EXEC          := 1
       HAVE_RSOUND              := 1
 
-      APP_BOOTER_DIR = wii/app_booter
+      APP_BOOTER_DIR = os/gekko/rvl/app_booter
       PLATOBJS := $(APP_BOOTER_DIR)/app_booter.binobj
 
       ifeq ($(USBGECKO), 1)
@@ -272,6 +273,7 @@ else ifeq ($(platform), psp1)
    HAVE_RJPEG               := 1
    HAVE_RBMP                := 1
    HAVE_RTGA                := 1
+   HAVE_RGIF                := 1
    HAVE_KERNEL_PRX          := 1
    #HAVE_LANGEXTRA          := 1
    RARCH_CONSOLE             = 1
@@ -309,7 +311,6 @@ else ifeq ($(platform), vita)
    PLATOBJS += \
       libretro-common/audio/conversion/s16_to_float_neon.o \
       libretro-common/audio/conversion/float_to_s16_neon.o \
-      memory/neon/memcpy-neon.o \
       libretro-common/audio/resampler/drivers/sinc_resampler_neon.o
 
    LIBDIRS += -L.
@@ -325,6 +326,7 @@ else ifeq ($(platform), vita)
    HAVE_RJPEG               := 1
    HAVE_RBMP                := 1
    HAVE_RTGA                := 1
+   HAVE_RGIF                := 1
    HAVE_7ZIP                := 1
    HAVE_GXM              := 1
    HAVE_NETWORKING          := 1
@@ -347,6 +349,7 @@ else ifeq ($(platform), windows_msvc6_x86)
    HAVE_RJPEG               := 1
    HAVE_RBMP                := 1
    HAVE_RTGA                := 1
+   HAVE_RGIF                := 1
    HAVE_7ZIP                := 1
    HAVE_NETWORKING          := 0
    HAVE_IFINFO              := 0
@@ -398,6 +401,7 @@ else ifeq ($(platform), windows_msvc2003_x86)
    HAVE_RJPEG               := 1
    HAVE_RBMP                := 1
    HAVE_RTGA                := 1
+   HAVE_RGIF                := 1
    HAVE_7ZIP                := 1
    HAVE_NETWORKING          := 1
    HAVE_IFINFO              := 0
@@ -455,6 +459,7 @@ else ifeq ($(platform), windows_msvc2005_x86)
    HAVE_RJPEG               := 1
    HAVE_RBMP                := 1
    HAVE_RTGA                := 1
+   HAVE_RGIF                := 1
    HAVE_7ZIP                := 1
    HAVE_NETWORKING          := 1
    HAVE_IFINFO              := 0
@@ -543,6 +548,7 @@ else ifneq (,$(findstring windows_msvc2010,$(platform)))
    HAVE_RJPEG               := 1
    HAVE_RBMP                := 1
    HAVE_RTGA                := 1
+   HAVE_RGIF                := 1
    HAVE_7ZIP                := 1
    HAVE_NETWORKING          := 1
    HAVE_IFINFO              := 1
@@ -639,6 +645,7 @@ else ifneq (,$(findstring windows_msvc2012,$(platform)))
    HAVE_RJPEG               := 1
    HAVE_RBMP                := 1
    HAVE_RTGA                := 1
+   HAVE_RGIF                := 1
    HAVE_7ZIP                := 1
    HAVE_NETWORKING          := 1
    HAVE_IFINFO              := 1
@@ -726,6 +733,7 @@ else ifneq (,$(findstring windows_msvc2013,$(platform)))
    HAVE_RJPEG               := 1
    HAVE_RBMP                := 1
    HAVE_RTGA                := 1
+   HAVE_RGIF                := 1
    HAVE_7ZIP                := 1
    HAVE_NETWORKING          := 1
    HAVE_IFINFO              := 1
@@ -813,6 +821,7 @@ else ifneq (,$(findstring windows_msvc2015,$(platform)))
    HAVE_RJPEG               := 1
    HAVE_RBMP                := 1
    HAVE_RTGA                := 1
+   HAVE_RGIF                := 1
    HAVE_7ZIP                := 1
    HAVE_NETWORKING          := 1
    HAVE_IFINFO              := 1
@@ -915,6 +924,7 @@ else ifeq (qnx,$(platform))
    HAVE_RJPEG               := 1
    HAVE_RBMP                := 1
    HAVE_RTGA                := 1
+   HAVE_RGIF                := 1
    HAVE_7ZIP                := 1
    HAVE_NETWORKING          := 1
    HAVE_IFINFO              := 1
@@ -961,6 +971,7 @@ else ifneq (,$(findstring unix,$(platform)))
    HAVE_RJPEG               := 1
    HAVE_RBMP                := 1
    HAVE_RTGA                := 1
+   HAVE_RGIF                := 1
    HAVE_7ZIP                := 1
    HAVE_NETWORKING          := 1
    HAVE_IFINFO              := 1
@@ -986,6 +997,9 @@ else ifneq (,$(findstring unix,$(platform)))
    PLATCFLAGS += -D__MMX__ -D__SSE__ -DHAVE_OPENGL -DHAVE_OPENGL1 -DHAVE_GLSL -DHAVE_SHADERPIPELINE -DHAVE_OZONE -DHAVE_CC_RESAMPLER -DHAVE_CHEEVOS -DRC_DISABLE_LUA -DHAVE_GL_SYNC -DHAVE_SLANG -DHAVE_LANGEXTRA -DHAVE_RUNAHEAD -DHAVE_GFX_WIDGETS -DHAVE_CONFIGFILE -DHAVE_PATCH -DHAVE_ONLINE_UPDATER -DHAVE_UPDATE_ASSETS -DHAVE_UPDATE_CORES
    PLATCFLAGS += -DHAVE_UPDATE_CORE_INFO
    PLATCFLAGS += -DHAVE_VULKAN -DHAVE_XMB -DRARCH_INTERNAL -DHAVE_X11 -DHAVE_XCB -DHAVE_UDEV -DHAVE_BSV_MOVIE -DHAVE_PULSE
+   # as Makefile builds Linux: the GNU extensions are seen from the first
+   # system header, which in a unity build is long before rthreads.c's
+   PLATCFLAGS += -D_GNU_SOURCE
    EXT_TARGET := $(TARGET_NAME)
    EXT_INTER_TARGET := $(TARGET_NAME)
    INCLUDE += -Ilibretro-common/include -Igfx/include -Ideps -Ideps/rcheevos/include -I.
@@ -1075,6 +1089,9 @@ endif
 ifeq ($(HAVE_RTGA), 1)
    CFLAGS      += -DHAVE_RTGA
 endif
+ifeq ($(HAVE_RGIF), 1)
+   CFLAGS      += -DHAVE_RGIF
+endif
 
 ifeq ($(HAVE_BSV_MOVIE), 1)
    CFLAGS      += -DHAVE_BSV_MOVIE
@@ -1118,6 +1135,19 @@ endif
 
 ifeq ($(HAVE_NETWORKING), 1)
    CFLAGS      += -DHAVE_NETWORKING
+   ifeq ($(HAVE_RTMP), 1)
+      CFLAGS   += -DHAVE_RTMP
+   endif
+endif
+
+ifeq ($(HAVE_RFLV), 1)
+   CFLAGS      += -DHAVE_RFLV
+endif
+
+ifeq ($(HAVE_MF_AUDIO), 1)
+   ifeq ($(system_platform), win)
+      CFLAGS   += -DHAVE_MF_AUDIO
+   endif
 endif
 
 ifeq ($(HAVE_IFINFO), 1)

@@ -20,6 +20,7 @@ SOURCES := bsv_replay_init_test.c \
            $(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
            $(LIBRETRO_COMM_DIR)/compat/fopen_utf8.c \
            $(LIBRETRO_COMM_DIR)/encodings/encoding_rzstd.c \
+           $(LIBRETRO_COMM_DIR)/encodings/encoding_xxh64.c \
            $(LIBRETRO_COMM_DIR)/encodings/encoding_utf.c \
            $(LIBRETRO_COMM_DIR)/encodings/encoding_crc32.c \
            $(LIBRETRO_COMM_DIR)/features/features_cpu.c \
@@ -48,9 +49,10 @@ LDFLAGS += -lpthread -lm
 # on desktop builds.
 ifeq ($(STATESTREAM),1)
    SOURCES += $(REPO_ROOT)/input/bsv/uint32s_index.c \
+              $(LIBRETRO_COMM_DIR)/encodings/encoding_xxh3.c \
               $(REPO_ROOT)/libretro-db/rmsgpack.c \
               $(REPO_ROOT)/libretro-db/rmsgpack_dom.c
-   CFLAGS  += -DHAVE_STATESTREAM -I$(REPO_ROOT)/deps
+   CFLAGS  += -DHAVE_STATESTREAM
 endif
 
 # NETPLAY=1 exercises the recorder and the real rollback/confirmation loop

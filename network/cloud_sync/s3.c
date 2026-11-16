@@ -14,6 +14,8 @@
 
 #include <encodings/base64.h>
 #include <lrc_hash.h>
+#include <crypto/crypto.h>
+#include <crypto/kdf.h>
 #include <string/stdstring.h>
 #include <time/rtime.h>
 #include <formats/rjson.h>
@@ -22,6 +24,7 @@
 #include "../cloud_sync_driver.h"
 #include "../../retroarch.h"
 #include "../../tasks/tasks_internal.h"
+#include "../../tasks/task_file_transfer.h"
 #include "../../verbosity.h"
 #include <compat/strl.h>
 
@@ -36,6 +39,8 @@
 #define S3_SIGNATURE_VERSION "AWS4-HMAC-SHA256"
 #define S3_SERVICE "s3"
 
+/* A test can set its own, down to the 5 MiB a part has at least */
+#ifndef S3_MULTIPART_NOMINAL_THRESHOLD_BYTES
 #if defined(_3DS) || defined(VITA) || defined(PSP) || defined(PS2) || defined(WIIU) || defined(GEKKO)
 #define S3_MULTIPART_NOMINAL_THRESHOLD_BYTES (16ULL * 1024ULL * 1024ULL)
 #elif defined(HAVE_LIBNX)
@@ -43,9 +48,21 @@
 #else
 #define S3_MULTIPART_NOMINAL_THRESHOLD_BYTES (64ULL * 1024ULL * 1024ULL)
 #endif
+#endif
+
+/* A byte range of the file being uploaded, pulled by net_http on the
+ * task thread as the socket takes it */
+typedef struct
+{
+   int64_t start;
+   RFILE  *file;
+   size_t  len;
+   size_t  pos;
+} s3_body_t;
 
 typedef struct
 {
+   s3_body_t body;
    char path[PATH_MAX_LENGTH];
    char file[PATH_MAX_LENGTH];
    cloud_sync_complete_handler_t cb;
@@ -69,7 +86,8 @@ typedef struct
    s3_cb_state_t *cb_state;
    char url[PATH_MAX_LENGTH];
    char canonical_uri[PATH_MAX_LENGTH];
-   char *file_data;
+   s3_body_t part;
+   RFILE *file;
    size_t file_size;
    size_t part_size;
    size_t part_count;
@@ -396,6 +414,86 @@ static char* s3_sha256_hash(const char *data, size_t len)
    return hash;
 }
 
+static void s3_hex32(char *s, const uint8_t *digest)
+{
+   static const char hex[] = "0123456789abcdef";
+   unsigned i;
+   for (i = 0; i < 32; i++)
+   {
+      s[2 * i]     = hex[digest[i] >> 4];
+      s[2 * i + 1] = hex[digest[i] & 15];
+   }
+   s[64] = '\0';
+}
+
+/* Read in runs this long to hash a range of the file */
+#define S3_HASH_RUN (64 * 1024)
+
+/* The SHA-256 of @len bytes of @file from @start, in hex, read in runs
+ * rather than whole: the body is hashed here, then read again as the
+ * socket takes it. NULL if the file reads short or out of memory. */
+static char *s3_sha256_file(RFILE *file, int64_t start, size_t len)
+{
+   struct sha256_state st;
+   uint8_t  digest[32];
+   uint8_t *run;
+   char    *hash = NULL;
+
+   if (!(run = (uint8_t*)malloc(len < S3_HASH_RUN ? (len ? len : 1) : S3_HASH_RUN)))
+      return NULL;
+   if (filestream_seek(file, start, SEEK_SET) < 0)
+      goto done;
+   sha256_stream_init(&st, 0);
+   while (len)
+   {
+      size_t n = len < S3_HASH_RUN ? len : S3_HASH_RUN;
+      if (filestream_read(file, run, (int64_t)n) != (int64_t)n)
+         goto done;
+      sha256_stream_update(&st, run, n);
+      len -= n;
+   }
+   sha256_stream_final(&st, digest);
+   if ((hash = (char*)malloc(65)))
+      s3_hex32(hash, digest);
+done:
+   free(run);
+   return hash;
+}
+
+/* net_http's source for an upload body: the next run of the range.
+ * The first run seeks to the range, so each part of a multipart
+ * upload reads its own bytes whatever was read before it. */
+static int64_t s3_body_source(void *data, void *buf, size_t len)
+{
+   s3_body_t *b = (s3_body_t*)data;
+   int64_t    got;
+
+   if (len > b->len - b->pos)
+      len = b->len - b->pos;
+   if (!len)
+      return 0;
+   if (!b->pos && filestream_seek(b->file, b->start, SEEK_SET) < 0)
+      return -1;
+   if ((got = filestream_read(b->file, buf, (int64_t)len)) > 0)
+      b->pos += (size_t)got;
+   return got;
+}
+
+/* A replay on a fresh connection sends the range again from its start */
+static bool s3_body_rewind(void *data)
+{
+   ((s3_body_t*)data)->pos = 0;
+   return true;
+}
+
+static void s3_body_set(s3_body_t *b, RFILE *file, int64_t start, size_t len)
+{
+   b->start = start;
+   b->file  = file;
+   b->len   = len;
+   b->pos   = 0;
+}
+
 /* URL encode a string according to RFC 3986 */
 static char* s3_url_encode(const char *input)
 {
@@ -444,217 +542,110 @@ static char* s3_url_encode(const char *input)
    return output;
 }
 
-/* Canonicalize query string parameters */
-static char* s3_canonicalize_query_string(const char *query_string)
+/* One query parameter: a span of the caller's string, and how much of
+ * it is the name. */
+typedef struct
 {
-   if (!query_string || !*query_string)
-      return strdup("");
+   const char *p;
+   size_t      len;
+   size_t      name;
+} s3_query_param_t;
 
-   /* For now, return the query string as-is since most S3 operations don't use
-    * query parameters
-    * A full implementation would:
-    * 1. Split parameters by '&'
-    * 2. URL encode each parameter name and value
-    * 3. Sort parameters alphabetically by name
-    * 4. Join with '&'
-    */
-   return strdup(query_string);
+/* Parameters sorted without allocating, past which the index is on
+ * the heap. Every request this client signs has one or two. */
+#define S3_QUERY_INLINE 16
+
+/* qsort comparator: SigV4 sorts query parameters by URL-encoded name,
+ * then by URL-encoded value, in byte order.  The names are compared on
+ * their own: on the whole "name=value" string, a name that extends
+ * another ("a1" after "a") would meet the '=' and sort first, since
+ * digits, '-', '.' and '%' all sort below '='. */
+static int s3_query_param_cmp(const void *a, const void *b)
+{
+   const s3_query_param_t *x = (const s3_query_param_t*)a;
+   const s3_query_param_t *y = (const s3_query_param_t*)b;
+   size_t xr                 = x->len - x->name;
+   size_t yr                 = y->len - y->name;
+   int    r                  = memcmp(x->p, y->p,
+         x->name < y->name ? x->name : y->name);
+
+   if (r)
+      return r;
+   if (x->name != y->name)
+      return x->name < y->name ? -1 : 1;
+   if ((r = memcmp(x->p + x->name, y->p + y->name, xr < yr ? xr : yr)))
+      return r;
+   return xr == yr ? 0 : (xr < yr ? -1 : 1);
 }
 
-/* Calculate HMAC-SHA256 and return binary result */
-static uint8_t* s3_hmac_sha256_bin(const uint8_t *key, size_t key_len, const char *data, uint8_t *output)
+typedef void (*s3_emit_t)(void *data, const char *s, size_t len);
+
+/* The canonical query string per SigV4, handed to @emit piece by
+ * piece: @query's parameters, sorted with s3_query_param_cmp, joined
+ * by '&'. Names and values arrive URL-encoded, and every parameter as
+ * name=value, even with an empty value ("uploads="). False only out of
+ * memory. */
+static bool s3_query_emit(const char *query, s3_emit_t emit, void *data)
 {
-   unsigned i       = 0;
-   char *inner_data = NULL;
-   size_t data_len  = strlen(data);
+   s3_query_param_t  inline_params[S3_QUERY_INLINE];
+   s3_query_param_t *params = inline_params;
+   const char       *q;
+   size_t            count  = 1;
+   size_t            i;
 
-   char inner_pad[64];
-   char outer_pad[64];
-   uint8_t key_hash[32];
+   if (!query || !*query)
+      return true;
+   for (q = query; *q; q++)
+      if (*q == '&')
+         count++;
+   if (     count > S3_QUERY_INLINE
+         && !(params = (s3_query_param_t*)malloc(count * sizeof(*params))))
+      return false;
 
-   char inner_hash_hex[65];
-   uint8_t inner_hash_bin[32];
-   char final_hash_hex[65];
-
-   /* Hash the key if it's longer than 64 bytes */
-   if (key_len > 64)
+   for (i = 0, q = query; i < count; i++)
    {
-      char temp_hash[65];/* Use a temporary buffer for the hash */
-      sha256_hash(temp_hash, (const uint8_t*)key, key_len);
-
-      /* Convert hex to binary */
-      for (i = 0; i < 32; i++)
-      {
-         char hex_byte[3];
-         hex_byte[0] = temp_hash[i*2];
-         hex_byte[1] = temp_hash[i*2+1];
-         hex_byte[2] = '\0';
-         key_hash[i] = (uint8_t)strtol(hex_byte, NULL, 16);
-      }
-      key = key_hash;
-      key_len = 32;
-   }
-   else
-   {
+      const char *amp = strchr(q, '&');
+      size_t      len = amp ? (size_t)(amp - q) : strlen(q);
+      const char *eq  = (const char*)memchr(q, '=', len);
+      params[i].p     = q;
+      params[i].len   = len;
+      params[i].name  = eq ? (size_t)(eq - q) : len;
+      q              += len + (amp ? 1 : 0);
    }
 
-   /* Pad the key to 64 bytes */
-   memset(outer_pad, 0, 64);
-   memset(inner_pad, 0, 64);
-   if (key_len <= 64)
+   qsort(params, count, sizeof(*params), s3_query_param_cmp);
+
+   for (i = 0; i < count; i++)
    {
-      memcpy(outer_pad, key, key_len);
-      memcpy(inner_pad, key, key_len);
-   }
-   else
-   {
-      /* Key is longer than 64 bytes, this shouldn't happen after hashing */
-      memcpy(outer_pad, key, 64);
-      memcpy(inner_pad, key, 64);
+      if (i)
+         emit(data, "&", 1);
+      emit(data, params[i].p, params[i].len);
    }
 
-   /* XOR with constants */
-   for (i = 0; i < 64; i++)
-   {
-      outer_pad[i] ^= 0x5c;
-      inner_pad[i] ^= 0x36;
-   }
-
-   /* Inner hash: H(K XOR 0x36, text) */
-   inner_data = malloc(64 + data_len);
-   if (!inner_data)
-      return NULL;
-
-   memcpy(inner_data, inner_pad, 64);
-   memcpy(inner_data + 64, data, data_len);
-
-   /* Hash and convert to binary */
-   sha256_hash(inner_hash_hex, (const uint8_t*)inner_data, 64 + data_len);
-
-   for (i = 0; i < 32; i++)
-   {
-      char hex_byte[3];
-      hex_byte[0] = inner_hash_hex[i*2];
-      hex_byte[1] = inner_hash_hex[i*2+1];
-      hex_byte[2] = '\0';
-      inner_hash_bin[i] = (uint8_t)strtol(hex_byte, NULL, 16);
-   }
-
-   /* Outer hash: H(K XOR 0x5c, inner_hash_bin) */
-   /* Ensure we have enough space for outer hash (64 + 32 = 96 bytes) */
-   if (64 + data_len < 96)
-   {
-      /* Reallocate if needed */
-      char *outer_data = realloc(inner_data, 96);
-      if (!outer_data)
-      {
-         free(inner_data);
-         return NULL;
-      }
-      inner_data = outer_data;
-   }
-
-   memcpy(inner_data, outer_pad, 64);
-   memcpy(inner_data + 64, inner_hash_bin, 32);
-
-   sha256_hash(final_hash_hex, (const uint8_t*)inner_data, 64 + 32);
-
-   /* Convert final result to binary */
-   for (i = 0; i < 32; i++)
-   {
-      char hex_byte[3];
-      hex_byte[0] = final_hash_hex[i*2];
-      hex_byte[1] = final_hash_hex[i*2+1];
-      hex_byte[2] = '\0';
-      output[i] = (uint8_t)strtol(hex_byte, NULL, 16);
-   }
-
-   /* Cleanup */
-   free(inner_data);
-
-   return output;
+   if (params != inline_params)
+      free(params);
+   return true;
 }
 
-/* Calculate AWS Signature Version 4 signature with proper key derivation */
-static char* s3_calculate_aws4_signature(const char *secret_key, const char *date,
-                                        const char *region, const char *service,
-                                        const char *string_to_sign)
+/* @s, NUL-terminated, into the hash or the MAC being made */
+#define S3_SHA_STR(st, str) \
+   sha256_stream_update((st), (const uint8_t*)(str), strlen(str))
+#define S3_MAC_STR(ctx, str) \
+   hmac_sha256_update((ctx), (const uint8_t*)(str), strlen(str))
+
+static void s3_sha_emit(void *data, const char *s, size_t len)
 {
-   unsigned i;
-   char *signature;
-   char aws4_key[128];
-   uint8_t k_date[32];
-   uint8_t k_region[32];
-   uint8_t k_service[32];
-   uint8_t k_signing[32];
-   uint8_t final_signature[32];
-   char k_date_hex[65];
-   char k_region_hex[65];
-   char k_service_hex[65];
-
-   signature = malloc(65);
-   if (!signature)
-      return NULL;
-
-   /* Build AWS4 key string */
-   snprintf(aws4_key, sizeof(aws4_key), "AWS4%s", secret_key);
-
-   /* Derive keys step by step using binary HMAC throughout */
-   /* Step 1: DateKey = HMAC-SHA256("AWS4" + SecretAccessKey, Date) */
-   /* Note: aws4_key is a string, but HMAC treats it as byte data */
-   if (!s3_hmac_sha256_bin((uint8_t*)aws4_key, strlen(aws4_key), date, k_date))
-      goto error;
-
-   /* Debug: Show k_date */
-   for (i = 0; i < 32; i++)
-      snprintf(k_date_hex + 2 * i, 3, "%02x", (unsigned)k_date[i]);
-   k_date_hex[64] = '\0';
-   /* Step 2: DateRegionKey = HMAC-SHA256(DateKey, Region) */
-   if (!s3_hmac_sha256_bin(k_date, 32, region, k_region))
-      goto error;
-
-   /* Debug: Show k_region */
-   for (i = 0; i < 32; i++)
-      snprintf(k_region_hex + 2 * i, 3, "%02x", (unsigned)k_region[i]);
-   k_region_hex[64] = '\0';
-   /* Step 3: DateRegionServiceKey = HMAC-SHA256(DateRegionKey, Service) */
-   if (!s3_hmac_sha256_bin(k_region, 32, service, k_service))
-      goto error;
-
-   /* Debug: Show k_service */
-   for (i = 0; i < 32; i++)
-      snprintf(k_service_hex + 2 * i, 3, "%02x", (unsigned)k_service[i]);
-   k_service_hex[64] = '\0';
-   /* Step 4: SigningKey = HMAC-SHA256(DateRegionServiceKey, "aws4_request") */
-   if (!s3_hmac_sha256_bin(k_service, 32, "aws4_request", k_signing))
-      goto error;
-
-   /* Calculate final signature using the derived signing key in binary
-   * format
-   */
-   if (!s3_hmac_sha256_bin(k_signing, 32, string_to_sign, final_signature))
-   {
-      RARCH_ERR(S3_PFX "Failed to calculate final signature\n");
-      goto error;
-   }
-
-   /* Convert final signature to hex string */
-   for (i = 0; i < 32; i++)
-      snprintf(signature + 2 * i, 3, "%02x", (unsigned)final_signature[i]);
-
-   signature[64] = '\0';
-   return signature;
-
-error:
-   free(signature);
-   return NULL;
+   sha256_stream_update((struct sha256_state*)data, (const uint8_t*)s, len);
 }
 
 /* AWS Signature Version 4 calculation with provided timestamp */
 /* @copy_source, when set, is the x-amz-copy-source value of a
  * CopyObject request.  S3 requires every x-amz-* header a request
  * carries to be signed, so it joins the canonical and signed headers
- * in its sorted place, between x-amz-content-sha256 and x-amz-date. */
+ * in its sorted place, between x-amz-content-sha256 and x-amz-date.
+ * The canonical request is hashed as it is made, and the string to
+ * sign MACed the same way: nothing is assembled, so nothing is cut
+ * short. Returns the signature in hex, NULL out of memory. */
 static char* s3_calculate_signature_v4_with_time(const char *method, const char *canonical_uri,
                                       const char *query_string, const char *headers,
                                       const char *payload_hash, const char *region,
@@ -662,98 +653,95 @@ static char* s3_calculate_signature_v4_with_time(const char *method, const char 
                                       const char *secret_key, const char *host,
                                       const char *copy_source, time_t now)
 {
-   char *signature = NULL;
-   char date[16];
-   char datetime[32];
-   char credential_scope[128];
-   char canonical_request[4096];
-   char string_to_sign[4096];
-   char signed_headers[256];
-   char *canonical_headers = NULL;
-   char *canonical_query_string = NULL;
-   char *canonical_request_hash = NULL;
-
-   /* Use provided timestamp */
+   struct sha256_state    cr;
+   struct hmac_sha256_ctx mac;
+   uint8_t  digest[32];
+   uint8_t  key[32];
+   char     cr_hash[65];
+   char     date[16];
+   char     datetime[32];
+   /* "AWS4" and the secret, which the settings keep to 185 octets */
+   char     aws4_key[4 + 186];
+   size_t   secret_len = strlen(secret_key);
+   char    *signature;
    struct tm *tm_info = gmtime(&now);
+
+   (void)access_key;
+   if (secret_len > sizeof(aws4_key) - 4)
+   {
+      RARCH_ERR(S3_PFX "Secret access key too long to sign with\n");
+      return NULL;
+   }
+   if (!(signature = (char*)malloc(65)))
+      return NULL;
    strftime(date, sizeof(date), "%Y%m%d", tm_info);
    strftime(datetime, sizeof(datetime), "%Y%m%dT%H%M%SZ", tm_info);
 
-   /* Build credential scope */
-   snprintf(credential_scope, sizeof(credential_scope), "%s/%s/%s/aws4_request",
-            date, region, service);
-
-   /* Build canonical headers */
+   /* The canonical request, into its hash */
+   sha256_stream_init(&cr, 0);
+   S3_SHA_STR(&cr, method);
+   S3_SHA_STR(&cr, "\n");
+   S3_SHA_STR(&cr, canonical_uri);
+   S3_SHA_STR(&cr, "\n");
+   /* Out of memory, the request is not signed at all: a signature made
+    * without the query only shows up later, as a 403. */
+   if (!s3_query_emit(query_string, s3_sha_emit, &cr))
+   {
+      free(signature);
+      return NULL;
+   }
+   S3_SHA_STR(&cr, "\n");
    if (headers)
    {
-      /* Format headers for canonical request - must be sorted alphabetically
-       * and lowercase. Each header must be trimmed and end with a newline.
-       * Each header must be in the following order:
-       * host
-       * x-amz-content-sha256
-       * x-amz-date
-       */
-      size_t canonical_len = 512 + (copy_source ? strlen(copy_source) : 0);
-      canonical_headers = malloc(canonical_len);
-      if (canonical_headers)
+      /* sorted, lowercase, each ending in a newline */
+      S3_SHA_STR(&cr, "host:");
+      S3_SHA_STR(&cr, host);
+      S3_SHA_STR(&cr, "\nx-amz-content-sha256:");
+      S3_SHA_STR(&cr, payload_hash);
+      if (copy_source)
       {
-         if (copy_source)
-            snprintf(canonical_headers, canonical_len,
-                  "host:%s\nx-amz-content-sha256:%s\nx-amz-copy-source:%s\nx-amz-date:%s\n",
-                  host, payload_hash, copy_source, datetime);
-         else
-            snprintf(canonical_headers, canonical_len,
-                  "host:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n",
-                  host, payload_hash, datetime);
+         S3_SHA_STR(&cr, "\nx-amz-copy-source:");
+         S3_SHA_STR(&cr, copy_source);
       }
-
+      S3_SHA_STR(&cr, "\nx-amz-date:");
+      S3_SHA_STR(&cr, datetime);
+      S3_SHA_STR(&cr, "\n");
    }
-
-   /* Build signed headers list */
-   strlcpy(signed_headers, copy_source
+   S3_SHA_STR(&cr, "\n");
+   S3_SHA_STR(&cr, copy_source
          ? "host;x-amz-content-sha256;x-amz-copy-source;x-amz-date"
-         : "host;x-amz-content-sha256;x-amz-date", sizeof(signed_headers));
+         : "host;x-amz-content-sha256;x-amz-date");
+   S3_SHA_STR(&cr, "\n");
+   S3_SHA_STR(&cr, payload_hash);
+   sha256_stream_final(&cr, digest);
+   s3_hex32(cr_hash, digest);
 
-   /* Build canonical query string */
-   if (query_string)
-      canonical_query_string = s3_canonicalize_query_string(query_string);
+   /* The signing key: HMAC chained from "AWS4" and the secret, through
+    * the date, the region, the service and "aws4_request" */
+   memcpy(aws4_key, "AWS4", 4);
+   memcpy(aws4_key + 4, secret_key, secret_len);
+   hmac_sha256((const uint8_t*)aws4_key, 4 + secret_len,
+         (const uint8_t*)date, strlen(date), key);
+   hmac_sha256(key, 32, (const uint8_t*)region, strlen(region), key);
+   hmac_sha256(key, 32, (const uint8_t*)service, strlen(service), key);
+   hmac_sha256(key, 32, (const uint8_t*)"aws4_request", 12, key);
 
-   /* Build canonical request */
-   snprintf(canonical_request, sizeof(canonical_request),
-            "%s\n%s\n%s\n%s\n%s\n%s",
-            method,
-            canonical_uri,
-            canonical_query_string ? canonical_query_string : "",
-            canonical_headers ? canonical_headers : "",
-            signed_headers,
-            payload_hash);
-
-   /* Calculate SHA256 hash of canonical request */
-   canonical_request_hash = s3_sha256_hash(canonical_request, strlen(canonical_request));
-   if (!canonical_request_hash)
-      goto cleanup;
-
-   /* Build string to sign */
-   snprintf(string_to_sign, sizeof(string_to_sign),
-            "%s\n%s\n%s\n%s",
-            S3_SIGNATURE_VERSION,
-            datetime,
-            credential_scope,
-            canonical_request_hash);
-
-   /* Calculate signature using AWS Signature Version 4 key derivation */
-   signature = s3_calculate_aws4_signature(secret_key, date, region, service, string_to_sign);
-   if (!signature)
-      RARCH_ERR(S3_PFX "Failed to calculate signature\n");
-
-   /* Cleanup */
-   cleanup:
-   if (canonical_headers)
-      free(canonical_headers);
-   if (canonical_query_string)
-      free(canonical_query_string);
-   if (canonical_request_hash)
-      free(canonical_request_hash);
-
+   /* The string to sign, into its MAC */
+   hmac_sha256_init(&mac, key, 32);
+   S3_MAC_STR(&mac, S3_SIGNATURE_VERSION "\n");
+   S3_MAC_STR(&mac, datetime);
+   S3_MAC_STR(&mac, "\n");
+   S3_MAC_STR(&mac, date);
+   S3_MAC_STR(&mac, "/");
+   S3_MAC_STR(&mac, region);
+   S3_MAC_STR(&mac, "/");
+   S3_MAC_STR(&mac, service);
+   S3_MAC_STR(&mac, "/aws4_request\n");
+   S3_MAC_STR(&mac, cr_hash);
+   hmac_sha256_final(&mac, digest);
+   s3_hex32(signature, digest);
+   crypto_memzero(aws4_key, sizeof(aws4_key));
+   crypto_memzero(key, sizeof(key));
    return signature;
 }
 
@@ -872,21 +860,15 @@ static void s3_read_cb(retro_task_t *task, void *task_data, void *user_data, con
    else if (!success)
       s3_log_http_failure(s3_cb_st->path, data, err);
 
+   /* The body went to the file as it arrived */
    if (success && data && data->status >= 200 && data->status < 300)
    {
-      file = filestream_open(s3_cb_st->file,
-            RETRO_VFS_FILE_ACCESS_READ_WRITE,
-            RETRO_VFS_FILE_ACCESS_HINT_NONE);
-      if (!file)
+      if (!(file = filestream_open(s3_cb_st->file,
+                  RETRO_VFS_FILE_ACCESS_READ,
+                  RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK)))
       {
          RARCH_WARN(S3_PFX "Failed to open local file for read '%s'\n", s3_cb_st->file);
          success = false;
-      }
-      else
-      {
-         if (data->data && data->len > 0)
-            filestream_write(file, data->data, data->len);
-         filestream_seek(file, 0, SEEK_SET);
       }
    }
 
@@ -939,17 +921,24 @@ static void s3_delete_cb(retro_task_t *task, void *task_data, void *user_data, c
    free(s3_cb_st);
 }
 
+/* GET straight into @cb_state's file, as the body arrives */
 static bool s3_http_get_async(const char *url, const char *headers, s3_cb_state_t *cb_state)
 {
-   return task_push_http_transfer_with_headers(url, true, NULL,
-         headers, s3_read_cb, cb_state) != NULL;
+   return task_push_http_download_file_with_headers(url, cb_state->file,
+         true, NULL, headers, s3_read_cb, cb_state) != NULL;
 }
 
+/* PUT @cb_state's body, streamed from its file */
 static bool s3_http_put_async(const char *url, const char *headers,
-      const void *data, size_t data_len, s3_cb_state_t *cb_state)
+      s3_cb_state_t *cb_state)
 {
-   return task_push_http_transfer_with_content(url, "PUT",
-         data, data_len, "application/octet-stream", true, false,
+   if (!cb_state->body.len)
+      return task_push_http_transfer_with_content(url, "PUT",
+            NULL, 0, "application/octet-stream", true, false,
+            headers, s3_update_cb, cb_state) != NULL;
+   return task_push_http_transfer_with_source(url, "PUT",
+         s3_body_source, s3_body_rewind, &cb_state->body, cb_state->body.len,
+         "application/octet-stream", true, false,
          headers, s3_update_cb, cb_state) != NULL;
 }
 
@@ -1213,7 +1202,6 @@ static void s3_multipart_free(s3_multipart_state_t *mp_st)
    }
 
    free(mp_st->upload_id);
-   free(mp_st->file_data);
    free(mp_st->cb_state);
    free(mp_st);
 }
@@ -1296,12 +1284,8 @@ static bool s3_multipart_fallback_single_put(s3_multipart_state_t *mp_st)
    if (!mp_st || !mp_st->cb_state)
       return false;
 
-   if (mp_st->file_data && mp_st->file_size > 0)
-      payload_hash = s3_sha256_hash(mp_st->file_data, mp_st->file_size);
-   else
-      payload_hash = strdup(S3_EMPTY_PAYLOAD_SHA256);
-
-   if (!payload_hash)
+   s3_body_set(&mp_st->cb_state->body, mp_st->file, 0, mp_st->file_size);
+   if (!(payload_hash = s3_sha256_file(mp_st->file, 0, mp_st->file_size)))
       return false;
 
    auth_header = s3_build_auth_header("PUT", mp_st->canonical_uri, "",
@@ -1312,8 +1296,7 @@ static bool s3_multipart_fallback_single_put(s3_multipart_state_t *mp_st)
       return false;
    }
 
-   if (!s3_http_put_async(mp_st->url, auth_header,
-            mp_st->file_data, mp_st->file_size, mp_st->cb_state))
+   if (!s3_http_put_async(mp_st->url, auth_header, mp_st->cb_state))
    {
       free(payload_hash);
       free(auth_header);
@@ -1586,7 +1569,8 @@ static void s3_multipart_upload_next_part(s3_multipart_state_t *mp_st)
    }
    part_number = (unsigned)(mp_st->current_part + 1);
 
-   payload_hash = s3_sha256_hash(mp_st->file_data + offset, content_len);
+   s3_body_set(&mp_st->part, mp_st->file, (int64_t)offset, content_len);
+   payload_hash = s3_sha256_file(mp_st->file, (int64_t)offset, content_len);
    encoded_upload_id = s3_url_encode_query_value(mp_st->upload_id);
    if (!payload_hash || !encoded_upload_id)
       goto fail;
@@ -1603,8 +1587,9 @@ static void s3_multipart_upload_next_part(s3_multipart_state_t *mp_st)
    if (!url_with_query || !auth_header)
       goto fail;
 
-   if (!task_push_http_transfer_with_content(url_with_query, "PUT",
-            mp_st->file_data + offset, content_len, "application/octet-stream", true, true,
+   if (!task_push_http_transfer_with_source(url_with_query, "PUT",
+            s3_body_source, s3_body_rewind, &mp_st->part, content_len,
+            "application/octet-stream", true, true,
             auth_header, s3_multipart_upload_part_cb, mp_st))
       goto fail;
 
@@ -1783,13 +1768,34 @@ static bool s3_sync_end(cloud_sync_complete_handler_t cb, void *user_data)
 }
 
 /* Read file from S3 */
+/* @path's request URL, and its canonical URI behind it in the same
+ * allocation, which the caller frees: two path buffers kept off the
+ * stack. NULL if either cannot be built or out of memory. */
+static char *s3_object_urls(s3_state_t *s3_st, const char *path,
+      char **canonical_uri)
+{
+   char *url = (char*)malloc(2 * PATH_MAX_LENGTH);
+
+   if (!url)
+      return NULL;
+   *canonical_uri = url + PATH_MAX_LENGTH;
+   if (     !s3_build_request_url(url, PATH_MAX_LENGTH, s3_st, path)
+         || !s3_build_canonical_uri_from_url(url, *canonical_uri,
+            PATH_MAX_LENGTH))
+   {
+      free(url);
+      return NULL;
+   }
+   return url;
+}
+
 static bool s3_read(const char *path, const char *file, cloud_sync_complete_handler_t cb, void *user_data)
 {
    s3_cb_state_t *s3_cb_st = (s3_cb_state_t*)calloc(1, sizeof(s3_cb_state_t));
    s3_state_t *s3_st = s3_state_get_ptr();
    char *auth_header = NULL;
-   char url[PATH_MAX_LENGTH];
-   char canonical_uri[PATH_MAX_LENGTH];
+   char *url = NULL;
+   char *canonical_uri = NULL;
    bool success = false;
 
    if (!s3_cb_st)
@@ -1800,16 +1806,12 @@ static bool s3_read(const char *path, const char *file, cloud_sync_complete_hand
    strlcpy(s3_cb_st->path, path, sizeof(s3_cb_st->path));
    strlcpy(s3_cb_st->file, file, sizeof(s3_cb_st->file));
 
-   /* Build S3 URL - all supported formats are virtual-hosted style */
-   if (!s3_build_request_url(url, sizeof(url), s3_st, path))
-      goto cleanup;
-
-   if (!s3_build_canonical_uri_from_url(url, canonical_uri, sizeof(canonical_uri)))
+   if (!(url = s3_object_urls(s3_st, path, &canonical_uri)))
       goto cleanup;
 
    /* Build authorization header */
    auth_header = s3_build_auth_header("GET", canonical_uri, "", "host;x-amz-content-sha256;x-amz-date",
-                                     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", s3_st);
+                                     S3_EMPTY_PAYLOAD_SHA256, s3_st);
 
    if (!auth_header)
    {
@@ -1834,6 +1836,7 @@ static bool s3_read(const char *path, const char *file, cloud_sync_complete_hand
 cleanup:
    free(auth_header);
    free(s3_cb_st);
+   free(url);
 
    return success;
 }
@@ -1845,9 +1848,8 @@ static bool s3_update_upload(const char *path, RFILE *file, cloud_sync_complete_
    s3_multipart_state_t *mp_st = NULL;
    s3_state_t *s3_st = s3_state_get_ptr();
    char *auth_header = NULL;
-   char url[PATH_MAX_LENGTH];
-   char canonical_uri[PATH_MAX_LENGTH];
-   char *file_data = NULL;
+   char *url = NULL;
+   char *canonical_uri = NULL;
    size_t file_size = 0;
    char *payload_hash = NULL;
    size_t multipart_threshold = s3_get_multipart_nominal_threshold_bytes();
@@ -1861,31 +1863,21 @@ static bool s3_update_upload(const char *path, RFILE *file, cloud_sync_complete_
    s3_cb_st->rfile = file;
    strlcpy(s3_cb_st->path, path, sizeof(s3_cb_st->path));
 
-   /* Get file size and data */
+   /* The body is streamed from the file, never read into memory whole:
+    * hashed in runs for the signature, then read again as the socket
+    * takes it. */
    if (file)
    {
-      filestream_seek(file, 0, SEEK_END);
-      file_size = filestream_tell(file);
-      filestream_seek(file, 0, SEEK_SET);
-
-      if (file_size > 0)
+      int64_t size = filestream_get_size(file);
+      if (size < 0 || (uint64_t)size > (uint64_t)((size_t)-1))
       {
-         file_data = malloc(file_size);
-         if (file_data)
-            filestream_read(file, file_data, file_size);
-         else
-         {
-            RARCH_ERR(S3_PFX "Failed to allocate memory for upload (%zu bytes)\n", file_size);
-            goto cleanup;
-         }
+         RARCH_ERR(S3_PFX "Could not read %s for upload\n", path);
+         goto cleanup;
       }
+      file_size = (size_t)size;
    }
 
-   /* Build S3 URL - all supported formats are virtual-hosted style */
-   if (!s3_build_request_url(url, sizeof(url), s3_st, path))
-      goto cleanup;
-
-   if (!s3_build_canonical_uri_from_url(url, canonical_uri, sizeof(canonical_uri)))
+   if (!(url = s3_object_urls(s3_st, path, &canonical_uri)))
       goto cleanup;
 
    RARCH_DBG(S3_PFX "Request URL: %s\n", url);
@@ -1912,8 +1904,7 @@ static bool s3_update_upload(const char *path, RFILE *file, cloud_sync_complete_
 
       mp_st->cb_state = s3_cb_st;
       s3_cb_st = NULL;
-      mp_st->file_data = file_data;
-      file_data = NULL;
+      mp_st->file = file;
       mp_st->file_size = file_size;
       mp_st->part_size = part_size;
       mp_st->part_count = part_count;
@@ -1934,15 +1925,15 @@ static bool s3_update_upload(const char *path, RFILE *file, cloud_sync_complete_
 
       /* Ownership transferred to multipart callbacks */
       s3_cb_st = NULL;
-      file_data = NULL;
       mp_st = NULL;
       success = true;
    }
    else
    {
       /* Single PUT request */
-      if (file_data && file_size > 0)
-         payload_hash = s3_sha256_hash(file_data, file_size);
+      s3_body_set(&s3_cb_st->body, file, 0, file_size);
+      if (file_size)
+         payload_hash = s3_sha256_file(file, 0, file_size);
       else
          payload_hash = strdup(S3_EMPTY_PAYLOAD_SHA256);
 
@@ -1962,7 +1953,7 @@ static bool s3_update_upload(const char *path, RFILE *file, cloud_sync_complete_
       }
 
       /* Perform HTTP PUT request */
-      if (!s3_http_put_async(url, auth_header, file_data, file_size, s3_cb_st))
+      if (!s3_http_put_async(url, auth_header, s3_cb_st))
       {
          RARCH_ERR(S3_PFX "Failed to start HTTP PUT request\n");
          goto cleanup;
@@ -1975,9 +1966,9 @@ static bool s3_update_upload(const char *path, RFILE *file, cloud_sync_complete_
 cleanup:
    s3_multipart_free(mp_st);
    free(auth_header);
-   free(file_data);
    free(payload_hash);
    free(s3_cb_st);
+   free(url);
 
    return success;
 }
@@ -1988,8 +1979,8 @@ static bool s3_delete_object(const char *path, cloud_sync_complete_handler_t cb,
    s3_cb_state_t *s3_cb_st = (s3_cb_state_t*)calloc(1, sizeof(s3_cb_state_t));
    s3_state_t *s3_st = s3_state_get_ptr();
    char *auth_header = NULL;
-   char url[PATH_MAX_LENGTH];
-   char canonical_uri[PATH_MAX_LENGTH];
+   char *url = NULL;
+   char *canonical_uri = NULL;
    bool success = false;
 
    if (!s3_cb_st)
@@ -1999,16 +1990,12 @@ static bool s3_delete_object(const char *path, cloud_sync_complete_handler_t cb,
    s3_cb_st->user_data = user_data;
    strlcpy(s3_cb_st->path, path, sizeof(s3_cb_st->path));
 
-   /* Build S3 URL - all supported formats are virtual-hosted style */
-   if (!s3_build_request_url(url, sizeof(url), s3_st, path))
-      goto cleanup;
-
-   if (!s3_build_canonical_uri_from_url(url, canonical_uri, sizeof(canonical_uri)))
+   if (!(url = s3_object_urls(s3_st, path, &canonical_uri)))
       goto cleanup;
 
    /* Build authorization header */
    auth_header = s3_build_auth_header("DELETE", canonical_uri, "", "host;x-amz-content-sha256;x-amz-date",
-                                     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", s3_st);
+                                     S3_EMPTY_PAYLOAD_SHA256, s3_st);
 
    if (!auth_header)
    {
@@ -2029,6 +2016,7 @@ static bool s3_delete_object(const char *path, cloud_sync_complete_handler_t cb,
 cleanup:
    free(auth_header);
    free(s3_cb_st);
+   free(url);
 
    return success;
 }
@@ -2151,33 +2139,42 @@ static void s3_backup_cb(retro_task_t *task, void *task_data, void *user_data, c
    free(st);
 }
 
-static bool s3_backup_then(const char *path, RFILE *file, bool is_delete,
-      cloud_sync_complete_handler_t cb, void *user_data)
+/* What a backup copy is named by: six path buffers, kept off the stack */
+typedef struct
 {
-   s3_state_t        *s3_st       = s3_state_get_ptr();
-   s3_backup_state_t *st          = NULL;
-   char              *auth_header = NULL;
    char key[PATH_MAX_LENGTH];
    char src_url[PATH_MAX_LENGTH];
    char src_uri[PATH_MAX_LENGTH];
    char dest_url[PATH_MAX_LENGTH];
    char dest_uri[PATH_MAX_LENGTH];
    char copy_source[PATH_MAX_LENGTH + NAME_MAX_LENGTH];
+} s3_backup_names_t;
 
-   if (   !s3_backup_key(key, sizeof(key), path)
-       || !s3_build_request_url(src_url, sizeof(src_url), s3_st, path)
-       || !s3_build_canonical_uri_from_url(src_url, src_uri, sizeof(src_uri))
-       || !s3_build_request_url(dest_url, sizeof(dest_url), s3_st, key)
-       || !s3_build_canonical_uri_from_url(dest_url, dest_uri, sizeof(dest_uri))
-       || !s3_copy_source(copy_source, sizeof(copy_source), s3_st, src_uri))
+static bool s3_backup_then(const char *path, RFILE *file, bool is_delete,
+      cloud_sync_complete_handler_t cb, void *user_data)
+{
+   s3_state_t        *s3_st       = s3_state_get_ptr();
+   s3_backup_state_t *st          = NULL;
+   char              *auth_header = NULL;
+   s3_backup_names_t *n           = (s3_backup_names_t*)malloc(sizeof(*n));
+   bool               ok          = false;
+
+   if (!n)
+      return false;
+   if (   !s3_backup_key(n->key, sizeof(n->key), path)
+       || !s3_build_request_url(n->src_url, sizeof(n->src_url), s3_st, path)
+       || !s3_build_canonical_uri_from_url(n->src_url, n->src_uri, sizeof(n->src_uri))
+       || !s3_build_request_url(n->dest_url, sizeof(n->dest_url), s3_st, n->key)
+       || !s3_build_canonical_uri_from_url(n->dest_url, n->dest_uri, sizeof(n->dest_uri))
+       || !s3_copy_source(n->copy_source, sizeof(n->copy_source), s3_st, n->src_uri))
    {
       RARCH_ERR(S3_PFX "Not %s '%s': could not name a backup for it.\n",
             is_delete ? "deleting" : "replacing", path);
-      return false;
+      goto done;
    }
 
    if (!(st = (s3_backup_state_t*)calloc(1, sizeof(*st))))
-      return false;
+      goto done;
    strlcpy(st->path, path, sizeof(st->path));
    st->rfile     = file;
    st->cb        = cb;
@@ -2185,28 +2182,31 @@ static bool s3_backup_then(const char *path, RFILE *file, bool is_delete,
    st->is_delete = is_delete;
 
    /* CopyObject: a PUT on the new key, empty body, naming the source. */
-   auth_header = s3_build_auth_header_ex("PUT", dest_uri, "",
+   auth_header = s3_build_auth_header_ex("PUT", n->dest_uri, "",
          "host;x-amz-content-sha256;x-amz-copy-source;x-amz-date",
-         S3_EMPTY_PAYLOAD_SHA256, copy_source, s3_st);
+         S3_EMPTY_PAYLOAD_SHA256, n->copy_source, s3_st);
    if (!auth_header)
    {
       RARCH_ERR(S3_PFX "Failed to build authorization header\n");
-      free(st);
-      return false;
+      goto done;
    }
 
-   RARCH_DBG(S3_PFX "COPY %s -> %s\n", copy_source, dest_url);
-   if (!task_push_http_transfer_with_content(dest_url, "PUT", NULL, 0, NULL,
+   RARCH_DBG(S3_PFX "COPY %s -> %s\n", n->copy_source, n->dest_url);
+   if (!task_push_http_transfer_with_content(n->dest_url, "PUT", NULL, 0, NULL,
             true, false, auth_header, s3_backup_cb, st))
    {
       RARCH_ERR(S3_PFX "Failed to start backup of '%s'\n", path);
-      free(auth_header);
-      free(st);
-      return false;
+      goto done;
    }
+   /* Ownership transferred to the backup callback */
+   st = NULL;
+   ok = true;
 
+done:
    free(auth_header);
-   return true;
+   free(st);
+   free(n);
+   return ok;
 }
 
 static bool s3_update(const char *path, RFILE *file, cloud_sync_complete_handler_t cb, void *user_data)

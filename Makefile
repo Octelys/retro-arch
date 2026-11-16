@@ -135,7 +135,7 @@ ifneq ($(CXX_BUILD), 1)
          # Keep the SDK's long-long declarations visible in C89 mode.
          CFLAGS += -U__STRICT_ANSI__
          ifeq ($(shell $(CC) --version 2>&1 | head -n 1 | grep -c "clang"),1)
-            CFLAGS += -Wno-c99-extensions
+            CFLAGS += -Wno-c99-extensions -Wno-c11-extensions
          endif
       endif
       ifneq ($(findstring Win32,$(OS)),)
@@ -143,10 +143,13 @@ ifneq ($(CXX_BUILD), 1)
       endif
       ifeq ($(HAVE_PIPEWIRE), 1)
          # The SPA headers are C99: read them as system headers, which
-         # takes them out of -pedantic, and give them __inline__.
+         # takes them out of -pedantic, and give them __inline__. Newer
+         # ones declare in for loops, which no C89 compiler reads, so
+         # these three are built as gnu99 (the last -std given wins);
+         # their own declarations stay held before statements.
          PIPEWIRE_C89_OBJ := $(addprefix $(OBJDIR)/,audio/drivers/pipewire.o \
                audio/common/pipewire.o camera/drivers/pipewire.o)
-         $(PIPEWIRE_C89_OBJ): DEFINES += -Dinline=__inline__ \
+         $(PIPEWIRE_C89_OBJ): DEFINES += -std=gnu99 -Dinline=__inline__ \
                $(patsubst -I%,-isystem %,$(filter -I%,$(PIPEWIRE_CFLAGS)))
       endif
    else ifeq ($(HAVE_C99), 1)

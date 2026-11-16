@@ -17,6 +17,21 @@ Subdirectories with rules of their own carry their own AGENTS.md.
 `tools/compile_commands.py`, after ./configure, writes compile_commands.json
 for clangd and other code navigation.
 
+## Copies
+
+Remove a copy wherever one can be removed, on every change: look for one
+each time a data path is written or touched, not only when asked.
+
+- Hand data over by borrow or lend. Have the producer write into the memory
+  the consumer reads (driver frame memory, a ring's write span, a device
+  buffer), or have the consumer read the producer's memory in place.
+- Give a borrow a stated owner and lifetime, and retire it through the rings,
+  atomics and fences above, never a lock or a wait.
+- A lend is an offer: it can be declined, so the copy stays as its fallback.
+- Keep a copy only where nothing else can work (the owner frees or rewrites
+  the memory before the reader is done, or uncached memory would be read
+  back).
+
 ## Threads
 
 - Nothing may block: no sleeping, busy-waiting, wait-for-idle or round-trip
@@ -35,6 +50,44 @@ Complexity may exist for compatibility, platform, driver, or architectural reaso
 When implementing a feature, find an existing feature with similar behavior and follow its implementation pattern. The current source tree takes precedence over historical examples.
 
 Do not make unrelated cleanup or refactoring changes.
+
+## Portability
+
+Code that builds with GCC or Clang on Linux can still break MSVC, UWP,
+griffin or old-SDK builds that you never ran. Check for these when
+writing the code:
+
+- Do not use a name that a Windows SDK header defines as a macro for a
+  variable, parameter, field or function. `rpcndr.h`, which windows.h,
+  D3D, DXGI, EGL and UWP headers all pull in, has `#define small char`
+  and `#define hyper __int64`. `windef.h` defines `near`, `far`, `IN`,
+  `OUT` and `OPTIONAL` as nothing, `objbase.h` defines `interface` as
+  `struct`, and windows.h defines `min` and `max` as function-like
+  macros. mingw-w64 guards some of these defines, so a mingw build is
+  no proof. `tools/win_macro_names_check.py` covers `small` and
+  `hyper`. To check a file by hand, compile it with `-Dsmall=char
+  -Dhyper=__int64`.
+- The griffin builds (MSVC, UWP and most consoles) compile almost every
+  .c file as one translation unit through `griffin/griffin.c`. So
+  file-scope `static` names must be unique across all the files griffin
+  joins, not just within one file. A header that defines data (shader
+  source strings and the like) needs an include guard, and a name of its
+  own if a sibling header for another backend defines similar data.
+  Check by running `x86_64-w64-mingw32-gcc -fsyntax-only` on
+  griffin.c with the build's defines, before and after the change,
+  and compare the two error lists.
+- Shared GL code does not spell framebuffer-object names directly.
+  macOS SDKs before 10.12 (the PPC build) have only the `_EXT` names,
+  and PSGL has the `_OES` names. Use the per-SDK macros the way gl2.c
+  and gl_common.c do.
+- A platform you cannot build still gets compiled. Force the
+  platform's branch of the `#if` on and compile it on Linux, and say
+  in the commit that it was checked only that way.
+- Some samples read a shipping file as text and build it from a copy in
+  a temporary directory. The Metal sample does this with
+  `Shaders.metal`, for example. Before adding an `#include` to such a
+  file, run `tools/ci_local.py which` on it and run the samples it
+  lists.
 
 ## Comments
 
@@ -130,6 +183,24 @@ If a change touches code already covered by the GitHub CI workflow regression te
 - Do not present a change while any of those tests fail.
 - A workflow construct `ci_local.py` cannot read fails `tools/ci_local.py selftest`, which CI runs; extend the script in the same change.
 - A job's Ubuntu packages go in its `APT_PKGS` and are installed once, through `.github/workflows/scripts/apt-install.sh` and its cache steps; `tools/ci_apt_check.py` fails any other `apt-get` in a runner job.
+
+### Adding or changing a regression test
+
+- Show the test failing without the fix and passing with it. A test never seen to fail proves nothing.
+- Put a new step in the job that already runs its area: `tools/ci_local.py which` on a neighbouring sample names it. Within a job, steps run in order, so a step goes after any step whose output it uses. A step that takes more than a couple of minutes gets a job of its own instead of lengthening a shared one; jobs run side by side.
+- A new directory under `samples/` or `libretro-common/samples/` is claimed by a workflow step in the same commit, or the unclaimed-samples job builds it on its own.
+- After adding or changing a workflow step, or making one sample use another's files, run `tools/ci_paths.py` and commit the paths filters it rewrites. CI runs `tools/ci_paths.py --check` and fails on a stale filter.
+- Harnesses list their sources by hand. When a change makes a shipping file call a function defined in another file, run `tools/ci_local.py which` on the calling file and build every harness it lists. Each one that links the caller needs the callee's source, or a stand-in that does what the real function does, added in the same change.
+
+The runner image moves under the tree: Ubuntu releases bring new Mesa, Wine, ffmpeg, compilers, mingw-w64 headers and validation layers. Test what the code does, not what the current image happens to do:
+
+- Find tools by name on the `PATH`. When a package moves one, fix it once in `apt-install.sh`, not in each step.
+- Match a Vulkan validation message by its ID, which the driver's log line carries as `[ VUID-... ]`, never by its wording.
+- A fixture made with an external tool (ffmpeg and the like) builds the property under test explicitly, so the tool cannot choose it. For example, give the encoder frames of its own length so timestamps reach it unchanged. Where you can, have the generator check the property, so a tool that changes fails there with a clear message rather than as a wrong result in the test.
+- System headers can change dialect: newer SPA headers declare variables in `for` loops, and mingw-w64 13 hides APIs newer than the `_WIN32_WINNT` a build targets. Resolve newer Windows APIs at runtime; do not depend on what an SDK happens to declare.
+- Start an X server with `xvfb-run -a`, or on a display number no other step of the job uses.
+- With threads, assert only states that cannot have moved on yet: a load queued on a worker may already be finished when the next line runs.
+- Sanitizer builds at `-O0` have larger stack frames than optimised ones, and they grow with the compiler. A function close to the frame limit (2 KiB in libretro-common, 4 KiB elsewhere) is split; the limit is not raised.
 
 ## Never commit build output
 

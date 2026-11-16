@@ -219,19 +219,6 @@ char *bin_to_hex_alloc(const uint8_t *data, size_t len)
    return ret;
 }
 
-/* Field selection flags for database_cursor_iterate_filtered.
- * 0 = extract all fields (backward compatible). */
-#define DB_EXTRACT_NAME     (1 << 0)
-#define DB_EXTRACT_CRC      (1 << 1)
-#define DB_EXTRACT_SERIAL   (1 << 2)
-#define DB_EXTRACT_SIZE     (1 << 3)
-#define DB_EXTRACT_MD5      (1 << 4)
-#define DB_EXTRACT_SHA1     (1 << 5)
-
-/* Combination used by the scanner */
-#define DB_EXTRACT_SCAN_FIELDS \
-   (DB_EXTRACT_NAME | DB_EXTRACT_CRC | DB_EXTRACT_SERIAL | DB_EXTRACT_SIZE)
-
 static int database_cursor_iterate(libretrodb_cursor_t *cur,
       database_info_t *db_info)
 {
@@ -352,6 +339,11 @@ static int database_cursor_iterate(libretrodb_cursor_t *cur,
                db_info->size = (uint64_t)val->val.uint_;
             else if (memcmp(str, "coop", 4) == 0)
                db_info->coop_supported = (int)val->val.uint_;
+            else if (memcmp(str, "tags", 4) == 0)
+            {
+               if (val_string && *val_string)
+                  db_info->tags = strdup(val_string);
+            }
             else if (memcmp(str, "sha1", 4) == 0)
             {
                if (val->type == RDT_BINARY)
@@ -449,8 +441,7 @@ static int database_cursor_iterate(libretrodb_cursor_t *cur,
             }
             else if (memcmp(str, "rom_name", 8) == 0)
             {
-               /* rom_name is not used anywhere in codebase,
-                * but is frequently added to DB */
+               /* The filtered read takes rom_name; this one skips it. */
             }
             break;
 
@@ -463,7 +454,7 @@ static int database_cursor_iterate(libretrodb_cursor_t *cur,
             else if (memcmp(str, "developer", 9) == 0)
             {
                if (val_string && *val_string)
-                  db_info->developer = string_split(val_string, "|");
+                  db_info->developer = strdup(val_string);
             }
             else if (memcmp(str, "narrative", 9) == 0)
             {
@@ -681,6 +672,29 @@ static int database_info_fill_from_dom(struct rmsgpack_dom_value *item,
                   const char *vs = val->val.string.buff;
                   if (vs && *vs)
                      db_info->serial = strdup(vs);
+               }
+            }
+            else if (   (fields & DB_EXTRACT_REGION)
+                     && memcmp(str, "region", 6) == 0)
+            {
+               if (val->type == RDT_STRING || val->type == RDT_BINARY)
+               {
+                  const char *vs = val->val.string.buff;
+                  if (vs && *vs)
+                     db_info->region = strdup(vs);
+               }
+            }
+            break;
+
+         case 8:
+            if (   (fields & DB_EXTRACT_ROM_NAME)
+                && memcmp(str, "rom_name", 8) == 0)
+            {
+               if (val->type == RDT_STRING)
+               {
+                  const char *vs = val->val.string.buff;
+                  if (vs && *vs)
+                     db_info->rom_name = strdup(vs);
                }
             }
             break;
@@ -1021,6 +1035,13 @@ struct database_info_crc_index
    uint64_t             size_min;
    uint64_t             size_max;
    bool                 have_size;
+   /* (size << 3) | kind of each record named for an archive, sorted,
+    * when arc_have; bit kind of arc_unsized is set when a record of
+    * that kind has no size.  See db_arc_kind(). */
+   uint64_t            *arc_keys;
+   size_t               arc_count;
+   uint8_t              arc_unsized;
+   bool                 arc_have;
    /* One buffered stream on the database, opened on the first hit
     * and kept for the index's lifetime.  A hit reads one record at a
     * known offset; opening the file twice per hit (libretrodb_open
@@ -1186,6 +1207,98 @@ static database_info_crc_index_t *db_crc_index_finish(
    return idx;
 }
 
+/* The archive types a rom_name can end in.  A kind is the place here
+ * plus one; 0 is none. */
+static const char *const db_arc_exts[] = { "zip", "7z", "apk", "rar", "zst" };
+
+static unsigned db_arc_kind(const char *ext)
+{
+   unsigned i;
+
+   if (!ext || !*ext)
+      return 0;
+   for (i = 0; i < sizeof(db_arc_exts) / sizeof(db_arc_exts[0]); i++)
+      if (string_is_equal_noncase(ext, db_arc_exts[i]))
+         return i + 1;
+   return 0;
+}
+
+static int db_arc_by_key(const void *a, const void *b)
+{
+   uint64_t x = *(const uint64_t*)a;
+   uint64_t y = *(const uint64_t*)b;
+   if (x < y) return -1;
+   if (x > y) return  1;
+   return 0;
+}
+
+struct db_arc_build
+{
+   uint64_t *keys;
+   size_t    count;
+   size_t    capacity;
+   size_t    max_bytes;
+   uint8_t   unsized;
+   bool      failed;
+};
+
+static void db_arc_collect(struct db_arc_build *b, const char *name,
+      size_t name_len, const uint64_t *size)
+{
+   const char *dot;
+   unsigned    kind;
+
+   if (   !name_len
+       || !(dot = strrchr(name, '.'))
+       || !(kind = db_arc_kind(dot + 1)))
+      return;
+   /* A size the key cannot hold counts as none: read whole. */
+   if (!size || (*size >> 61))
+   {
+      b->unsized |= (uint8_t)(1u << kind);
+      return;
+   }
+   if (b->count == b->capacity)
+   {
+      size_t    cap = b->capacity ? b->capacity * 2 : 256;
+      uint64_t *tmp;
+
+      if (   (b->max_bytes && cap * sizeof(*b->keys) > b->max_bytes)
+          || !(tmp = (uint64_t*)realloc(b->keys, cap * sizeof(*tmp))))
+      {
+         b->failed = true;
+         return;
+      }
+      b->keys     = tmp;
+      b->capacity = cap;
+   }
+   b->keys[b->count++] = (*size << 3) | kind;
+}
+
+bool database_info_crc_index_may_hold_archive(
+      const database_info_crc_index_t *idx, const char *ext, uint64_t size)
+{
+   unsigned kind = db_arc_kind(ext);
+   uint64_t key;
+   size_t   lo   = 0;
+   size_t   hi;
+
+   if (   !idx || !idx->arc_have || !kind || !size || (size >> 61)
+       || (idx->arc_unsized & (1u << kind)))
+      return true;
+   key = (size << 3) | kind;
+   hi  = idx->arc_count;
+   while (lo < hi)
+   {
+      size_t mid = lo + ((hi - lo) / 2);
+      if (idx->arc_keys[mid] < key)
+         lo = mid + 1;
+      else
+         hi = mid;
+   }
+   return lo < idx->arc_count && idx->arc_keys[lo] == key;
+}
+
 bool database_info_crc_index_size_range(
       const database_info_crc_index_t *idx, int64_t *min, int64_t *max)
 {
@@ -1200,7 +1313,8 @@ size_t database_info_crc_index_bytes(const database_info_crc_index_t *idx)
 {
    if (!idx)
       return 0;
-   return idx->count * sizeof(*idx->entries) + sizeof(*idx);
+   return idx->count * sizeof(*idx->entries)
+      + idx->arc_count * sizeof(*idx->arc_keys) + sizeof(*idx);
 }
 
 void database_info_crc_index_free(database_info_crc_index_t *idx)
@@ -1209,6 +1323,7 @@ void database_info_crc_index_free(database_info_crc_index_t *idx)
       return;
    db_index_stream_close(idx->fd);
    free(idx->entries);
+   free(idx->arc_keys);
    free(idx->rdb_path);
    free(idx);
 }
@@ -1462,28 +1577,46 @@ static database_info_serial_index_t *db_serial_index_finish(
    return idx;
 }
 
-/* Both builds, fed by one walk.  Each may grow to the whole budget, so
- * a build for the serial lookup can hold twice it until the split at
- * the end. */
+/* The three builds, fed by one walk.  Each may grow to the whole
+ * budget, so a build of all three can hold three times it until the
+ * split at the end. */
 struct db_index_build
 {
    struct db_crc_build    crc;
    struct db_serial_build serial;
+   struct db_arc_build    arc;
    bool                   want_crc;
    bool                   want_serial;
+   bool                   want_setfp;
+   bool                   want_arc;
    bool                   has_serial;
 };
 
 static int db_index_collect(void *ctx, const uint8_t *key, size_t key_len,
-      const uint8_t *serial, size_t serial_len, uint64_t offset,
-      const uint64_t *aux)
+      const uint8_t *serial, size_t serial_len, const char *name,
+      size_t name_len, uint64_t offset, const uint64_t *aux)
 {
    struct db_index_build *b = (struct db_index_build*)ctx;
 
+   /* The walk reads set_fpm1 where it reads the serial.  A record can
+    * carry both fingerprints; each indexes it, once when they agree, as
+    * for a set with no clones. */
+   if (b->want_setfp)
+   {
+      if (!b->crc.failed)
+         db_crc_collect(&b->crc, key, key_len, offset, NULL);
+      if (   !b->crc.failed
+          && !(   key_len == serial_len
+               && !memcmp(key, serial, key_len)))
+         db_crc_collect(&b->crc, serial, serial_len, offset, NULL);
+      return b->crc.failed;
+   }
    if (serial_len)
       b->has_serial = true;
    if (b->want_crc && !b->crc.failed)
       db_crc_collect(&b->crc, key, key_len, offset, aux);
+   if (b->want_arc && !b->arc.failed)
+      db_arc_collect(&b->arc, name, name_len, aux);
    if (b->want_serial && !b->serial.failed)
       db_serial_collect(&b->serial, serial, serial_len, offset, NULL);
 
@@ -1578,6 +1711,7 @@ enum db_index_phase
    DB_INDEX_WALK = 0,
    DB_INDEX_SORT_CRC,
    DB_INDEX_SORT_SERIAL,
+   DB_INDEX_SORT_ARC,
    DB_INDEX_DONE,
    DB_INDEX_FAILED
 };
@@ -1606,6 +1740,13 @@ database_info_index_job_t *database_info_index_job_new(
 
    job->b.want_crc         = (want & DATABASE_INFO_INDEX_CRC)    != 0;
    job->b.want_serial      = (want & DATABASE_INFO_INDEX_SERIAL) != 0;
+   job->b.want_setfp       = job->b.want_crc
+      && (want & DATABASE_INFO_INDEX_SETFP) != 0;
+   if (job->b.want_setfp)
+      job->b.want_serial   = false;
+   job->b.want_arc         = job->b.want_crc && !job->b.want_setfp
+      && (want & DATABASE_INFO_INDEX_ARCHIVE_SIZES) != 0;
+   job->b.arc.max_bytes    = max_bytes;
    job->b.crc.max_bytes    = max_bytes;
    job->b.serial.max_bytes = max_bytes;
    job->max_bytes          = max_bytes;
@@ -1618,11 +1759,16 @@ database_info_index_job_t *database_info_index_job_new(
    }
    if (libretrodb_open(rdb_path, db, false) == 0)
    {
-      job->scan = libretrodb_scan_begin(db,
-            job->b.want_crc ? "crc" : NULL,
-            (want & (DATABASE_INFO_INDEX_SERIAL
-                   | DATABASE_INFO_INDEX_HAS_SERIAL)) ? "serial" : NULL,
-            job->b.want_crc ? "size" : NULL);
+      if (job->b.want_setfp)
+         job->scan = libretrodb_scan_begin(db,
+               "set_fp1", "set_fpm1", NULL, NULL);
+      else
+         job->scan = libretrodb_scan_begin(db,
+               job->b.want_crc ? "crc" : NULL,
+               (want & (DATABASE_INFO_INDEX_SERIAL
+                      | DATABASE_INFO_INDEX_HAS_SERIAL)) ? "serial" : NULL,
+               job->b.want_crc ? "size" : NULL,
+               job->b.want_arc ? "rom_name" : NULL);
       libretrodb_close(db);
    }
    libretrodb_free(db);
@@ -1680,6 +1826,20 @@ bool database_info_index_job_step(database_info_index_job_t *job,
             if (!done)
                return false;
          }
+         job->phase = DB_INDEX_SORT_ARC;
+         return false;
+      case DB_INDEX_SORT_ARC:
+         if (b->want_arc && !b->arc.failed)
+         {
+            void *base = b->arc.keys;
+            bool  done = db_sort_step(&job->sort, &base, b->arc.count,
+                  b->arc.capacity, sizeof(*b->arc.keys), db_arc_by_key,
+                  entries, &b->arc.failed);
+
+            b->arc.keys = (uint64_t*)base;
+            if (!done)
+               return false;
+         }
          job->phase = DB_INDEX_DONE;
          return true;
       default:
@@ -1706,6 +1866,19 @@ void database_info_index_job_finish(database_info_index_job_t *job,
 
       if (crc && b->want_crc && !b->crc.failed)
          *crc = db_crc_index_finish(&b->crc, job->rdb_path);
+      /* Sizes that would go over the budget are dropped, and the archives
+       * they would have gated are read whole. */
+      if (   crc && *crc && b->want_arc && !b->arc.failed
+          && (   !job->max_bytes
+              ||   database_info_crc_index_bytes(*crc)
+                 + b->arc.count * sizeof(*b->arc.keys) <= job->max_bytes))
+      {
+         (*crc)->arc_keys    = b->arc.keys;
+         (*crc)->arc_count   = b->arc.count;
+         (*crc)->arc_unsized = b->arc.unsized;
+         (*crc)->arc_have    = true;
+         b->arc.keys         = NULL;
+      }
 
       /* The serial index gets what the crc index leaves. */
       if (job->max_bytes && crc && *crc)
@@ -1738,6 +1911,7 @@ void database_info_index_job_free(database_info_index_job_t *job)
    free(job->sort.tmp);
    free(job->b.crc.entries);
    free(job->b.serial.entries);
+   free(job->b.arc.keys);
    free(job->rdb_path);
    free(job);
 }
@@ -2003,6 +2177,10 @@ database_info_list_t *database_info_list_new_filtered(
                free(db_info.visual);
             if (db_info.vehicular)
                free(db_info.vehicular);
+            if (db_info.tags)
+               free(db_info.tags);
+            if (db_info.developer)
+               free(db_info.developer);
             if (db_info.name)
                free(db_info.name);
             if (db_info.origin)
@@ -2118,12 +2296,14 @@ void database_info_list_free(database_info_list_t *database_info_list)
          free(info->visual);
       if (info->vehicular)
          free(info->vehicular);
+      if (info->tags)
+         free(info->tags);
       if (info->description)
          free(info->description);
       if (info->publisher)
          free(info->publisher);
       if (info->developer)
-         string_list_free(info->developer);
+         free(info->developer);
       if (info->origin)
          free(info->origin);
       if (info->franchise)

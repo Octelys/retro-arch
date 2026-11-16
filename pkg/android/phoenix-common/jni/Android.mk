@@ -17,6 +17,11 @@ HAVE_SAF := 1
 # but sockets; the NFSv3/v4 client and its nfs:// backend likewise.
 HAVE_CRYPTO   := 1
 HAVE_KEYCHAIN := 1
+HAVE_CORE_SIGNATURES := 1
+# ndk-build HAVE_CORE_LOAD_CHECK=0 to load cores without the check
+HAVE_CORE_LOAD_CHECK := 1
+# ndk-build HAVE_CORE_SIGNING_TEST_KEY=1 for test builds only
+HAVE_CORE_SIGNING_TEST_KEY := 0
 HAVE_RETROSSL := 1
 HAVE_RETROSMB := 1
 HAVE_RETRONFS := 1
@@ -97,6 +102,15 @@ ifeq ($(HAVE_CRYPTO),1)
    ifeq ($(HAVE_RETROSMB),1)
       DEFINES += -DHAVE_SMBCLIENT -DHAVE_RETROSMB
    endif
+   ifeq ($(HAVE_CORE_SIGNATURES),1)
+      DEFINES += -DHAVE_CORE_SIGNATURES
+      ifeq ($(HAVE_CORE_LOAD_CHECK),1)
+         DEFINES += -DHAVE_CORE_LOAD_CHECK
+      endif
+      ifeq ($(HAVE_CORE_SIGNING_TEST_KEY),1)
+         DEFINES += -DHAVE_CORE_SIGNING_TEST_KEY
+      endif
+   endif
 endif
 
 ifeq ($(HAVE_MODELINE),1)
@@ -158,6 +172,7 @@ DEFINES += -DRARCH_MOBILE \
 	   -DHAVE_RJPEG \
 	   -DHAVE_RBMP \
 	   -DHAVE_RTGA \
+	   -DHAVE_RGIF \
 	   -DINLINE=inline \
 	   -DHAVE_THREADS \
 	   -DHAVE_THREAD_STORAGE \
@@ -241,6 +256,23 @@ ifeq ($(HAVE_OPENXR),1)
 DEFINES += -DHAVE_OPENXR -DXR_OS_ANDROID -DXR_USE_PLATFORM_ANDROID
 endif
 
+# Custom Vulkan driver packages: sideloaded arm64 builds only.
+# Play builds pass PLAY_STORE_BUILD=1, Quest passes HAVE_OPENXR=1.
+HAVE_VULKAN_CUSTOM_DRIVER := 0
+ifeq ($(TARGET_ARCH_ABI),arm64-v8a)
+   ifeq ($(HAVE_VULKAN),1)
+      ifneq ($(PLAY_STORE_BUILD),1)
+         ifneq ($(HAVE_OPENXR),1)
+            HAVE_VULKAN_CUSTOM_DRIVER := 1
+         endif
+      endif
+   endif
+endif
+
+ifeq ($(HAVE_VULKAN_CUSTOM_DRIVER),1)
+DEFINES += -DHAVE_VULKAN_CUSTOM_DRIVER
+endif
+
 LOCAL_CFLAGS   += -Wall -std=gnu99 -pthread -Wno-unused-function -fno-stack-protector -funroll-loops $(DEFINES)
 LOCAL_CPPFLAGS := -fexceptions -fpermissive -std=gnu++11 -fno-rtti -Wno-reorder $(DEFINES)
 
@@ -305,3 +337,16 @@ ifeq ($(TARGET_ARCH_ABI),x86_64)
 endif
 
 include $(BUILD_SHARED_LIBRARY)
+
+ifeq ($(HAVE_VULKAN_CUSTOM_DRIVER),1)
+# Loaded into a private linker namespace in front of a copy of the system
+# Vulkan loader, which opens its HAL through it.
+include $(CLEAR_VARS)
+LOCAL_MODULE    := vulkan_driver_hook
+LOCAL_CFLAGS    := -DVULKAN_CUSTOM_DRIVER_HOOK -fvisibility=hidden -Wall
+LOCAL_SRC_FILES := $(RARCH_DIR)/gfx/common/vulkan_custom_driver_linker.c
+LOCAL_LDFLAGS   := -Wl,-z,global \
+                   -Wl,-z,max-page-size=16384,-z,common-page-size=16384
+LOCAL_LDLIBS    := -ldl -llog
+include $(BUILD_SHARED_LIBRARY)
+endif

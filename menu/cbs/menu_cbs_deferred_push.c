@@ -109,6 +109,7 @@ GENERIC_DEFERRED_PUSH(deferred_push_content_collection_list,        DISPLAYLIST_
 GENERIC_DEFERRED_PUSH(deferred_push_configurations_list,            DISPLAYLIST_CONFIGURATIONS_LIST)
 GENERIC_DEFERRED_PUSH(deferred_push_load_content_special,           DISPLAYLIST_LOAD_CONTENT_LIST)
 GENERIC_DEFERRED_PUSH(deferred_push_load_content_list,              DISPLAYLIST_LOAD_CONTENT_LIST)
+GENERIC_DEFERRED_PUSH(deferred_push_manual_content_scan_dir_list,   DISPLAYLIST_MANUAL_CONTENT_SCAN_DIR_LIST)
 GENERIC_DEFERRED_PUSH(deferred_push_dump_disk_list,                 DISPLAYLIST_DUMP_DISC)
 #ifdef HAVE_LAKKA
 GENERIC_DEFERRED_PUSH(deferred_push_eject_disc,                     DISPLAYLIST_EJECT_DISC)
@@ -252,6 +253,7 @@ GENERIC_DEFERRED_PUSH(deferred_push_playlist_settings_list,         DISPLAYLIST_
 GENERIC_DEFERRED_PUSH(deferred_push_playlist_manager_list,          DISPLAYLIST_PLAYLIST_MANAGER_LIST)
 GENERIC_DEFERRED_PUSH(deferred_push_playlist_manager_settings,      DISPLAYLIST_PLAYLIST_MANAGER_SETTINGS)
 GENERIC_DEFERRED_PUSH(deferred_push_input_retropad_binds_list,        DISPLAYLIST_INPUT_RETROPAD_BINDS_LIST)
+GENERIC_DEFERRED_PUSH(deferred_push_input_controllers_list,           DISPLAYLIST_INPUT_CONTROLLERS_LIST)
 GENERIC_DEFERRED_PUSH(deferred_push_input_hotkey_binds_list,        DISPLAYLIST_INPUT_HOTKEY_BINDS_LIST)
 GENERIC_DEFERRED_PUSH(deferred_push_accounts_cheevos_list,          DISPLAYLIST_ACCOUNTS_CHEEVOS_LIST)
 GENERIC_DEFERRED_PUSH(deferred_push_accounts_twitch_list,           DISPLAYLIST_ACCOUNTS_TWITCH_LIST)
@@ -264,6 +266,9 @@ GENERIC_DEFERRED_PUSH(deferred_push_core_list_deferred,             DISPLAYLIST_
 GENERIC_DEFERRED_PUSH(deferred_push_core_collection_list_deferred,  DISPLAYLIST_CORES_COLLECTION_SUPPORTED)
 GENERIC_DEFERRED_PUSH(deferred_push_menu_sounds_list,               DISPLAYLIST_MENU_SOUNDS_LIST)
 GENERIC_DEFERRED_PUSH(deferred_push_rgui_theme_preset,              DISPLAYLIST_RGUI_THEME_PRESETS)
+#ifdef HAVE_VULKAN_CUSTOM_DRIVER
+GENERIC_DEFERRED_PUSH(deferred_push_vulkan_driver,                  DISPLAYLIST_VULKAN_DRIVERS)
+#endif
 
 #ifdef HAVE_NETWORKING
 GENERIC_DEFERRED_PUSH(deferred_push_pl_thumbnails_updater_list,     DISPLAYLIST_PL_THUMBNAILS_UPDATER)
@@ -532,7 +537,7 @@ static int general_push(menu_displaylist_info_t *info,
       string_ext_list_merge_dedup(ext_filter, &_len, ext_size, "webm|mkv");
 #endif
 #ifdef HAVE_RMP4
-      string_ext_list_merge_dedup(ext_filter, &_len, ext_size, "mp4|m4v");
+      string_ext_list_merge_dedup(ext_filter, &_len, ext_size, "mp4|m4v|mov");
 #endif
    }
 #endif
@@ -551,6 +556,9 @@ static int general_push(menu_displaylist_info_t *info,
 #endif
 #ifdef HAVE_RTGA
       string_ext_list_merge_dedup(ext_filter, &_len, ext_size, "tga");
+#endif
+#ifdef HAVE_RGIF
+      string_ext_list_merge_dedup(ext_filter, &_len, ext_size, "gif");
 #endif
 #ifdef HAVE_RWEBP
       string_ext_list_merge_dedup(ext_filter, &_len, ext_size, "webp");
@@ -621,6 +629,8 @@ GENERIC_DEFERRED_PUSH_GENERAL(deferred_push_dropdown_box_list_input_device_type,
 GENERIC_DEFERRED_PUSH_GENERAL(deferred_push_dropdown_box_list_input_description, PUSH_DEFAULT, DISPLAYLIST_DROPDOWN_LIST_INPUT_DESCRIPTION)
 GENERIC_DEFERRED_PUSH_GENERAL(deferred_push_dropdown_box_list_input_description_kbd, PUSH_DEFAULT, DISPLAYLIST_DROPDOWN_LIST_INPUT_DESCRIPTION_KBD)
 GENERIC_DEFERRED_PUSH_GENERAL(deferred_push_dropdown_box_list_input_select_reserved_device, PUSH_DEFAULT, DISPLAYLIST_DROPDOWN_LIST_INPUT_SELECT_RESERVED_DEVICE)
+GENERIC_DEFERRED_PUSH_GENERAL(deferred_push_dropdown_box_list_input_plays_as, PUSH_DEFAULT, DISPLAYLIST_DROPDOWN_LIST_INPUT_PLAYS_AS)
+GENERIC_DEFERRED_PUSH_GENERAL(deferred_push_dropdown_box_list_input_plays_as_add, PUSH_DEFAULT, DISPLAYLIST_DROPDOWN_LIST_INPUT_PLAYS_AS_ADD)
 #ifdef ANDROID
 GENERIC_DEFERRED_PUSH_GENERAL(deferred_push_dropdown_box_list_input_select_physical_keyboard, PUSH_DEFAULT, DISPLAYLIST_DROPDOWN_LIST_INPUT_SELECT_PHYSICAL_KEYBOARD)
 #endif
@@ -673,6 +683,8 @@ static int menu_cbs_init_bind_deferred_push_compare_label(
       {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_DESCRIPTION, deferred_push_dropdown_box_list_input_description},
       {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_DESCRIPTION_KBD, deferred_push_dropdown_box_list_input_description_kbd},
       {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_SELECT_RESERVED_DEVICE, deferred_push_dropdown_box_list_input_select_reserved_device},
+      {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_PLAYS_AS, deferred_push_dropdown_box_list_input_plays_as},
+      {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_PLAYS_AS_ADD, deferred_push_dropdown_box_list_input_plays_as_add},
 #ifdef ANDROID
       {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_SELECT_PHYSICAL_KEYBOARD, deferred_push_dropdown_box_list_input_select_physical_keyboard},
 #endif
@@ -805,6 +817,7 @@ static int menu_cbs_init_bind_deferred_push_compare_label(
       {MENU_ENUM_LABEL_SHADER_OPTIONS, deferred_push_shader_options},
       {MENU_ENUM_LABEL_DEFERRED_USER_BINDS_LIST, deferred_user_binds_list},
       {MENU_ENUM_LABEL_DEFERRED_INPUT_RETROPAD_BINDS_LIST, deferred_push_input_retropad_binds_list},
+      {MENU_ENUM_LABEL_DEFERRED_INPUT_CONTROLLERS_LIST, deferred_push_input_controllers_list},
       {MENU_ENUM_LABEL_DEFERRED_INPUT_HOTKEY_BINDS_LIST, deferred_push_input_hotkey_binds_list},
       {MENU_ENUM_LABEL_DEFERRED_QUICK_MENU_OVERRIDE_OPTIONS, deferred_push_quick_menu_override_options},
       {MENU_ENUM_LABEL_DEFERRED_ACCOUNTS_YOUTUBE_LIST, deferred_push_accounts_youtube_list},
@@ -824,6 +837,7 @@ static int menu_cbs_init_bind_deferred_push_compare_label(
       {MENU_ENUM_LABEL_DEFERRED_PLAYLIST_MANAGER_LIST, deferred_push_playlist_manager_list},
       {MENU_ENUM_LABEL_DEFERRED_PLAYLIST_MANAGER_SETTINGS, deferred_push_playlist_manager_settings},
       {MENU_ENUM_LABEL_LOAD_CONTENT_LIST, deferred_push_load_content_list},
+      {MENU_ENUM_LABEL_DEFERRED_MANUAL_CONTENT_SCAN_DIR_LIST, deferred_push_manual_content_scan_dir_list},
       {MENU_ENUM_LABEL_DEFERRED_PLAYLIST_SETTINGS_LIST, deferred_push_playlist_settings_list},
       {MENU_ENUM_LABEL_DEFERRED_DATABASE_MANAGER_LIST, deferred_push_database_manager_list_deferred},
       {MENU_ENUM_LABEL_CONFIGURATIONS, deferred_push_configurations},
@@ -857,6 +871,9 @@ static int menu_cbs_init_bind_deferred_push_compare_label(
       {MENU_ENUM_LABEL_RECORD_CONFIG, deferred_push_record_configfile},
       {MENU_ENUM_LABEL_STREAM_CONFIG, deferred_push_stream_configfile},
       {MENU_ENUM_LABEL_RGUI_MENU_THEME_PRESET, deferred_push_rgui_theme_preset},
+#ifdef HAVE_VULKAN_CUSTOM_DRIVER
+      {MENU_ENUM_LABEL_VIDEO_VULKAN_DRIVER_PATH, deferred_push_vulkan_driver},
+#endif
       {MENU_ENUM_LABEL_NETPLAY, deferred_push_netplay},
       {MENU_ENUM_LABEL_CONTENT_SETTINGS, deferred_push_content_settings},
       {MENU_ENUM_LABEL_ADD_CONTENT_LIST, deferred_push_add_content_list},
@@ -921,6 +938,7 @@ static int menu_cbs_init_bind_deferred_push_compare_label(
          { MENU_ENUM_LABEL_DEFERRED_PLAYLIST_MANAGER_SETTINGS, deferred_push_playlist_manager_settings },
          { MENU_ENUM_LABEL_DEFERRED_RECORDING_SETTINGS_LIST, deferred_push_recording_settings_list },
          { MENU_ENUM_LABEL_DEFERRED_INPUT_RETROPAD_BINDS_LIST, deferred_push_input_retropad_binds_list },
+         { MENU_ENUM_LABEL_DEFERRED_INPUT_CONTROLLERS_LIST, deferred_push_input_controllers_list },
          { MENU_ENUM_LABEL_DEFERRED_INPUT_HOTKEY_BINDS_LIST, deferred_push_input_hotkey_binds_list },
          { MENU_ENUM_LABEL_DEFERRED_ACCOUNTS_CHEEVOS_LIST, deferred_push_accounts_cheevos_list },
          { MENU_ENUM_LABEL_DEFERRED_ACCOUNTS_YOUTUBE_LIST, deferred_push_accounts_youtube_list },
@@ -940,6 +958,9 @@ static int menu_cbs_init_bind_deferred_push_compare_label(
          { MENU_ENUM_LABEL_RECORD_CONFIG, deferred_push_record_configfile },
          { MENU_ENUM_LABEL_STREAM_CONFIG, deferred_push_stream_configfile },
          { MENU_ENUM_LABEL_RGUI_MENU_THEME_PRESET, deferred_push_rgui_theme_preset },
+#ifdef HAVE_VULKAN_CUSTOM_DRIVER
+         { MENU_ENUM_LABEL_VIDEO_VULKAN_DRIVER_PATH, deferred_push_vulkan_driver },
+#endif
          { MENU_ENUM_LABEL_SHADER_OPTIONS, deferred_push_shader_options },
          { MENU_ENUM_LABEL_ONLINE_UPDATER, deferred_push_options },
          { MENU_ENUM_LABEL_NETPLAY, deferred_push_netplay },
@@ -948,6 +969,7 @@ static int menu_cbs_init_bind_deferred_push_compare_label(
          { MENU_ENUM_LABEL_CONFIGURATIONS_LIST, deferred_push_configurations_list },
          { MENU_ENUM_LABEL_LOAD_CONTENT_LIST, deferred_push_load_content_list },
          { MENU_ENUM_LABEL_LOAD_CONTENT_SPECIAL, deferred_push_load_content_special },
+         { MENU_ENUM_LABEL_DEFERRED_MANUAL_CONTENT_SCAN_DIR_LIST, deferred_push_manual_content_scan_dir_list },
          { MENU_ENUM_LABEL_INFORMATION_LIST, deferred_push_information_list },
          { MENU_ENUM_LABEL_INFORMATION, deferred_push_information },
          { MENU_ENUM_LABEL_DEFERRED_CORE_LIST, deferred_push_core_list_deferred },

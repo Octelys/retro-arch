@@ -29,6 +29,23 @@
 
 RETRO_BEGIN_DECLS
 
+/* Moves @atlas's samples into storage the consumer makes with @storage
+ * - memory it can sample them from in place - and keeps them there as
+ * the atlas grows, each buffer it moves out of handed to
+ * @storage_free, the last when the font goes. False, with the atlas
+ * where it was, when the storage cannot be had. */
+bool font_atlas_place(struct font_atlas *atlas,
+      void *(*storage)(void *user, size_t size),
+      void (*storage_free)(void *user, void *buffer), void *user);
+
+/* Adds the rectangle @pos..@end, its corners packed as dirty_xy0 and
+ * dirty_xy1 are, to the @*n rectangles of @r, which holds
+ * FONT_ATLAS_DIRTY_MAX: when it is full, of the rectangles and the new
+ * one the two whose union adds least are joined. For a consumer that
+ * keeps the regions it has staged since its last upload. */
+void font_dirty_rects_add(unsigned (*r)[2], unsigned *n,
+      unsigned pos, unsigned end);
+
 /* How many rectangles @a's dirty region is sent as */
 static INLINE unsigned font_atlas_dirty_rects(const struct font_atlas *a)
 {
@@ -272,6 +289,7 @@ typedef struct font_params_resolved
    float x;
    float y;
    float scale;
+   float x_scale;          /* Never 0 */
    float drop_mod;
    float drop_alpha;
    float color[4];         /* RGBA, 0..1, from the packed colour */

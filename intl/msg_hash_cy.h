@@ -216,6 +216,7 @@ static const struct
    char s_e2f9cd07[11];
    char s_7277e127[22];
    char s_3a9d7557[11];
+   char s_d6611158[4];
    char s_21d7a1f6[6];
    char s_bcddf275[6];
    char s_7f2380a0[12];
@@ -283,6 +284,7 @@ static const struct
    char s_026b7f11[14];
    char s_440540f4[10];
    char s_d16f3816[6];
+   char s_c52621db[9];
    char s_c182bd2e[2];
    char s_9d2c8cfb[10];
    char s_94fc1cd0[17];
@@ -490,6 +492,7 @@ static const struct
    "Defnyddiwr",
    "Rhyngwyneb Defnyddiwr",
    "Defnyddiwr",
+   "Dim",
    "Lleol",
    "Fideo",
    "Datgysylltu",
@@ -562,6 +565,7 @@ static const struct
    "Rho Gyfrinair",
    "Rhyngrwyd",
    "Lleol",
+   "Dewislen",
    "i",
    "Anhysybys",
    "Yn Ailgychwyn...",
@@ -571,7 +575,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_cy_blob_check[
-      (sizeof(msg_hash_cy_blob) == (5220u
+      (sizeof(msg_hash_cy_blob) == (5233u
 #ifdef HAVE_LAKKA
 #ifdef HAVE_RETROFLAG
        + 77u
@@ -784,6 +788,7 @@ static const msg_hash_id_t msg_hash_cy_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_USER,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_USER_INTERFACE_SETTINGS,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_USER_SETTINGS,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_HANDS_NONE,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_STREAMING_MODE_LOCAL,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_TAB,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_WIFI_DISCONNECT,
@@ -851,6 +856,7 @@ static const msg_hash_id_t msg_hash_cy_ids[] =
    (msg_hash_id_t)MSG_INPUT_KIOSK_MODE_PASSWORD,
    (msg_hash_id_t)MSG_INTERNET,
    (msg_hash_id_t)MSG_LOCAL,
+   (msg_hash_id_t)MSG_OPENXR_EDIT_TAG_MENU,
    (msg_hash_id_t)MSG_TO,
    (msg_hash_id_t)MSG_UNKNOWN,
    (msg_hash_id_t)MSG_VALUE_REBOOTING,

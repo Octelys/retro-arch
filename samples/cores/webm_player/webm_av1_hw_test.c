@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include <formats/rav1_hw.h>
+/* The whole MP4 writer: the WebM fixture alone takes only its byte helpers */
+#include "../../../libretro-common/samples/formats/av1/rav1_mp4_fixture.h"
 #include "../../../libretro-common/samples/formats/av1/rav1_webm_fixture.h"
 #include "../../../cores/libretro-media/media_core.c"
 
@@ -224,12 +226,12 @@ static void unload(void)
 static void test_container(void)
 {
    FILE *file;
-   unsigned i, before, accepted;
+   unsigned i, before, accepted, delivered;
    uint8_t state[40];
    if (container)
       make_webm(container == 2, 1, 1, 0);
    else
-      make_mp4(1);
+      make_mp4_clip(1, 0);
    file = fopen(fixture_path, "wb");
    if (!file)
    {
@@ -268,9 +270,10 @@ static void test_container(void)
    for (i = 0; i < 32 && !stopped; i++)
    {
       accepted = decoded;
+      delivered = taken;
       before = media_player.hw_frame.image != 0;
       retro_run();
-      if (before)
+      if (before && delivered == taken)
          CHECK(accepted == decoded);
    }
    CHECK(stopped && taken && ticks && !media_player.hw_frame.image);

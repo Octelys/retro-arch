@@ -109,14 +109,24 @@ static void sdl3_flush_unread_events(void)
          SDL_EVENT_RENDER_DEVICE_LOST);
 }
 
-void sdl3_pump_input_events(void)
+bool sdl3_pump_input_events(void)
 {
+   /* The joypad and input polls run back to back: one backend round
+    * trip serves both. */
+   static Uint64 last_ns = 0;
+   Uint64 now_ns;
+
    /* Two threads pumping at once deadlock in the X11 backend. */
    if (     video_driver_thread_wrapper_active()
          && SDL_WasInit(SDL_INIT_VIDEO))
-      return;
+      return false;
+   now_ns = SDL_GetTicksNS();
+   if (last_ns && now_ns - last_ns < SDL_NS_PER_MS)
+      return true;
+   last_ns = now_ns;
    SDL_PumpEvents();
    sdl3_flush_unread_events();
+   return true;
 }
 
 void sdl3_pump_window_events(bool *quit, bool *resize)
@@ -429,11 +439,14 @@ void sdl3_window_get_video_size(SDL_Window *win,
       return;
    }
 
-   /* The window doesn't exist yet, so report the desktop size. */
+   /* The window doesn't exist yet, so report the desktop size, which
+    * a mode gives in points. */
    mode = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay());
    if (mode)
    {
-      *dims = VIDEO_SCALE_PACK(mode->w, mode->h);
+      float d = mode->pixel_density > 0.0f ? mode->pixel_density : 1.0f;
+      *dims   = VIDEO_SCALE_PACK((unsigned)(mode->w * d + 0.5f),
+            (unsigned)(mode->h * d + 0.5f));
    }
 }
 
@@ -487,6 +500,26 @@ void sdl3_ctx_input_driver(void *data,
       const char *name)
 {
    sdl3_input_driver(name);
+}
+
+bool sdl3_next_window_is_sdl3(void)
+{
+   /* The driver in front, and through it the context the drivers ask
+    * sdl3_ctx_enabled() about. A core's gl/glcore/vulkan request
+    * swaps the setting and keeps the user's choice in
+    * cached_driver_id, which sdl3_ctx_enabled() honours. A driver
+    * with no context driver (d3d*, metal, ...) never makes an SDL3
+    * window, whatever the context setting still says. */
+   const char *video = config_get_ptr()->arrays.video_driver;
+   if (string_is_equal(video, "sdl3"))
+      return true;
+   if (string_is_equal(video, "vulkan"))
+      return sdl3_ctx_enabled("vk_sdl3");
+   if (     string_is_equal(video, "gl")
+         || string_is_equal(video, "glcore")
+         || string_is_equal(video, "gl1"))
+      return sdl3_ctx_enabled("gl_sdl3");
+   return false;
 }
 
 bool sdl3_ctx_enabled(const char *ctx_ident)

@@ -17,6 +17,8 @@
 #ifndef __MENU_DEFINES__H
 #define __MENU_DEFINES__H
 
+#include <stdint.h>
+
 #include <retro_common_api.h>
 
 #include "../audio/audio_defines.h"
@@ -594,16 +596,30 @@ enum menu_input_binds_ctl_state
    MENU_INPUT_BINDS_CTL_BIND_ALL
 };
 
+/* A confirm box with named buttons offers at most this many */
+#define MENU_DIALOG_BUTTONS_MAX 3
+
 struct menu_dialog
 {
+   const char           *confirm_text; /* borrowed until the dialog closes */
    unsigned              current_id;
    enum menu_dialog_type current_type;
    unsigned              confirm_msg;
    unsigned              confirm_cmd;
    unsigned              pending_cmd;
+   /* Named buttons, left to right (enum msg_hash_enums); the first
+    * one cancels */
+   unsigned              button_label[MENU_DIALOG_BUTTONS_MAX];
+   int                   button_highlight; /* -1: none */
+   int                   button_hover;     /* -1: none */
+   uint8_t               first_run_downloads; /* bundles to fetch on OK */
+   uint8_t               button_count;     /* 0: Cancel and OK */
+   uint8_t               button_epoch;     /* changes with each new box */
+   uint8_t               button_drawn;     /* button_epoch last drawn */
    bool                  confirm_hover_ok;
    bool                  confirm_hover_back;
    bool                  pending_push;
+   bool                  button_announce;  /* speak the box's text again */
 };
 
 typedef struct menu_dialog menu_dialog_t;

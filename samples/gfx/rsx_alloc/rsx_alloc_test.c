@@ -30,6 +30,10 @@
  *    cursors and GPU fences.
  *  - native_menu_frame, menu_dupe_frame: a menu with no new core
  *    frame is presented, over the last core frame if there is one.
+ *  - flip_latency: two swapchain images keep the core behind the
+ *    flip, three let it run into the pending one.
+ *  - dupe_keeps_image: a dupe redraws the last frame that loaded,
+ *    and with none presents nothing.
  *
  * Plain C and the C library only, so it builds and runs the same with
  * mingw on Windows. */
@@ -55,6 +59,8 @@ static struct
 static unsigned rsx_alloc_calls;   /* rsxMemalign calls so far */
 static unsigned rsx_fail_at;       /* the call to fail, 1-based; 0 none */
 static unsigned rsx_finish_calls;
+static unsigned rsx_depth_test_calls;
+static u32 rsx_depth_test_enable;
 
 static unsigned rsx_live(void)
 {
@@ -154,15 +160,83 @@ void rsxSetWaitForIdle(gcmContextData *context) { }
 void rsxSetWriteBackendLabel(gcmContextData *context, u8 index, u32 value)
 { if (!fake_defer_backend) fake_labels[index] = value; }
 u32 *gcmGetLabelAddress(const u8 index) { return &fake_labels[index]; }
-u32  gcmGetFlipStatus(void) { return 0; }
-void gcmResetFlipStatus(void) { }
+static unsigned rsx_flip_waits;
+static retro_time_t fake_time;
+static retro_time_t fake_flip_period;
+static retro_time_t fake_flip_due;
+static retro_time_t fake_gpu_time;
+static unsigned fake_flip_overlap;
+static unsigned fake_clear_hazards;
+static unsigned fake_time_reads;
+static retro_time_t fake_last_flip_due;
+/* The flip status as GCM keeps it: 1 from a reset until the flip
+ * queued after it has been shown, 0 from then on */
+static u32 fake_flip_status;
+static bool fake_flip_queued;
+static unsigned fake_flip_hangs;
+/* rsx_wait_flip spins on this; a pending flip is shown at its due
+ * time, a reset with no flip behind it would spin forever */
+u32 gcmGetFlipStatus(void)
+{
+   rsx_flip_waits++;
+   if (fake_flip_status)
+   {
+      if (!fake_flip_queued)
+         fake_flip_hangs++;
+      else if (fake_flip_period && fake_time < fake_flip_due)
+         fake_time = fake_flip_due;
+      fake_flip_status = 0;
+      fake_flip_due    = 0;
+   }
+   return 0;
+}
+void gcmResetFlipStatus(void)
+{
+   fake_flip_status = 1;
+   fake_flip_queued = false;
+}
 s32  gcmSetDisplayBuffer(const u8 bufferId, const u32 offset,
       const u32 pitch, const u32 width, const u32 height) { return 0; }
 static unsigned rsx_flip_calls;
+retro_time_t cpu_features_get_time_usec(void)
+{
+   fake_time_reads++;
+   return fake_time;
+}
 s32  gcmSetFlip(gcmContextData *context, const u8 bufferId)
-{ rsx_flip_calls++; return 0; }
+{
+   rsx_flip_calls++;
+   fake_flip_queued = true;
+   if (fake_flip_period)
+   {
+      if (fake_flip_due > fake_time)
+         fake_flip_overlap++;
+      if (fake_gpu_time < fake_time)
+         fake_gpu_time = fake_time;
+      fake_flip_due = (fake_gpu_time / fake_flip_period + 1) * fake_flip_period;
+      fake_last_flip_due = fake_flip_due;
+   }
+   return 0;
+}
+
+/* A flip queued one period out, as a test's first frame finds it */
+static void fake_flip_pending(void)
+{
+   fake_flip_status = 1;
+   fake_flip_queued = true;
+   fake_flip_due    = fake_time + fake_flip_period;
+}
 void gcmSetFlipMode(const u32 mode) { }
-void gcmSetWaitFlip(gcmContextData *context) { }
+void gcmSetWaitFlip(gcmContextData *context)
+{
+   if (fake_flip_period)
+   {
+      if (fake_gpu_time < fake_time)
+         fake_gpu_time = fake_time;
+      if (fake_gpu_time < fake_flip_due)
+         fake_gpu_time = fake_flip_due;
+   }
+}
 
 void rsxVertexProgramGetUCode(const rsxVertexProgram *vp, void **ucode,
       u32 *size) { *ucode = fake_ucode; *size = sizeof(fake_ucode); }
@@ -179,18 +253,35 @@ rsxProgramAttrib *rsxFragmentProgramGetAttrib(const rsxFragmentProgram *fp,
 
 void rsxBindVertexArrayAttrib(gcmContextData *c, u8 attr, u16 frequency,
       u32 offset, u8 stride, u8 elems, u8 dtype, u8 location) { }
-void rsxClearSurface(gcmContextData *c, u32 clear_mask) { }
+void rsxClearSurface(gcmContextData *c, u32 clear_mask)
+{
+   if (fake_flip_period && fake_gpu_time < fake_flip_due)
+      fake_clear_hazards++;
+}
 static unsigned rsx_draw_calls;
+#define FAKE_DRAW_OSD UINT32_MAX
+#define FAKE_DRAW_WIDGET (UINT32_MAX - 1)
+static u32 fake_bound_texture;
+static u32 fake_draw_trace[16];
+static unsigned fake_draw_count;
+static bool fake_trace_draws;
+
+static void fake_record_draw(u32 source)
+{
+   if (fake_trace_draws && fake_draw_count < ARRAY_SIZE(fake_draw_trace))
+      fake_draw_trace[fake_draw_count++] = source;
+}
 static unsigned rsx_vertex_invalidations;
 void rsxInvalidateVertexCache(gcmContextData *context)
 { rsx_vertex_invalidations++; }
 void rsxDrawVertexArray(gcmContextData *c, u32 type, u32 start, u32 count)
-{ rsx_draw_calls++; }
+{ rsx_draw_calls++; fake_record_draw(fake_bound_texture); }
 void rsxFlushBuffer(gcmContextData *c) { }
 void rsxInvalidateTextureCache(gcmContextData *c, u32 type) { }
 void rsxLoadFragmentProgramLocation(gcmContextData *c,
       const rsxFragmentProgram *program, u32 offset, u32 location) { }
-void rsxLoadTexture(gcmContextData *c, u8 index, const gcmTexture *t) { }
+void rsxLoadTexture(gcmContextData *c, u8 index, const gcmTexture *t)
+{ fake_bound_texture = t->offset; }
 void rsxLoadVertexProgram(gcmContextData *c,
       const rsxVertexProgram *program, const void *ucode) { }
 void rsxSetAlphaFunc(gcmContextData *c, u32 alphaFunc, u32 ref) { }
@@ -206,7 +297,11 @@ void rsxSetClearDepthStencil(gcmContextData *c, u32 value) { }
 void rsxSetColorMask(gcmContextData *c, u32 mask) { }
 void rsxSetColorMaskMrt(gcmContextData *c, u32 mask) { }
 void rsxSetDepthFunc(gcmContextData *c, u32 func) { }
-void rsxSetDepthTestEnable(gcmContextData *c, u32 enable) { }
+void rsxSetDepthTestEnable(gcmContextData *c, u32 enable)
+{
+   rsx_depth_test_calls++;
+   rsx_depth_test_enable = enable;
+}
 void rsxSetDepthWriteEnable(gcmContextData *c, u32 enable) { }
 void rsxSetStencilTestEnable(gcmContextData *c, u32 enable) { }
 void rsxSetLogicOpEnable(gcmContextData *c, u32 enable) { }
@@ -277,7 +372,24 @@ void video_driver_update_viewport(struct video_viewport* vp,
 void input_driver_video_window(enum input_window_kind window,
       void *window_data) { }
 void menu_driver_frame(bool menu_is_alive, video_frame_info_t *video_info) { }
-void gfx_widgets_frame(void *data) { }
+static bool fake_widgets_visible = true;
+static unsigned fake_widget_calls;
+static bool fake_widget_restored;
+bool gfx_widgets_visible(void *data)
+{
+   video_frame_info_t *info = (video_frame_info_t*)data;
+   return info->widgets_active && fake_widgets_visible
+      && !info->notifications_hidden && !info->msg_queue_delay;
+}
+void gfx_widgets_frame(void *data)
+{
+   fake_widget_calls++;
+   if (gfx_widgets_visible(data))
+   {
+      fake_widget_restored = rsx_depth_test_enable == GCM_FALSE;
+      fake_record_draw(FAKE_DRAW_WIDGET);
+   }
+}
 int32_t sysUtilCheckCallback(void) { return 0; }
 uintptr_t video_thread_texture_handle(void *data,
       custom_command_method_t func) { return func(data); }
@@ -285,7 +397,8 @@ bool video_coord_array_append(video_coord_array_t *ca,
       const video_coords_t *coords, unsigned count) { return true; }
 uint32_t utf8_walk(const char **string) { return *(*string)++; }
 void font_driver_render_msg(void *data, const char *msg, size_t msg_len,
-      const struct font_params *params, void *font_data) { }
+      const struct font_params *params, void *font_data)
+{ if (msg && msg_len) fake_record_draw(FAKE_DRAW_OSD); }
 /* Red of the next message drawn, to tell draws apart */
 static float fake_msg_red;
 void font_driver_resolve_params(const struct font_params *params,
@@ -299,7 +412,34 @@ int font_renderer_get_message_width(
       const char *msg, size_t msg_len, float scale) { return 0; }
 
 static struct font_atlas *fake_get_atlas(void *data) { return &fake_atlas; }
-static void fake_font_free(void *data) { }
+/* The font driver's font_atlas_place() and the release a renderer's
+ * free makes: the atlas moved into the consumer's storage, and handed
+ * back to it when the font goes. The fake's own buffer is static. */
+bool font_atlas_place(struct font_atlas *atlas,
+      void *(*storage)(void *user, size_t size),
+      void (*storage_free)(void *user, void *buffer), void *user)
+{
+   size_t   size = (size_t)atlas->width * atlas->height;
+   uint8_t *buf;
+   if (!storage || !(buf = (uint8_t*)storage(user, size)))
+      return false;
+   memcpy(buf, atlas->buffer, size);
+   atlas->buffer       = buf;
+   atlas->storage      = storage;
+   atlas->storage_free = storage_free;
+   atlas->storage_user = user;
+   return true;
+}
+static void fake_font_free(void *data)
+{
+   struct font_atlas *atlas = (struct font_atlas*)data;
+   if (atlas->storage_free && atlas->buffer != fake_atlas_buffer)
+      atlas->storage_free(atlas->storage_user, atlas->buffer);
+   atlas->buffer       = fake_atlas_buffer;
+   atlas->storage      = NULL;
+   atlas->storage_free = NULL;
+   atlas->storage_user = NULL;
+}
 static struct font_glyph fake_glyph;
 static const struct font_glyph *fake_get_glyph(void *data, uint32_t code)
 { return &fake_glyph; }
@@ -339,12 +479,23 @@ static video_info_t fake_video_info(void)
    return video;
 }
 
+/* The frame as video_driver_frame hands it over: widget visibility
+ * answered before the driver draws */
+static bool frame_out(rsx_t *rsx, const void *frame, unsigned dims,
+      uint64_t frame_count, unsigned pitch, const char *msg,
+      video_frame_info_t *info)
+{
+   info->widgets_visible = info->widgets_active && gfx_widgets_visible(info);
+   return rsx_frame(rsx, frame, dims, frame_count, pitch, msg, info);
+}
+
 /* A driver to draw with, its allocations then forgotten so each test
  * counts only its own */
 static rsx_t *driver_up(void)
 {
    video_info_t video = fake_video_info();
    rsx_t *rsx;
+   fake_widgets_visible = true;
    rsx_fail_at        = 0;
    rsx                = (rsx_t*)rsx_init(&video);
    if (!rsx)
@@ -460,7 +611,7 @@ static void test_frame_fail(void)
    draws           = rsx_draw_calls;
    rsx_alloc_calls = 0;
    rsx_fail_at     = 1;
-   rsx_frame(rsx, frame, VIDEO_SCALE_PACK(16, 8), 1, 16 * 2, NULL,
+   frame_out(rsx, frame, VIDEO_SCALE_PACK(16, 8), 1, 16 * 2, NULL,
          &video_info);
    rsx_fail_at     = 0;
    CHECK(rsx_draw_calls == draws,
@@ -468,7 +619,7 @@ static void test_frame_fail(void)
 
    /* With memory it is */
    draws           = rsx_draw_calls;
-   rsx_frame(rsx, frame, VIDEO_SCALE_PACK(16, 8), 2, 16 * 2, NULL,
+   frame_out(rsx, frame, VIDEO_SCALE_PACK(16, 8), 2, 16 * 2, NULL,
          &video_info);
    CHECK(rsx_draw_calls > draws, "frame_fail: a frame is drawn");
 
@@ -627,18 +778,22 @@ static void test_native_menu_frame(void)
    info.menu_st_flags = MENU_ST_FLAG_ALIVE;
    rsx->menu_frame_enable = true;
    flips = rsx_flip_calls;
-   CHECK(rsx_frame(rsx, NULL, 0, 0, 0, NULL, &info),
+   CHECK(frame_out(rsx, NULL, 0, 0, 0, NULL, &info),
          "native_menu_frame: frame callback");
    CHECK(rsx_flip_calls == flips + 1,
          "native_menu_frame: menu without a core frame was not presented");
    rsx->menu_frame_enable = false;
    flips = rsx_flip_calls;
-   rsx_frame(rsx, NULL, 0, 1, 0, NULL, &info);
+   frame_out(rsx, NULL, 0, 1, 0, NULL, &info);
+   CHECK(rsx_flip_calls == flips + 1,
+         "native_menu_frame: disabled menu left on screen");
+   flips = rsx_flip_calls;
+   frame_out(rsx, NULL, 0, 1, 0, NULL, &info);
    CHECK(rsx_flip_calls == flips,
          "native_menu_frame: disabled menu was presented");
    rsx->menu_frame_enable = true;
    info.menu_st_flags = 0;
-   rsx_frame(rsx, NULL, 0, 2, 0, NULL, &info);
+   frame_out(rsx, NULL, 0, 2, 0, NULL, &info);
    CHECK(rsx_flip_calls == flips,
          "native_menu_frame: inactive menu was presented");
    driver_down(rsx);
@@ -779,7 +934,7 @@ static void test_menu_frame_vertices(void)
       check_vertices(rsx->texture_vertices, start, &coords);
       previous = &rsx->texture_vertices[start];
       previous_color = color[0];
-      rsx_frame(rsx, NULL, 0, i, 0, NULL, &info);
+      frame_out(rsx, NULL, 0, i, 0, NULL, &info);
    }
    CHECK(rsx_finish_calls == finishes, "menu_frame_vertices: waits for the GPU");
    driver_down(rsx);
@@ -849,7 +1004,7 @@ static void test_font_queue(void)
       previous_red = red;
       start       += 6;
       if (i % 3 == 2)
-         rsx_frame(rsx, NULL, 0, i, 0, NULL, &info);
+         frame_out(rsx, NULL, 0, i, 0, NULL, &info);
    }
    fake_msg_red = 0;
    rsx_font_free(font, false);
@@ -955,14 +1110,14 @@ static void test_menu_dupe_frame(void)
    rsx->menu_frame_enable = true;
 
    draws = rsx_draw_calls;
-   rsx_frame(rsx, NULL, 0, 0, 0, NULL, &info);
+   frame_out(rsx, NULL, 0, 0, 0, NULL, &info);
    CHECK(rsx_draw_calls == draws,
          "menu_dupe_frame: drawn with no core frame yet");
 
-   rsx_frame(rsx, frame, VIDEO_SCALE_PACK(16, 8), 1, 16 * 2, NULL, &info);
+   frame_out(rsx, frame, VIDEO_SCALE_PACK(16, 8), 1, 16 * 2, NULL, &info);
    draws = rsx_draw_calls;
    flips = rsx_flip_calls;
-   rsx_frame(rsx, NULL, 0, 2, 0, NULL, &info);
+   frame_out(rsx, NULL, 0, 2, 0, NULL, &info);
    CHECK(rsx_draw_calls == draws + 1,
          "menu_dupe_frame: duped core frame not drawn behind the menu");
    CHECK(rsx_flip_calls == flips + 1,
@@ -971,12 +1126,549 @@ static void test_menu_dupe_frame(void)
    info.menu_st_flags = 0;
    draws = rsx_draw_calls;
    flips = rsx_flip_calls;
-   rsx_frame(rsx, NULL, 0, 3, 0, NULL, &info);
+   frame_out(rsx, NULL, 0, 3, 0, NULL, &info);
+   CHECK(rsx_draw_calls == draws + 1 && rsx_flip_calls == flips + 1,
+         "menu_dupe_frame: closed menu left on screen over a dupe");
+   draws = rsx_draw_calls;
+   flips = rsx_flip_calls;
+   frame_out(rsx, NULL, 0, 4, 0, NULL, &info);
    CHECK(rsx_draw_calls == draws && rsx_flip_calls == flips,
          "menu_dupe_frame: a dupe without the menu was redrawn");
 
    driver_down(rsx);
    printf("menu_dupe_frame: ok\n");
+}
+
+static void test_widget_dupe_frame(void)
+{
+   static u8 pixels[4 * 4 * 2];
+   struct retro_rsx_image image;
+   video_frame_info_t info;
+   rsx_t *rsx;
+   unsigned draws, flips, allocations, finishes;
+
+   memset(&info, 0, sizeof(info));
+   fake_hwr.context_type = RETRO_HW_CONTEXT_RSX;
+   rsx = driver_up();
+   image.offset = 0x10000;
+   image.pitch  = 512 * 4;
+   image.width  = 512;
+   image.height = 240;
+   rsx_set_hw_image(rsx, &image);
+   frame_out(rsx, RETRO_HW_FRAME_BUFFER_VALID, 0, 0, 0, NULL, &info);
+
+   info.widgets_active = true;
+   draws       = rsx_draw_calls;
+   flips       = rsx_flip_calls;
+   allocations = rsx_alloc_calls;
+   finishes    = rsx_finish_calls;
+   frame_out(rsx, NULL, 0, 1, 0, NULL, &info);
+   CHECK(rsx_draw_calls == draws + 1 && rsx_flip_calls == flips + 1,
+         "widget_dupe_frame: hardware image and widgets not presented");
+   CHECK(rsx_alloc_calls == allocations && rsx_finish_calls == finishes,
+         "widget_dupe_frame: hardware replay allocates or waits");
+
+   info.menu_st_flags     = MENU_ST_FLAG_ALIVE;
+   rsx->menu_frame_enable = true;
+   draws = rsx_draw_calls;
+   frame_out(rsx, NULL, 0, 2, 0, NULL, &info);
+   CHECK(rsx_draw_calls == draws + 1,
+         "widget_dupe_frame: image drawn twice behind menu and widgets");
+   info.menu_st_flags     = 0;
+   rsx->menu_frame_enable = false;
+
+   rsx_set_hw_image(rsx, NULL);
+   frame_out(rsx, pixels, VIDEO_SCALE_PACK(4, 4), 3, 8, NULL, &info);
+   draws = rsx_draw_calls;
+   flips = rsx_flip_calls;
+   frame_out(rsx, NULL, 0, 4, 0, NULL, &info);
+   CHECK(rsx_draw_calls == draws + 1 && rsx_flip_calls == flips + 1,
+         "widget_dupe_frame: CPU fallback and widgets not presented");
+
+   info.widgets_active = false;
+   draws = rsx_draw_calls;
+   flips = rsx_flip_calls;
+   frame_out(rsx, NULL, 0, 5, 0, NULL, &info);
+   CHECK(rsx_draw_calls == draws + 1 && rsx_flip_calls == flips + 1,
+         "widget_dupe_frame: disabling widgets leaves old pixels");
+   draws = rsx_draw_calls;
+   flips = rsx_flip_calls;
+   frame_out(rsx, NULL, 0, 6, 0, NULL, &info);
+   CHECK(rsx_draw_calls == draws && rsx_flip_calls == flips,
+         "widget_dupe_frame: inactive widgets keep redrawing duplicates");
+   driver_down(rsx);
+
+   fake_hwr.context_type = RETRO_HW_CONTEXT_NONE;
+   rsx = driver_up();
+   info.widgets_active = true;
+   frame_out(rsx, pixels, VIDEO_SCALE_PACK(4, 4), 0, 8, NULL, &info);
+   draws = rsx_draw_calls;
+   flips = rsx_flip_calls;
+   frame_out(rsx, NULL, 0, 1, 0, NULL, &info);
+   CHECK(rsx_draw_calls == draws + 1 && rsx_flip_calls == flips + 1,
+         "widget_dupe_frame: software image and widgets not presented");
+   driver_down(rsx);
+   printf("widget_dupe_frame: ok\n");
+}
+
+static void test_widget_visibility(void)
+{
+   struct retro_rsx_image image;
+   video_frame_info_t info;
+   rsx_t *rsx;
+   unsigned draws, flips, restores, calls;
+
+   memset(&info, 0, sizeof(info));
+   fake_hwr.context_type = RETRO_HW_CONTEXT_RSX;
+   rsx = driver_up();
+   image.offset = 0x10000;
+   image.pitch  = 512 * 4;
+   image.width  = 512;
+   image.height = 240;
+   rsx_set_hw_image(rsx, &image);
+   frame_out(rsx, RETRO_HW_FRAME_BUFFER_VALID, 0, 0, 0, NULL, &info);
+
+   info.widgets_active  = true;
+   fake_widgets_visible = false;
+   draws    = rsx_draw_calls;
+   flips    = rsx_flip_calls;
+   restores = rsx_depth_test_calls;
+   calls    = fake_widget_calls;
+   frame_out(rsx, NULL, 0, 1, 0, NULL, &info);
+   CHECK(rsx_draw_calls == draws && rsx_flip_calls == flips
+         && rsx_depth_test_calls == restores,
+         "widget_visibility: empty widgets redraw or restore a duplicate");
+   CHECK(fake_widget_calls == calls + 1,
+         "widget_visibility: invisible widgets skip frame housekeeping");
+   frame_out(rsx, NULL, 0, 1, 0, "", &info);
+   CHECK(rsx_draw_calls == draws && rsx_flip_calls == flips
+         && rsx_depth_test_calls == restores,
+         "widget_visibility: empty OSD message redraws an idle duplicate");
+
+   fake_widgets_visible = true;
+   frame_out(rsx, NULL, 0, 2, 0, NULL, &info);
+   CHECK(rsx_draw_calls == draws + 1 && rsx_flip_calls == flips + 1,
+         "widget_visibility: newly visible widgets not presented");
+   info.notifications_hidden = true;
+   draws = rsx_draw_calls;
+   flips = rsx_flip_calls;
+   frame_out(rsx, NULL, 0, 3, 0, NULL, &info);
+   CHECK(rsx_draw_calls == draws + 1 && rsx_flip_calls == flips + 1,
+         "widget_visibility: hidden notification leaves old pixels");
+   draws = rsx_draw_calls;
+   flips = rsx_flip_calls;
+   restores = rsx_depth_test_calls;
+   frame_out(rsx, NULL, 0, 4, 0, NULL, &info);
+   CHECK(rsx_draw_calls == draws && rsx_flip_calls == flips
+         && rsx_depth_test_calls == restores,
+         "widget_visibility: hidden widgets keep presenting duplicates");
+   frame_out(rsx, NULL, 0, 4, 0, "", &info);
+   CHECK(rsx_draw_calls == draws && rsx_flip_calls == flips
+         && rsx_depth_test_calls == restores,
+         "widget_visibility: empty OSD message redraws hidden widgets");
+
+   info.notifications_hidden = false;
+   frame_out(rsx, NULL, 0, 5, 0, NULL, &info);
+   fake_widgets_visible = false;
+   draws = rsx_draw_calls;
+   flips = rsx_flip_calls;
+   frame_out(rsx, NULL, 0, 6, 0, NULL, &info);
+   CHECK(rsx_draw_calls == draws + 1 && rsx_flip_calls == flips + 1,
+         "widget_visibility: expired notification leaves old pixels");
+   draws = rsx_draw_calls;
+   flips = rsx_flip_calls;
+   frame_out(rsx, NULL, 0, 7, 0, NULL, &info);
+   CHECK(rsx_draw_calls == draws && rsx_flip_calls == flips,
+         "widget_visibility: expired notification needs repeated cleanup");
+
+   fake_widgets_visible = true;
+   frame_out(rsx, NULL, 0, 8, 0, NULL, &info);
+   fake_widgets_visible = false;
+   frame_out(rsx, RETRO_HW_FRAME_BUFFER_VALID, 0, 9, 0, NULL, &info);
+   flips = rsx_flip_calls;
+   frame_out(rsx, NULL, 0, 10, 0, NULL, &info);
+   CHECK(rsx_flip_calls == flips,
+         "widget_visibility: real frame did not consume pending cleanup");
+   driver_down(rsx);
+   fake_hwr.context_type = RETRO_HW_CONTEXT_NONE;
+   printf("widget_visibility: ok\n");
+}
+
+static void test_ui_dupe_pacing(void)
+{
+   static uint16_t pixels[4 * 4];
+   video_frame_info_t info;
+   rsx_t *rsx;
+   unsigned mode, i, flips, waits, calls, reads, overlaps, hazards;
+   retro_time_t start;
+
+   memset(&info, 0, sizeof(info));
+   fake_hwr.context_type = RETRO_HW_CONTEXT_RSX;
+   rsx = driver_up();
+   info.refresh_rate = 60.0f;
+   info.max_swapchain_images = 3;
+   info.widgets_active = true;
+   rsx_set_nonblock_state(rsx, false, false, 1);
+   fake_flip_period = 16667;
+   for (mode = 0; mode < 5; mode++)
+   {
+      flips = rsx_flip_calls;
+      waits = rsx_flip_waits;
+      calls = fake_widget_calls;
+      reads = fake_time_reads;
+      overlaps = fake_flip_overlap;
+      hazards = fake_clear_hazards;
+      fake_time = start = 10 * fake_flip_period;
+      fake_gpu_time = fake_time;
+      fake_flip_pending();
+      for (i = 0; i < 120; i++)
+      {
+         const void *frame = mode == 0 || mode >= 3 ? (i & 1 ? NULL : pixels)
+            : mode == 1 ? (i & 1 ? NULL : RETRO_HW_FRAME_BUFFER_VALID)
+            : NULL;
+         fake_time += mode == 3 && !(i & 1) ? 20000 : 1000;
+         if (mode == 4)
+         {
+            if (fake_gpu_time < fake_time)
+               fake_gpu_time = fake_time;
+            fake_gpu_time += (i & 1) ? 1000 : 20000;
+         }
+         rsx_depth_test_enable = GCM_TRUE;
+         fake_widget_restored = false;
+         frame_out(rsx, frame, VIDEO_SCALE_PACK(4, 4), i, 8, NULL, &info);
+         CHECK(fake_widget_restored,
+               "ui_dupe_pacing: visible widgets missing or drawn without state restore");
+      }
+      CHECK(rsx_flip_calls == flips + 120 && rsx_flip_waits == waits + 120,
+            "ui_dupe_pacing: core duplicates lost synchronized presents");
+      CHECK(fake_time - start == 120 * fake_flip_period,
+            "ui_dupe_pacing: lost display cadence (%ld us, expected %ld us)",
+            (long)(fake_time - start), (long)(120 * fake_flip_period));
+      CHECK(fake_widget_calls == calls + 120 && !info.notifications_hidden,
+            "ui_dupe_pacing: widget frames suppressed");
+      CHECK(fake_time_reads == reads,
+            "ui_dupe_pacing: frame path reads wall clock");
+      CHECK(fake_flip_overlap == overlaps,
+            "ui_dupe_pacing: new flip submitted before previous one completes");
+      CHECK(fake_clear_hazards == hazards,
+            "ui_dupe_pacing: framebuffer cleared before previous flip completes");
+   }
+
+   flips = rsx_flip_calls;
+   waits = rsx_flip_waits;
+   rsx->menu_frame_enable = true;
+   info.menu_st_flags = MENU_ST_FLAG_ALIVE;
+   frame_out(rsx, NULL, 0, 120, 0, NULL, &info);
+   frame_out(rsx, NULL, 0, 121, 0, NULL, &info);
+   CHECK(rsx_flip_calls == flips + 2 && !fake_flip_due,
+         "ui_dupe_pacing: menu returned with uploads still in use");
+   rsx->menu_frame_enable = false;
+   info.menu_st_flags = 0;
+   rsx->should_resize = true;
+   frame_out(rsx, NULL, 0, 122, 0, NULL, &info);
+   CHECK(rsx_flip_calls == flips + 3 && !rsx->should_resize,
+         "ui_dupe_pacing: viewport resize deferred");
+
+   info.widgets_active = false;
+   frame_out(rsx, NULL, 0, 123, 0, NULL, &info);
+   frame_out(rsx, NULL, 0, 124, 0, NULL, &info);
+   CHECK(rsx_flip_calls == flips + 5 && !rsx->ui_presented,
+         "ui_dupe_pacing: cleanup lost display cadence or stayed pending");
+
+   info.widgets_active = true;
+   flips = rsx_flip_calls;
+   waits = rsx_flip_waits;
+   rsx_set_nonblock_state(rsx, true, false, 1);
+   frame_out(rsx, NULL, 0, 125, 0, NULL, &info);
+   CHECK(rsx_flip_calls == flips + 1 && rsx_flip_waits == waits,
+         "ui_dupe_pacing: nonblocking frame waited or deferred");
+   rsx_set_nonblock_state(rsx, false, false, 1);
+   info.frame_repeat = true;
+   frame_out(rsx, NULL, 0, 126, 0, NULL, &info);
+   CHECK(rsx_flip_calls == flips + 2 && rsx_flip_waits == waits + 1,
+         "ui_dupe_pacing: cached replay deferred");
+   rsx->overlay_enable = true;
+   flips = rsx_flip_calls;
+   frame_out(rsx, NULL, 0, 127, 0, NULL, &info);
+   CHECK(rsx_flip_calls == flips + 1 && !fake_flip_due,
+         "ui_dupe_pacing: overlay returned with vertices still in use");
+   fake_flip_period = 0;
+   fake_flip_due = 0;
+   driver_down(rsx);
+   fake_hwr.context_type = RETRO_HW_CONTEXT_NONE;
+   printf("ui_dupe_pacing: ok\n");
+}
+
+static void test_bare_dupe_pacing(void)
+{
+   static uint16_t pixels[4 * 4];
+   video_frame_info_t info;
+   struct retro_rsx_image image;
+   rsx_t *rsx;
+   unsigned mode, i, flips, waits, calls, draws, restores, index, allocations;
+   retro_time_t start;
+
+   for (mode = 0; mode < 4; mode++)
+   {
+      const void *source = mode & 1 ? RETRO_HW_FRAME_BUFFER_VALID : pixels;
+      memset(&info, 0, sizeof(info));
+      info.widgets_active = true;
+      info.max_swapchain_images = 3;
+      fake_hwr.context_type = mode & 1 ? RETRO_HW_CONTEXT_RSX : RETRO_HW_CONTEXT_NONE;
+      rsx = driver_up();
+      fake_widgets_visible = false;
+      image.offset = 0x10000;
+      image.pitch  = 4 * 4;
+      image.width  = image.height = 4;
+      if (mode & 1)
+         CHECK(rsx_set_hw_image(rsx, &image), "bare_dupe_pacing: cached image");
+      frame_out(rsx, source, VIDEO_SCALE_PACK(4, 4), 0, 8, NULL, &info);
+      rsx_set_nonblock_state(rsx, false, false, 1);
+      flips = rsx_flip_calls;
+      waits = rsx_flip_waits;
+      calls = fake_widget_calls;
+      draws = rsx_draw_calls;
+      restores = rsx_depth_test_calls;
+      index = rsx->tex_index;
+      allocations = rsx_alloc_calls;
+      fake_flip_period = 16667;
+      fake_time = start = 10 * fake_flip_period;
+      fake_gpu_time = fake_time;
+      fake_flip_pending();
+      for (i = 0; i < 120; i++)
+      {
+         fake_time += 1000;
+         frame_out(rsx, mode >= 2 || (i & 1) ? NULL : source,
+               VIDEO_SCALE_PACK(4, 4), i + 1, 8, NULL, &info);
+      }
+      CHECK(rsx_flip_calls == flips + 120 && rsx_flip_waits == waits + 120,
+            "bare_dupe_pacing: core duplicates lost synchronized presents (mode %u)", mode);
+      CHECK(fake_time - start == 120 * fake_flip_period,
+            "bare_dupe_pacing: lost display cadence (mode %u, %ld us)",
+            mode, (long)(fake_time - start));
+      CHECK(rsx_draw_calls == draws + 120 && !rsx->ui_presented,
+            "bare_dupe_pacing: cached background missing or marked as UI");
+      CHECK(!(mode & 1) || rsx_depth_test_calls == restores + 120,
+            "bare_dupe_pacing: cached hardware draw missing state restore");
+      CHECK(fake_widget_calls == calls + 120 && !info.widgets_visible,
+            "bare_dupe_pacing: invisible widget housekeeping suppressed");
+      CHECK(mode < 2 || (rsx->tex_index == index && rsx_alloc_calls == allocations),
+            "bare_dupe_pacing: duplicate uploaded or allocated a texture");
+      flips = rsx_flip_calls;
+      waits = rsx_flip_waits;
+      draws = rsx_draw_calls;
+      rsx_set_nonblock_state(rsx, true, false, 1);
+      frame_out(rsx, NULL, 0, 121, 0, NULL, &info);
+      CHECK(rsx_flip_calls == flips && rsx_flip_waits == waits && rsx_draw_calls == draws,
+            "bare_dupe_pacing: nonblocking duplicate presented or waited");
+      fake_flip_period = fake_flip_due = 0;
+      driver_down(rsx);
+   }
+   fake_hwr.context_type = RETRO_HW_CONTEXT_NONE;
+   printf("bare_dupe_pacing: ok\n");
+}
+
+/* Input is polled as retro_run starts, when the last frame call has
+ * returned; the frame is seen at the vblank its flip lands on */
+static void test_flip_latency(void)
+{
+   static uint16_t pixels[4 * 4];
+   video_frame_info_t info;
+   rsx_t *rsx;
+   unsigned images, i, hangs;
+   retro_time_t poll, worst;
+
+   for (images = 2; images <= 3; images++)
+   {
+      memset(&info, 0, sizeof(info));
+      info.max_swapchain_images = images;
+      rsx = driver_up();
+      rsx_set_nonblock_state(rsx, false, false, 1);
+      fake_flip_period = 16667;
+      fake_time        = 10 * fake_flip_period;
+      fake_gpu_time    = fake_time;
+      fake_flip_pending();
+      hangs            = fake_flip_hangs;
+      worst            = 0;
+      for (i = 0; i < 120; i++)
+      {
+         poll       = fake_time;
+         fake_time += 1000;
+         frame_out(rsx, pixels, VIDEO_SCALE_PACK(4, 4), i, 8, NULL, &info);
+         if (i && fake_last_flip_due - poll > worst)
+            worst = fake_last_flip_due - poll;
+      }
+      CHECK(fake_flip_hangs == hangs,
+            "flip_latency: waited on a flip never queued (%u images)", images);
+      if (images == 2)
+         CHECK(worst <= fake_flip_period + 1000,
+               "flip_latency: two images ran the core into the pending flip"
+               " (%ld us to display)", (long)worst);
+      else
+         CHECK(worst > fake_flip_period + 1000,
+               "flip_latency: three images kept the core behind the flip");
+      fake_flip_period = fake_flip_due = 0;
+      driver_down(rsx);
+   }
+   printf("flip_latency: ok\n");
+}
+
+/* A dupe redraws the last frame that loaded, and with nothing loaded
+ * leaves the screen as it is */
+static void test_dupe_keeps_image(void)
+{
+   static uint16_t pixels[4 * 4];
+   video_frame_info_t info;
+   rsx_t *rsx;
+   unsigned flips, draws, index;
+
+   memset(&info, 0, sizeof(info));
+   rsx = driver_up();
+   rsx_set_nonblock_state(rsx, false, false, 1);
+
+   flips = rsx_flip_calls;
+   frame_out(rsx, NULL, 0, 0, 0, NULL, &info);
+   CHECK(rsx_flip_calls == flips,
+         "dupe_keeps_image: a dupe with nothing cached presented a cleared buffer");
+
+   frame_out(rsx, pixels, VIDEO_SCALE_PACK(4, 4), 1, 8, NULL, &info);
+   index           = rsx->tex_index;
+   rsx_alloc_calls = 0;
+   rsx_fail_at     = 1;
+   frame_out(rsx, pixels, VIDEO_SCALE_PACK(4, 4), 2, 8, NULL, &info);
+   rsx_fail_at     = 0;
+   CHECK(rsx->tex_index == index && rsx->texture[index].data,
+         "dupe_keeps_image: a failed upload became the cached frame");
+
+   flips = rsx_flip_calls;
+   draws = rsx_draw_calls;
+   frame_out(rsx, NULL, 0, 3, 0, NULL, &info);
+   CHECK(rsx_flip_calls == flips + 1 && rsx_draw_calls == draws + 1,
+         "dupe_keeps_image: the last loaded frame was not presented");
+
+   driver_down(rsx);
+   printf("dupe_keeps_image: ok\n");
+}
+
+static void test_widget_layer_order(void)
+{
+   uint32_t pixels[4] = { 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff };
+   struct texture_image overlay;
+   struct retro_rsx_image image;
+   video_frame_info_t info;
+   rsx_t *rsx;
+   u32 overlay_offset, core_offset;
+   unsigned i, flips;
+
+   memset(&info, 0, sizeof(info));
+   memset(&overlay, 0, sizeof(overlay));
+   overlay.pixels = pixels;
+   overlay.width = overlay.height = 2;
+   fake_hwr.context_type = RETRO_HW_CONTEXT_RSX;
+   rsx = driver_up();
+   image.offset = 0x10000;
+   image.pitch  = 512 * 4;
+   image.width  = 512;
+   image.height = 240;
+   rsx_set_hw_image(rsx, &image);
+   frame_out(rsx, RETRO_HW_FRAME_BUFFER_VALID, 0, 0, 0, NULL, &info);
+   CHECK(rsx_overlay_load(rsx, &overlay, 1), "widget_layer_order: overlay load");
+   overlay_offset = rsx->overlay[0].texture.tex.offset;
+
+   for (i = 0; i < 2; i++)
+   {
+      if (i)
+      {
+         rsx_set_hw_image(rsx, NULL);
+         frame_out(rsx, pixels, VIDEO_SCALE_PACK(2, 2), 1, 4, NULL, &info);
+      }
+      core_offset = i ? rsx->texture[rsx->tex_index].tex.offset : image.offset;
+      rsx->overlay_enable  = true;
+      info.widgets_active = true;
+      info.statistics_show = true;
+      info.stat_text       = "statistics";
+      info.stat_text_len   = strlen(info.stat_text);
+      fake_trace_draws = true;
+      fake_draw_count = 0;
+      frame_out(rsx, NULL, 0, 2, 0, NULL, &info);
+      CHECK(fake_draw_count == 4 && fake_draw_trace[0] == core_offset
+            && fake_draw_trace[1] == FAKE_DRAW_OSD
+            && fake_draw_trace[2] == overlay_offset
+            && fake_draw_trace[3] == FAKE_DRAW_WIDGET,
+            "widget_layer_order: core/statistics/overlay/widgets order (%u)", i);
+      fake_trace_draws = false;
+      rsx->overlay_enable  = false;
+      info.widgets_active = false;
+      info.statistics_show = false;
+      frame_out(rsx, NULL, 0, 3, 0, NULL, &info);
+   }
+
+   for (i = 0; i < 3; i++)
+   {
+      const char *msg = i == 2 ? "message" : NULL;
+      rsx->overlay_enable  = i == 0;
+      info.statistics_show = i == 1;
+      fake_trace_draws = true;
+      fake_draw_count = 0;
+      flips = rsx_flip_calls;
+      frame_out(rsx, NULL, 0, 4, 0, msg, &info);
+      CHECK(fake_draw_count == 2 && fake_draw_trace[0] == core_offset
+            && fake_draw_trace[1] == (i == 0 ? overlay_offset : FAKE_DRAW_OSD)
+            && rsx_flip_calls == flips + 1,
+            "widget_layer_order: standalone frontend layer not composed (%u)", i);
+      fake_trace_draws = false;
+   }
+
+   rsx_free_overlay(rsx);
+   driver_down(rsx);
+   fake_hwr.context_type = RETRO_HW_CONTEXT_NONE;
+   printf("widget_layer_order: ok\n");
+}
+
+/* Any frontend layer that goes away over duped frames is taken off by
+ * one more present of the bare core image, then dupes skip again. */
+static void test_ui_cleanup(void)
+{
+   static u8 pixels[4 * 4 * 2];
+   video_frame_info_t info;
+   rsx_t *rsx;
+   unsigned i, draws, flips;
+
+   memset(&info, 0, sizeof(info));
+   rsx = driver_up();
+   frame_out(rsx, pixels, VIDEO_SCALE_PACK(4, 4), 0, 8, NULL, &info);
+
+   for (i = 0; i < 3; i++)
+   {
+      const char *msg = i == 0 ? "message" : NULL;
+      rsx->overlay_enable  = i == 1;
+      info.statistics_show = i == 2;
+      frame_out(rsx, NULL, 0, 1, 0, msg, &info);
+      rsx->overlay_enable  = false;
+      info.statistics_show = false;
+
+      draws = rsx_draw_calls;
+      flips = rsx_flip_calls;
+      frame_out(rsx, NULL, 0, 2, 0, NULL, &info);
+      CHECK(rsx_draw_calls == draws + 1 && rsx_flip_calls == flips + 1,
+            "ui_cleanup: removed layer left on screen (%u)", i);
+      draws = rsx_draw_calls;
+      flips = rsx_flip_calls;
+      frame_out(rsx, NULL, 0, 3, 0, "", &info);
+      CHECK(rsx_draw_calls == draws && rsx_flip_calls == flips,
+            "ui_cleanup: cleanup presented more than once (%u)", i);
+   }
+
+   /* A real frame without layers clears the pending cleanup */
+   frame_out(rsx, NULL, 0, 4, 0, "message", &info);
+   frame_out(rsx, pixels, VIDEO_SCALE_PACK(4, 4), 5, 8, NULL, &info);
+   flips = rsx_flip_calls;
+   frame_out(rsx, NULL, 0, 6, 0, NULL, &info);
+   CHECK(rsx_flip_calls == flips,
+         "ui_cleanup: real frame did not consume pending cleanup");
+
+   driver_down(rsx);
+   printf("ui_cleanup: ok\n");
 }
 
 static void test_hw_interface(void)
@@ -1023,7 +1715,7 @@ static void test_hw_interface(void)
    allocations = rsx_alloc_calls;
    finishes = rsx_finish_calls;
    draws = rsx_draw_calls;
-   rsx_frame(rsx, RETRO_HW_FRAME_BUFFER_VALID, VIDEO_SCALE_PACK(480, 272),
+   frame_out(rsx, RETRO_HW_FRAME_BUFFER_VALID, VIDEO_SCALE_PACK(480, 272),
          0, 0, NULL, &info);
    CHECK(rsx_draw_calls == draws + 1 && rsx_alloc_calls == allocations,
          "hw_interface: GPU image displayed without allocation or CPU upload");
@@ -1032,7 +1724,7 @@ static void test_hw_interface(void)
    info.menu_st_flags     = MENU_ST_FLAG_ALIVE;
    rsx->menu_frame_enable = true;
    draws = rsx_draw_calls;
-   rsx_frame(rsx, NULL, 0, 1, 0, NULL, &info);
+   frame_out(rsx, NULL, 0, 1, 0, NULL, &info);
    CHECK(rsx_draw_calls == draws + 1,
          "hw_interface: core image not drawn again behind the menu");
    info.menu_st_flags     = 0;
@@ -1041,7 +1733,7 @@ static void test_hw_interface(void)
    CHECK(!iface->set_image(iface->handle, &image),
          "hw_interface: invalid pitch rejected");
    draws = rsx_draw_calls;
-   rsx_frame(rsx, RETRO_HW_FRAME_BUFFER_VALID, VIDEO_SCALE_PACK(480, 272),
+   frame_out(rsx, RETRO_HW_FRAME_BUFFER_VALID, VIDEO_SCALE_PACK(480, 272),
          1, 0, NULL, &info);
    CHECK(rsx_draw_calls == draws, "hw_interface: rejected image not reused");
    image.pitch = 512 * 4;
@@ -1053,6 +1745,57 @@ static void test_hw_interface(void)
    driver_down(rsx);
    fake_hwr.context_type = RETRO_HW_CONTEXT_NONE;
    printf("hw_interface: ok\n");
+}
+
+static void test_hw_frame_state(void)
+{
+   uint16_t pixels[4] = { 0, 0, 0, 0 };
+   video_frame_info_t info;
+   rsx_t *rsx;
+   unsigned calls, draws;
+   memset(&info, 0, sizeof(info));
+   fake_hwr.context_type = RETRO_HW_CONTEXT_RSX;
+   rsx = driver_up();
+
+   rsx_depth_test_enable = GCM_TRUE;
+   calls = rsx_depth_test_calls;
+   frame_out(rsx, RETRO_HW_FRAME_BUFFER_VALID, 0, 0, 0, NULL, &info);
+   CHECK(rsx_depth_test_calls == calls + 1
+         && rsx_depth_test_enable == GCM_FALSE,
+         "hw_frame_state: hardware frame restores frontend state");
+
+   rsx_depth_test_enable = GCM_TRUE;
+   calls = rsx_depth_test_calls;
+   draws = rsx_draw_calls;
+   frame_out(rsx, pixels, VIDEO_SCALE_PACK(2, 2), 1, 4, NULL, &info);
+   CHECK(rsx_depth_test_calls == calls + 1
+         && rsx_depth_test_enable == GCM_FALSE
+         && rsx_draw_calls == draws + 1,
+         "hw_frame_state: software fallback restores frontend state");
+
+   rsx_depth_test_enable = GCM_TRUE;
+   calls = rsx_depth_test_calls;
+   frame_out(rsx, NULL, 0, 2, 0, NULL, &info);
+   CHECK(rsx_depth_test_calls == calls
+         && rsx_depth_test_enable == GCM_TRUE,
+         "hw_frame_state: duplicate frame does not reset state");
+
+   /* A dupe with the menu on top draws, so it must not inherit the
+    * core's state either. */
+   info.menu_st_flags     = MENU_ST_FLAG_ALIVE;
+   rsx->menu_frame_enable = true;
+   rsx_depth_test_enable  = GCM_TRUE;
+   calls = rsx_depth_test_calls;
+   frame_out(rsx, NULL, 0, 3, 0, NULL, &info);
+   CHECK(rsx_depth_test_calls == calls + 1
+         && rsx_depth_test_enable == GCM_FALSE,
+         "hw_frame_state: duplicate frame under the menu restores frontend state");
+   rsx->menu_frame_enable = false;
+   info.menu_st_flags     = 0;
+
+   driver_down(rsx);
+   fake_hwr.context_type = RETRO_HW_CONTEXT_NONE;
+   printf("hw_frame_state: ok\n");
 }
 
 /* Retired memory is fenced once at the next frame and freed when the
@@ -1079,7 +1822,7 @@ static void test_hw_retirement(void)
    fake_defer_backend = true;
    CHECK(iface->retire_memory(iface->handle, memory),
          "hw_retirement: allocation ownership transferred");
-   rsx_frame(rsx, NULL, 0, 0, 0, NULL, &info);
+   frame_out(rsx, NULL, 0, 0, 0, NULL, &info);
    rsx_collect_retired_memory();
    CHECK(rsx_live() == live && rsx_finish_calls == finishes,
          "hw_retirement: pending GPU memory preserved without waiting");
@@ -1104,7 +1847,16 @@ int main(int argc, char **argv)
       const char *name;
       void (*run)(void);
    } tests[] = {
+      { "widget_dupe_frame", test_widget_dupe_frame },
+      { "widget_visibility", test_widget_visibility },
+      { "ui_dupe_pacing", test_ui_dupe_pacing },
+      { "bare_dupe_pacing", test_bare_dupe_pacing },
+      { "flip_latency", test_flip_latency },
+      { "dupe_keeps_image", test_dupe_keeps_image },
+      { "widget_layer_order", test_widget_layer_order },
+      { "ui_cleanup", test_ui_cleanup },
       { "hw_interface", test_hw_interface },
+      { "hw_frame_state", test_hw_frame_state },
       { "hw_retirement", test_hw_retirement },
       { "texture_grow",  test_texture_grow  },
       { "texture_fail",  test_texture_fail  },

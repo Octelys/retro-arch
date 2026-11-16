@@ -39,6 +39,7 @@
 #include <file/archive_file.h>
 #include <file/file_path.h>
 #include <formats/image.h>
+#include <streams/image_texture_file.h>
 #include <lists/dir_list.h>
 #include <lists/string_list.h>
 #include <streams/file_stream.h>
@@ -81,8 +82,9 @@ static void companion_core_download_orphan(companion_core_t *core);
 #endif
 
 #ifdef HAVE_LIBRETRODB
-/* task_push_dbscan() carries no user data, so the requesting core is
- * kept here. Only one desktop companion is active at a time. */
+/* The requesting core, kept here rather than passed as the scan's
+ * user data so that freeing the core clears it. Only one desktop
+ * companion is active at a time. */
 static companion_core_t *companion_core_scan_owner = NULL;
 #endif
 
@@ -986,9 +988,14 @@ bool companion_core_playlist_rename(companion_core_t *core,
    return true;
 }
 
+static bool companion_core_push_entry(playlist_t *playlist,
+      playlist_dedup_t *dedup, const char *content_path, const char *label,
+      const char *core_path, const char *core_name, const char *db_name);
+
 static size_t companion_core_add_one(companion_core_t *core,
-      playlist_t *pl, const char *path, const char *db_name,
-      const char *core_path, const char *core_name, int depth)
+      playlist_t *pl, playlist_dedup_t *dedup, const char *path,
+      const char *db_name, const char *core_path, const char *core_name,
+      int depth)
 {
    size_t added = 0;
    if (path_is_directory(path))
@@ -1001,8 +1008,9 @@ static size_t companion_core_add_one(companion_core_t *core,
       if (!list)
          return 0;
       for (i = 0; i < list->size; i++)
-         added += companion_core_add_one(core, pl, list->elems[i].data,
-               db_name, core_path, core_name, depth + 1);
+         added += companion_core_add_one(core, pl, dedup,
+               list->elems[i].data, db_name, core_path, core_name,
+               depth + 1);
       string_list_free(list);
       return added;
    }
@@ -1011,7 +1019,7 @@ static size_t companion_core_add_one(companion_core_t *core,
    {
       char label[NAME_MAX_LENGTH];
       fill_pathname(label, path_basename(path), "", sizeof(label));
-      if (companion_core_playlist_push(core, pl, path, label,
+      if (companion_core_push_entry(pl, dedup, path, label,
                core_path ? core_path : "DETECT",
                core_name ? core_name : "DETECT", db_name))
          added++;
@@ -1024,6 +1032,7 @@ size_t companion_core_playlist_add_files(companion_core_t *core,
       const char *core_path, const char *core_name)
 {
    playlist_t *pl;
+   playlist_dedup_t *dedup;
    char db_name[NAME_MAX_LENGTH];
    size_t i, added = 0;
    if (!core || string_is_empty(playlist_path) || !paths || !n)
@@ -1034,10 +1043,14 @@ size_t companion_core_playlist_add_files(companion_core_t *core,
    if (!pl)
       return 0;
    strlcpy(db_name, path_basename(playlist_path), sizeof(db_name));
+   /* NULL on failure: every add then takes the full push */
+   if ((dedup = playlist_dedup_init()))
+      playlist_dedup_seed_step(dedup, pl, NULL, NULL);
    for (i = 0; i < n; i++)
       if (paths[i] && *paths[i])
-         added += companion_core_add_one(core, pl, paths[i], db_name,
-               core_path, core_name, 0);
+         added += companion_core_add_one(core, pl, dedup, paths[i],
+               db_name, core_path, core_name, 0);
+   playlist_dedup_free(dedup);
    companion_core_playlist_release(core, pl, true, added > 0);
    if (added && string_is_equal(companion_core_selected_playlist_path(core), playlist_path))
       companion_core_select_playlist_path(core, playlist_path); /* reload */
@@ -1724,7 +1737,16 @@ bool companion_core_request_load_content(companion_core_t *core,
 
    db_name_full[0] = '\0';
    if (!string_is_empty(db_name))
-      fill_pathname(db_name_full, db_name, ".lpl", sizeof(db_name_full));
+   {
+      /* Qt hands the name without its .lpl, Win32 and Cocoa with it;
+       * a dot inside the name stays (Tiger - Game.com). */
+      size_t _len = strlcpy(db_name_full, db_name, sizeof(db_name_full));
+      if (     _len < sizeof(db_name_full)
+            && !string_ends_with_size(db_name_full, ".lpl", _len,
+               STRLEN_CONST(".lpl")))
+         strlcpy_lit(db_name_full + _len, ".lpl",
+               sizeof(db_name_full) - _len);
+   }
 
    memset(&content_info, 0, sizeof(content_info));
 
@@ -1765,7 +1787,15 @@ bool companion_core_load_core(companion_core_t *core, const char *path)
 
    core_info_init_current_core();
 
+#ifdef HAVE_CORE_LOAD_CHECK
+   if (command_event(CMD_EVENT_LOAD_CORE, NULL))
+      return true;
+   /* path may be the core list's, freed by the deinit above */
+   task_content_park_core_load(path_get(RARCH_PATH_CORE));
+   return false;
+#else
    return command_event(CMD_EVENT_LOAD_CORE, NULL);
+#endif
 #else
    (void)core;
    (void)path;
@@ -1848,6 +1878,15 @@ static void companion_core_scan_finished(retro_task_t *task,
 }
 #endif
 
+const char *companion_core_scan_refusal(void)
+{
+#ifdef HAVE_LIBRETRODB
+   if (task_dbscan_chain_is_running())
+      return msg_hash_to_str(MSG_MANUAL_CONTENT_SCAN_ALREADY_RUNNING);
+#endif
+   return "Scanning is not available in this build.";
+}
+
 bool companion_core_request_scan(companion_core_t *core, const char *path)
 {
 #ifdef HAVE_LIBRETRODB
@@ -1855,7 +1894,7 @@ bool companion_core_request_scan(companion_core_t *core, const char *path)
       return false;
 
    companion_core_scan_owner = core;
-   return task_push_dbscan(path, companion_core_scan_finished);
+   return task_push_dbscan(path, companion_core_scan_finished, NULL);
 #else
    (void)core;
    (void)path;
@@ -3535,14 +3574,16 @@ size_t companion_core_resolve_content_path(companion_core_t *core,
    return _len;
 }
 
-bool companion_core_playlist_push(companion_core_t *core,
-      playlist_t *playlist, const char *content_path, const char *label,
+/* As playlist_push(); with @dedup, a path it shows absent is pushed
+ * without the push's own search of every entry, which would find
+ * nothing - the outcome the same, a bulk add linear rather than
+ * quadratic. A path it shows present takes the full push, which moves
+ * an entry for the same core to the top or adds one for another. */
+static bool companion_core_push_entry(playlist_t *playlist,
+      playlist_dedup_t *dedup, const char *content_path, const char *label,
       const char *core_path, const char *core_name, const char *db_name)
 {
    struct playlist_entry entry;
-
-   if (!core || !playlist || string_is_empty(content_path))
-      return false;
 
    memset(&entry, 0, sizeof(entry));
    /* playlist_push() reads the entry as const; the casts are safe. */
@@ -3553,7 +3594,19 @@ bool companion_core_playlist_push(companion_core_t *core,
    entry.crc32     = (char*)"00000000|crc";
    entry.db_name   = (char*)db_name;
 
+   if (dedup && !playlist_dedup_check_add(dedup, playlist, content_path, true))
+      return playlist_push_unchecked(playlist, &entry);
    return playlist_push(playlist, &entry);
+}
+
+bool companion_core_playlist_push(companion_core_t *core,
+      playlist_t *playlist, const char *content_path, const char *label,
+      const char *core_path, const char *core_name, const char *db_name)
+{
+   if (!core || !playlist || string_is_empty(content_path))
+      return false;
+   return companion_core_push_entry(playlist, NULL, content_path, label,
+         core_path, core_name, db_name);
 }
 
 /* --- Thumbnail downloads ----------------------------------------------- */

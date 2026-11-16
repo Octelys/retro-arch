@@ -307,7 +307,7 @@ static void handle_translation_response(
 {
    uint8_t* raw_output_data          = NULL;
    struct scaler_ctx* scaler         = NULL;
-   void* raw_image_data              = NULL;
+   const void* raw_image_data        = NULL;
    void* raw_image_data_alpha        = NULL;
    settings_t* settings              = config_get_ptr();
    uint32_t runloop_flags            = runloop_get_flags();
@@ -370,6 +370,7 @@ static void handle_translation_response(
        * the first row in memory is the top of the image. */
       size_t   image_row        = 0;
       bool     image_top_down   = false;
+      enum scaler_pix_fmt image_fmt = SCALER_FMT_BGR24;
       /* Get the video frame dimensions reference */
       unsigned dims   = 0;
       bool     is_hw_fb;
@@ -462,10 +463,7 @@ static void handle_translation_response(
                goto finish;
             }
 
-            if (!(raw_image_data = malloc(image_row * image_height)))
-               goto finish;
-            memcpy(raw_image_data, raw_image_file_data + offset,
-                  image_row * image_height);
+            raw_image_data = raw_image_file_data + offset;
          }
          else if (   new_image_size >= 24
                   && raw_image_file_data[1] == 'P'
@@ -513,40 +511,10 @@ static void handle_translation_response(
                rpng_free(rpng);
                goto finish;
             }
-            /* Written below as tight rows, bottom-up. */
-            image_row = (size_t)image_width * 3;
-
-            /* Returned output from the png processor is an upside down RGBA
-             * image, so we have to change that to RGB first.  This should
-             * probably be replaced with a scaler call.*/
-            {
-               unsigned ui;
-               int tw, th, tc;
-               int d          = 0;
-               raw_image_data = (void*)malloc(image_width*image_height*3*sizeof(uint8_t));
-               /* NULL-check: the indexed write at the bottom of
-                * this loop body dereferences raw_image_data.  On
-                * OOM jump to finish which NULL-tolerantly frees
-                * raw_image_data_alpha + rpng state; the
-                * translation request fails cleanly. */
-               if (!raw_image_data)
-               {
-                  rpng_free(rpng);
-                  goto finish;
-               }
-               for (ui = 0; ui < image_width * image_height * 4; ui++)
-               {
-                  if (ui % 4 != 3)
-                  {
-                     tc = d % 3;
-                     th = image_height-d / (image_width * 3) - 1;
-                     tw = (d % (image_width * 3)) / 3;
-                     ((uint8_t*) raw_image_data)[tw * 3 + th * 3 * image_width + tc] =
-                        ((uint8_t *)raw_image_data_alpha)[ui];
-                     d += 1;
-                  }
-               }
-            }
+            raw_image_data = raw_image_data_alpha;
+            image_row      = (size_t)image_width * sizeof(uint32_t);
+            image_top_down = true;
+            image_fmt      = SCALER_FMT_ARGB8888;
             rpng_free(rpng);
 #else
             /* PNG decoding requires RPNG; without it we cannot handle this
@@ -561,8 +529,7 @@ static void handle_translation_response(
          }
 
          if (    !VIDEO_SCALE_W(dims)
-              || !VIDEO_SCALE_H(dims)
-              || !(scaler = (struct scaler_ctx*)calloc(1, sizeof(struct scaler_ctx))))
+              || !VIDEO_SCALE_H(dims))
             goto finish;
 
          if (is_hw_fb)
@@ -575,6 +542,27 @@ static void handle_translation_response(
             RARCH_LOG("[Translation] Hardware frame buffer core, but selected video driver isn't supported.\n");
             goto finish;
          }
+
+         if (image_fmt == SCALER_FMT_ARGB8888
+               && (video_driver_pix_fmt == RETRO_PIXEL_FORMAT_XRGB8888
+                  || video_driver_pix_fmt == RETRO_PIXEL_FORMAT_RGB565)
+               && image_width == VIDEO_SCALE_W(dims)
+               && image_height == VIDEO_SCALE_H(dims))
+         {
+            raw_output_data      = (uint8_t*)raw_image_data_alpha;
+            raw_image_data_alpha = NULL;
+            pitch                = image_row;
+            if (video_driver_pix_fmt == RETRO_PIXEL_FORMAT_RGB565)
+            {
+               pitch = (size_t)image_width * sizeof(uint16_t);
+               conv_argb8888_rgb565(raw_output_data, raw_output_data,
+                     image_width, image_height, (int)pitch, (int)image_row);
+            }
+            goto draw_image;
+         }
+
+         if (!(scaler = (struct scaler_ctx*)calloc(1, sizeof(struct scaler_ctx))))
+            goto finish;
 
          /* The assigned pitch may not be reliable.  The width of
             the video frame can change during run-time, but the
@@ -600,7 +588,7 @@ static void handle_translation_response(
          if (!raw_output_data)
             goto finish;
 
-         scaler->in_fmt        = SCALER_FMT_BGR24;
+         scaler->in_fmt        = image_fmt;
          scaler->in_width      = image_width;
          scaler->in_height     = image_height;
          scaler->out_width     = VIDEO_SCALE_W(dims);
@@ -622,8 +610,18 @@ static void handle_translation_response(
          {
             scaler->in_stride  = -(int)image_row;
             scaler_ctx_scale_direct(scaler, raw_output_data,
-                  (uint8_t*)raw_image_data
+                  (const uint8_t*)raw_image_data
                   + (image_height - 1) * image_row);
+         }
+draw_image:
+         if (image_fmt == SCALER_FMT_ARGB8888
+               && video_driver_pix_fmt == RETRO_PIXEL_FORMAT_XRGB8888)
+         {
+            uint32_t *pixels = (uint32_t*)raw_output_data;
+            size_t i;
+            /* The software frame has always discarded the PNG alpha. */
+            for (i = 0; i < VIDEO_SCALE_AREA(dims); i++)
+               pixels[i] |= 0xff000000u;
          }
          video_driver_frame(raw_output_data,
                VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims), pitch);
@@ -760,8 +758,6 @@ static void handle_translation_response(
 finish:
    if (raw_image_data_alpha)
        free(raw_image_data_alpha);
-   if (raw_image_data)
-      free(raw_image_data);
    if (scaler)
    {
       scaler_ctx_gen_reset(scaler);
@@ -954,7 +950,8 @@ struct translation_sw_ctx
 {
    struct scaler_ctx *scaler;
    uint8_t           *dst;
-   size_t             pitch;
+   unsigned           dims;
+   bool               success;
 };
 
 static void translation_sw_convert_cb(void *userdata,
@@ -966,11 +963,10 @@ static void translation_sw_convert_cb(void *userdata,
    struct translation_sw_ctx *ctx = (struct translation_sw_ctx*)userdata;
    if (!data || !ctx || !ctx->dst)
       return;
-   /* If the dimensions shifted between cached_frame_info and
-    * here (shouldn't with same-thread access but cheap to defend),
-    * trust the cached_frame_read parameters which describe the
-    * actual buffer we were given. */
-   video_frame_convert_to_bgr24(
+   /* The destination was allocated for the earlier snapshot. */
+   if (dims != ctx->dims)
+      return;
+   ctx->success = video_frame_convert_to_bgr24(
          ctx->scaler,
          ctx->dst,
          (const uint8_t*)data + ((int)height - 1) * pitch,
@@ -1076,9 +1072,8 @@ bool run_translation_service_notify(settings_t *settings, bool paused,
             goto finish;
 
          bit24_image_prev = (uint8_t*)malloc(VIDEO_SCALE_AREA(vp.dims) * 3);
-         bit24_image      = (uint8_t*)malloc(VIDEO_SCALE_AREA(dims) * 3);
 
-         if (!bit24_image_prev || !bit24_image)
+         if (!bit24_image_prev)
             goto finish;
 
          if (!(      video_st->current_video->read_viewport
@@ -1089,19 +1084,25 @@ bool run_translation_service_notify(settings_t *settings, bool paused,
             goto finish;
          }
 
-         /* TODO: Rescale down to regular resolution */
-         scaler->in_fmt      = SCALER_FMT_BGR24;
-         scaler->out_fmt     = SCALER_FMT_BGR24;
-         scaler->scaler_type = SCALER_TYPE_POINT;
-         scaler->in_width    = VIDEO_SCALE_W(vp.dims);
-         scaler->in_height   = VIDEO_SCALE_H(vp.dims);
-         scaler->out_width   = VIDEO_SCALE_W(dims);
-         scaler->out_height  = VIDEO_SCALE_H(dims);
-         scaler_ctx_gen_filter(scaler);
-
-         scaler->in_stride   = VIDEO_SCALE_W(vp.dims)*3;
-         scaler->out_stride  = VIDEO_SCALE_W(dims)*3;
-         scaler_ctx_scale_direct(scaler, bit24_image, bit24_image_prev);
+         if (vp.dims == dims)
+         {
+            bit24_image      = bit24_image_prev;
+            bit24_image_prev = NULL;
+         }
+         else
+         {
+            bit24_image = (uint8_t*)malloc(VIDEO_SCALE_AREA(dims) * 3);
+            if (!bit24_image)
+               goto finish;
+            scaler->in_fmt = SCALER_FMT_BGR24;
+            if (!video_frame_convert_to_bgr24(scaler, bit24_image,
+                     bit24_image_prev,
+                     VIDEO_SCALE_W(vp.dims), VIDEO_SCALE_H(vp.dims),
+                     VIDEO_SCALE_W(vp.dims) * 3,
+                     VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims),
+                     VIDEO_SCALE_W(dims) * 3))
+               goto finish;
+         }
       }
       else
       {
@@ -1131,9 +1132,12 @@ bool run_translation_service_notify(settings_t *settings, bool paused,
             struct translation_sw_ctx ctx;
             ctx.scaler = scaler;
             ctx.dst    = bit24_image;
-            ctx.pitch  = pitch;
+            ctx.dims   = dims;
+            ctx.success = false;
             video_driver_cached_frame_read(&ctx,
                   translation_sw_convert_cb);
+            if (!ctx.success)
+               goto finish;
          }
       }
    }

@@ -33,11 +33,17 @@ RETRO_BEGIN_DECLS
 
 /* The devices' joypad driver, and their names: both hands, or each in
  * Separate. Each name has a built-in profile, the RetroPad's ids as
- * buttons, the sticks as axes 0 to 3, L2 and R2 as axes 4 and 5. */
+ * buttons, the menu button as button 16 with Menu Toggle on it, the
+ * sticks as axes 0 to 3, L2 and R2 as axes 4 and 5. */
 #define INPUT_OPENXR_JOYPAD          "openxr"
 #define INPUT_OPENXR_JOYPAD_COMBINED "OpenXR Controllers"
 #define INPUT_OPENXR_JOYPAD_LEFT     "OpenXR Left Controller"
 #define INPUT_OPENXR_JOYPAD_RIGHT    "OpenXR Right Controller"
+
+/* The menu button, past the RetroPad's sixteen, and the buttons a
+ * device has. */
+#define INPUT_OPENXR_BUTTON_MENU 16
+#define INPUT_OPENXR_BUTTONS     17
 
 struct rarch_joypad_driver;
 
@@ -45,10 +51,12 @@ struct rarch_joypad_driver;
 void input_openxr_register(void);
 
 /* Syncs the controllers, and connects or disconnects their devices;
- * once per input poll, with Max Users, the Headset Controllers and
- * Laser Pointer settings and the axis threshold. */
+ * once per input poll, with Max Users, the OpenXR Controller Layout,
+ * Laser Pointer, Laser Beam, Touch Hands, Touch Button and Touch
+ * Passthrough settings and the axis threshold. */
 void input_openxr_poll(unsigned max_users, unsigned controllers,
-      unsigned laser, float threshold);
+      unsigned laser, unsigned beam, unsigned touch_hands,
+      unsigned touch_button, bool touch_passthrough, float threshold);
 
 /* @joypad, or while the devices have slots a joypad driver that
  * answers theirs and passes every other to @joypad. */
@@ -69,14 +77,52 @@ void input_openxr_reannounce(void);
  * headset's. */
 bool input_openxr_autoconfigure(unsigned slot);
 
-/* RARCH_MENU_TOGGLE, RARCH_HEADSET_RECENTER, RARCH_LASER_POINTER_TOGGLE
- * or RARCH_HEADSET_VIEW_TOGGLE, from the headset's own actions. */
+/* RARCH_MENU_TOGGLE in edit mode, RARCH_HEADSET_RECENTER,
+ * RARCH_LASER_POINTER_TOGGLE, RARCH_HEADSET_VIEW_TOGGLE or
+ * RARCH_HEADSET_EDIT_SCREENS, from the headset's own actions. */
 bool input_openxr_hotkey(unsigned id);
 
-/* The laser as RETRO_DEVICE_POINTER or RETRO_DEVICE_LIGHTGUN on port 0,
- * while it can point (the headset focused, a screen live for the
- * laser): true, with *res set. A miss reads as offscreen. */
-bool input_openxr_pointer(unsigned port, unsigned device, unsigned idx,
+/* Edit Screens, main thread, between frames: a pause draws a frame.
+ * Toggle: stops edit mode, false; otherwise whether it can start, the
+ * desktop told when not. Begin, once the menu was asked to close: on at
+ * once, pausing running content when @pause (While Editing Screens)
+ * asks, held screens snapping when @snap (Snap to Screens) does;
+ * Snap to Angles' step, @snap_angles, Hinge Gap, @hinge_gap, and Edit
+ * Smoothing's level, @smoothing, hold until edit mode ends; a menu that
+ * stayed open (no content) is told instead. End: off at once, as a
+ * video reinit wants. */
+bool input_openxr_edit_toggle(void);
+void input_openxr_edit_begin(bool pause, bool snap, unsigned snap_angles,
+      unsigned hinge_gap, unsigned smoothing);
+void input_openxr_edit_end(void);
+
+/* Main thread: what each hand holds is let go where it is, as before a
+ * recenter. Edit mode stays on. */
+void input_openxr_edit_release(void);
+
+/* Any thread: whether a controller has Touch Button @button (enum
+ * video_openxr_touch_button) on either hand, as the last poll found:
+ * every button while no session runs or no hand's controller is
+ * known. */
+bool input_openxr_touch_offered(unsigned button);
+
+/* The Touch Button after @cur, or before it unless @forward, that
+ * input_openxr_touch_offered() offers, round; @cur when it offers no
+ * other. For the menu's left and right. */
+unsigned input_openxr_touch_step(unsigned cur, bool forward);
+
+/* Whether the laser drives a core's pointer this poll: when not,
+ * input_openxr_pointer() answers false for every port. */
+bool input_openxr_pointer_owned(void);
+
+/* The laser as RETRO_DEVICE_POINTER or RETRO_DEVICE_LIGHTGUN on a core
+ * port whose users read @slots (a bit per slot), while it can point
+ * (the headset focused, a screen live for the laser and a hand that can
+ * touch it) and a controller of the headset's is in one of those
+ * slots: true, with *res set. The pointing hand's port aims and fires;
+ * another hand's reads offscreen, as a miss does. A controller no user
+ * reads drives no core's pointer. */
+bool input_openxr_pointer(uint32_t slots, unsigned device, unsigned idx,
       unsigned id, int16_t *res);
 
 /* The laser on the menu quad: where, from 0 to 1 across and down, and

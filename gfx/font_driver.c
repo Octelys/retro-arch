@@ -449,7 +449,7 @@ typedef struct font_cache
    unsigned cand_count;
    unsigned cand_next;
    unsigned cand_frame;
-   /* The frame a search found every cell looked up in, when full_set:
+   /* The frame a search found every cell busy in, when full_set:
     * no cell is free again before the next one */
    unsigned full_frame;
    bool full_set;
@@ -640,9 +640,10 @@ static void *font_cache_fallback_face(font_cache_t *c, int id,
 /* Advanced once a video frame by font_driver_frame_begin(). A cell
  * looked up in the current frame may already have glyphs queued from
  * it, so it is not handed to another codepoint until the frame is over:
- * reusing it would draw the new glyph in the earlier one's place. 0
- * until the first frame, which leaves plain LRU in place for a cache
- * used outside the video loop.  It is only ever compared, never used
+ * reusing it would draw the new glyph in the earlier one's place. The
+ * same holds for the atlas's inflight frames before it, which the GPU
+ * may still be drawing. 0 until the first frame, which leaves plain LRU
+ * in place for a cache used outside the video loop.  It is only ever compared, never used
  * to publish anything, so it is read relaxed: a plain load on every
  * backend, where the glyph lookup reads it once a glyph. */
 static retro_atomic_int_t font_frame_epoch;
@@ -652,8 +653,14 @@ void font_driver_frame_begin(void)
    retro_atomic_fetch_add_int(&font_frame_epoch, 1);
 }
 
-/* Searches every cell for the least recently used one not looked up
- * in @frame, keeping the oldest few in c->cand for the misses after */
+/* Whether @s was looked up in @frame or in one of the atlas's inflight
+ * frames before it; 0 for a cell never looked up in a frame */
+#define FONT_CACHE_BUSY(c, s, frame) \
+   (   (frame) && (s)->last_frame \
+    && (unsigned)((frame) - (s)->last_frame) <= (c)->atlas.inflight)
+
+/* Searches every cell for the least recently used one not busy in
+ * @frame, keeping the oldest few in c->cand for the misses after */
 static font_cache_slot_t *font_cache_search(font_cache_t *c, unsigned frame)
 {
    unsigned i, b, k;
@@ -667,7 +674,7 @@ static font_cache_slot_t *font_cache_search(font_cache_t *c, unsigned frame)
       {
          /* Unsigned subtraction handles the counter wrapping */
          unsigned age = c->usage_counter - blk[i].last_used;
-         if (frame && blk[i].last_frame == frame)
+         if (FONT_CACHE_BUSY(c, &blk[i], frame))
             continue;
          if (     n == FONT_CACHE_CANDIDATES
                && age <= c->usage_counter - c->cand_used[n - 1])
@@ -690,8 +697,8 @@ static font_cache_slot_t *font_cache_search(font_cache_t *c, unsigned frame)
    return n ? c->cand[0] : NULL;
 }
 
-/* The least recently used cell not looked up in this frame, taken out
- * of the hash; NULL when every cell is in use this frame */
+/* The least recently used cell not busy in this frame, taken out of
+ * the hash; NULL when every cell is */
 static font_cache_slot_t *font_cache_take_slot(font_cache_t *c)
 {
    unsigned frame            = (unsigned)retro_atomic_load_relaxed_int(
@@ -708,7 +715,7 @@ static font_cache_slot_t *font_cache_take_slot(font_cache_t *c)
       {
          font_cache_slot_t *s = c->cand[c->cand_next];
          unsigned        used = c->cand_used[c->cand_next++];
-         if (s->last_used == used && !(frame && s->last_frame == frame))
+         if (s->last_used == used && !FONT_CACHE_BUSY(c, s, frame))
          {
             victim = s;
             break;
@@ -753,12 +760,91 @@ static font_cache_slot_t *font_cache_take_slot(font_cache_t *c)
    return victim;
 }
 
+/* @size bytes for the atlas's samples, zeroed, from its storage */
+static uint8_t *font_atlas_alloc(struct font_atlas *atlas, size_t size)
+{
+   uint8_t *buf;
+   if (!atlas->storage)
+      return (uint8_t*)calloc(1, size);
+   if ((buf = (uint8_t*)atlas->storage(atlas->storage_user, size)))
+      memset(buf, 0, size);
+   return buf;
+}
+
+/* Lets go of a buffer the atlas's samples were in */
+static void font_atlas_release(struct font_atlas *atlas, uint8_t *buffer)
+{
+   if (atlas->storage_free)
+      atlas->storage_free(atlas->storage_user, buffer);
+   else
+      free(buffer);
+}
+
+bool font_atlas_place(struct font_atlas *atlas,
+      void *(*storage)(void *user, size_t size),
+      void (*storage_free)(void *user, void *buffer), void *user)
+{
+   size_t   size = (size_t)atlas->width * atlas->height
+                 * ((atlas->format == FONT_ATLAS_FORMAT_A16) ? 2 : 1);
+   uint8_t *buf;
+   if (!storage || !(buf = (uint8_t*)storage(user, size)))
+      return false;
+   memcpy(buf, atlas->buffer, size);
+   font_atlas_release(atlas, atlas->buffer);
+   atlas->buffer       = buf;
+   atlas->storage      = storage;
+   atlas->storage_free = storage_free;
+   atlas->storage_user = user;
+   return true;
+}
+
+void font_dirty_rects_add(unsigned (*r)[2], unsigned *n,
+      unsigned pos, unsigned end)
+{
+   unsigned i, j, bi = 0, bj = 1;
+   unsigned cand[FONT_ATLAS_DIRTY_MAX + 1][2];
+   size_t   best_add = (size_t)-1;
+
+   if (*n < FONT_ATLAS_DIRTY_MAX)
+   {
+      r[*n][0]   = pos;
+      r[(*n)++][1] = end;
+      return;
+   }
+
+   /* Full: of the rectangles and the new one, the two whose union adds
+    * least are joined */
+   memcpy(cand, r, sizeof(cand[0]) * FONT_ATLAS_DIRTY_MAX);
+   cand[FONT_ATLAS_DIRTY_MAX][0] = pos;
+   cand[FONT_ATLAS_DIRTY_MAX][1] = end;
+   for (i = 0; i < FONT_ATLAS_DIRTY_MAX; i++)
+      for (j = i + 1; j <= FONT_ATLAS_DIRTY_MAX; j++)
+      {
+         size_t both = VIDEO_SCALE_AREA(
+                  VIDEO_SCALE_MAX(cand[i][1], cand[j][1])
+                - VIDEO_SCALE_MIN(cand[i][0], cand[j][0]));
+         size_t each = VIDEO_SCALE_AREA(cand[i][1] - cand[i][0])
+                     + VIDEO_SCALE_AREA(cand[j][1] - cand[j][0]);
+         size_t add  = both > each ? both - each : 0;
+         if (add < best_add)
+         {
+            bi       = i;
+            bj       = j;
+            best_add = add;
+         }
+      }
+   cand[bi][0] = VIDEO_SCALE_MIN(cand[bi][0], cand[bj][0]);
+   cand[bi][1] = VIDEO_SCALE_MAX(cand[bi][1], cand[bj][1]);
+   cand[bj][0] = cand[FONT_ATLAS_DIRTY_MAX][0];
+   cand[bj][1] = cand[FONT_ATLAS_DIRTY_MAX][1];
+   memcpy(r, cand, sizeof(cand[0]) * FONT_ATLAS_DIRTY_MAX);
+}
+
 /* @pos and @dims add packed: the atlas never outgrows
  * VIDEO_SCALE_DIM_MAX, so nothing carries between halves */
 static void font_cache_dirty_cell(struct font_atlas *atlas,
       unsigned pos, unsigned dims)
 {
-   unsigned i;
    unsigned end = pos + dims;
 
    if (!atlas->dirty)
@@ -775,47 +861,8 @@ static void font_cache_dirty_cell(struct font_atlas *atlas,
    atlas->dirty_xy1 = VIDEO_SCALE_MAX(atlas->dirty_xy1, end);
 
    /* Only the corners describe a region someone else made */
-   if (!atlas->dirty_rects)
-      return;
-   if (atlas->dirty_rects < FONT_ATLAS_DIRTY_MAX)
-   {
-      atlas->dirty_rect[atlas->dirty_rects][0]   = pos;
-      atlas->dirty_rect[atlas->dirty_rects++][1] = end;
-      return;
-   }
-
-   /* Full: of the rectangles and the cell, the two whose union adds
-    * least are joined */
-   {
-      unsigned j, bi = 0, bj = 1;
-      unsigned (*r)[2]  = atlas->dirty_rect;
-      unsigned  cand[FONT_ATLAS_DIRTY_MAX + 1][2];
-      size_t    best_add = (size_t)-1;
-      memcpy(cand, r, sizeof(atlas->dirty_rect));
-      cand[FONT_ATLAS_DIRTY_MAX][0] = pos;
-      cand[FONT_ATLAS_DIRTY_MAX][1] = end;
-      for (i = 0; i < FONT_ATLAS_DIRTY_MAX; i++)
-         for (j = i + 1; j <= FONT_ATLAS_DIRTY_MAX; j++)
-         {
-            size_t both = VIDEO_SCALE_AREA(
-                     VIDEO_SCALE_MAX(cand[i][1], cand[j][1])
-                   - VIDEO_SCALE_MIN(cand[i][0], cand[j][0]));
-            size_t each = VIDEO_SCALE_AREA(cand[i][1] - cand[i][0])
-                        + VIDEO_SCALE_AREA(cand[j][1] - cand[j][0]);
-            size_t add  = both > each ? both - each : 0;
-            if (add < best_add)
-            {
-               bi       = i;
-               bj       = j;
-               best_add = add;
-            }
-         }
-      cand[bi][0] = VIDEO_SCALE_MIN(cand[bi][0], cand[bj][0]);
-      cand[bi][1] = VIDEO_SCALE_MAX(cand[bi][1], cand[bj][1]);
-      cand[bj][0] = cand[FONT_ATLAS_DIRTY_MAX][0];
-      cand[bj][1] = cand[FONT_ATLAS_DIRTY_MAX][1];
-      memcpy(r, cand, sizeof(atlas->dirty_rect));
-   }
+   if (atlas->dirty_rects)
+      font_dirty_rects_add(atlas->dirty_rect, &atlas->dirty_rects, pos, end);
 }
 
 /* Out of line, so a hit needs none of the registers a miss saves */
@@ -870,9 +917,11 @@ VIDEO_NOINLINE static const struct font_glyph *font_cache_miss(
    if (!rast->render_glyph(face, code, gi, dst, c->atlas.width,
             c->cell_dims, c->atlas.format, &slot->glyph))
    {
-      /* Nothing to draw: the cell goes back as the oldest there is */
+      /* Nothing to draw: the cell goes back as the oldest there is,
+       * free again at once - no frame has drawn from it since it was
+       * taken */
       slot->last_used  = c->usage_counter - 0x80000000u;
-      slot->last_frame--;
+      slot->last_frame = 0;
       c->cand_count    = 0;
       return NULL;
    }
@@ -961,11 +1010,12 @@ static bool font_cache_grow(font_cache_t *c)
          || width  > VIDEO_SCALE_W(c->atlas.max_dims)
          || height > VIDEO_SCALE_H(c->atlas.max_dims))
       return false;
-   if (!(buffer = (uint8_t*)calloc(height, (size_t)width * esz)))
-      return false;
    if (!(blk = (font_cache_slot_t*)calloc(added, sizeof(*blk))))
+      return false;
+   if (!(buffer = font_atlas_alloc(&c->atlas,
+               (size_t)height * width * esz)))
    {
-      free(buffer);
+      free(blk);
       return false;
    }
 
@@ -990,7 +1040,7 @@ static bool font_cache_grow(font_cache_t *c)
       }
    }
 
-   free(c->atlas.buffer);
+   font_atlas_release(&c->atlas, c->atlas.buffer);
    c->atlas.buffer             = buffer;
    c->atlas.width              = width;
    c->atlas.height             = height;
@@ -1055,7 +1105,7 @@ static void font_cache_free(void *data)
       free(c->grown[i]);
    if (c->map != c->map_small)
       free(c->map);
-   free(c->atlas.buffer);
+   font_atlas_release(&c->atlas, c->atlas.buffer);
    free(c);
 }
 
@@ -2043,7 +2093,7 @@ void font_driver_render_msg(void *data, const char *msg, size_t msg_len,
 #endif
       /* Without a block the backend draws this string on its own;
        * with one, the draw is counted when the block is flushed */
-      if (p_disp && !(font->block_bound && renderer->bind_block))
+      if (p_disp && !(font->block_bound && renderer->flush))
          p_disp->stats.v[GFX_DISPLAY_STAT_FONT_DRAWS]++;
       renderer->render_msg(data,
             font->renderer_data, new_msg, new_msg_len, params);
@@ -2131,6 +2181,7 @@ void font_driver_resolve_params(const struct font_params *params,
       out->x           = params->x;
       out->y           = params->y;
       out->scale       = params->scale;
+      out->x_scale     = params->x_scale > 0.0f ? params->x_scale : 1.0f;
       out->drop_mod    = params->drop_mod;
       out->drop_alpha  = params->drop_alpha;
       out->drop_x      = params->drop_x;
@@ -2153,6 +2204,7 @@ void font_driver_resolve_params(const struct font_params *params,
       out->x           = settings->floats.video_msg_pos_x;
       out->y           = settings->floats.video_msg_pos_y;
       out->scale       = 1.0f;
+      out->x_scale     = 1.0f;
       out->drop_mod    = 0.3f;
       out->drop_alpha  = 1.0f;
       out->drop_x      = -2;

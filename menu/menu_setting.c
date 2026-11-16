@@ -39,6 +39,7 @@
 #include "../config.h"
 #endif
 
+#include "../record/record_native_buffer.h"
 #include "menu_setting.h"
 #include "menu_displaylist.h"
 #include "menu_cbs.h"
@@ -126,17 +127,23 @@ void android_app_set_window_settings(bool notch_write_over,
 #include "../ui/ui_companion_driver.h"
 #include "../performance_counters.h"
 #include "../setting_list.h"
-#include "../lakka.h"
+#include "../os/lakka/lakka.h"
 #ifdef HAVE_LAKKA_SWITCH
-#include "../lakka-switch.h"
+#include "../os/lakka/lakka-switch.h"
 #endif
 #include "../retroarch.h"
 #include "../gfx/video_display_server.h"
 #ifdef HAVE_TEMPORAL_UPSCALER
 #include "../gfx/video_upscaler.h"
 #endif
+#ifdef HAVE_VULKAN_CUSTOM_DRIVER
+#include "../gfx/common/vulkan_custom_driver.h"
+#endif
 #include "../gfx/video_views.h"
 #include "../gfx/video_windows.h"
+#ifdef HAVE_OPENXR
+#include "../input/common/input_openxr.h"
+#endif
 #ifdef HAVE_MODELINE
 #include "../gfx/video_crt_switch.h"
 #endif
@@ -175,11 +182,11 @@ void android_app_set_window_settings(bool notch_write_over,
 #endif
 
 #if defined(DINGUX)
-#include "../dingux/dingux_utils.h"
+#include "../os/dingux/dingux_utils.h"
 #endif
 
 #if defined(ANDROID)
-#include "../play_feature_delivery/play_feature_delivery.h"
+#include "../os/android/play_feature_delivery.h"
 #endif
 
 #ifdef HAVE_LANGEXTRA
@@ -354,9 +361,7 @@ SETTINGS_ACTION_SETTER(sel, action_select_handler_t)
 SETTINGS_ACTION_SETTER(left, action_left_handler_t)
 SETTINGS_ACTION_SETTER(right, action_right_handler_t)
 SETTINGS_ACTION_SETTER(change, change_handler_t)
-#ifdef ANDROID
 SETTINGS_ACTION_SETTER(read, change_handler_t)
-#endif
 SETTINGS_ACTION_SETTER(repr, get_string_representation_t)
 
 #define SETTINGS_ACTION_SET(field, s, fn) \
@@ -1210,6 +1215,13 @@ static int setting_bind_action_start(rarch_setting_t *setting)
 
    keybind->joykey  = NO_BTN;
    keybind->joyaxis = AXIS_NONE;
+   /* a hotkey's: the controllers' own go with it */
+   if (bind_type - MENU_SETTINGS_BIND_BEGIN >= RARCH_FIRST_META_KEY)
+   {
+      input_config_plays_as_clear_hotkey(
+            bind_type - MENU_SETTINGS_BIND_BEGIN);
+      config_get_ptr()->flags |= SETTINGS_FLG_MODIFIED;
+   }
 
    /* Clear old mapping bit */
    input_keyboard_mapping_bits(0, RETRO_KEYBIND_KEY(keybind));
@@ -1373,6 +1385,47 @@ static int setting_uint_action_right_default(
    }
 
    return 0;
+}
+
+static void setting_streaming_mode_adjust(rarch_setting_t *setting, bool forward)
+{
+   settings_t *settings = config_get_ptr();
+   unsigned value, i;
+   if (!setting || !settings || !recording_driver_can_stream(settings->arrays.record_driver))
+      return;
+   value = setting_uint_get(setting);
+   if (value > STREAMING_MODE_CUSTOM)
+      value = forward ? STREAMING_MODE_TWITCH : STREAMING_MODE_CUSTOM;
+   /* A bounded walk of enum choices, never a wait for a backend. */
+   for (i = 0; i <= STREAMING_MODE_CUSTOM; i++)
+   {
+      if (recording_driver_streaming_mode_supported(settings->arrays.record_driver, value))
+      {
+         if (value != setting_uint_get(setting))
+            setting_uint_set(setting, value);
+         return;
+      }
+      if (forward)
+         value = value == STREAMING_MODE_CUSTOM ? STREAMING_MODE_TWITCH : value + 1;
+      else
+         value = value ? value - 1 : STREAMING_MODE_CUSTOM;
+   }
+}
+
+static int setting_uint_action_left_streaming_mode(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{
+   int result = setting_uint_action_left_default(setting, idx, wraparound);
+   setting_streaming_mode_adjust(setting, false);
+   return result;
+}
+
+static int setting_uint_action_right_streaming_mode(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{
+   int result = setting_uint_action_right_default(setting, idx, wraparound);
+   setting_streaming_mode_adjust(setting, true);
+   return result;
 }
 
 static int setting_bool_action_right_with_refresh(
@@ -1774,6 +1827,7 @@ static size_t setting_get_string_representation_st_string(rarch_setting_t *setti
 static size_t setting_get_string_representation_st_bind(rarch_setting_t *setting,
       char *s, size_t len)
 {
+   size_t _len;
    unsigned index_offset                 = 0;
    unsigned id                           = 0;
    const struct retro_keybind* keybind   = NULL;
@@ -1787,9 +1841,14 @@ static size_t setting_get_string_representation_st_bind(rarch_setting_t *setting
    keybind      = input_config_bind(index_offset, id);
    auto_bind    = (const struct retro_keybind*)
       input_config_get_bind_auto(index_offset, id);
-   return input_config_get_bind_string(settings, s, keybind, auto_bind,
-         input_config_bind_names(index_offset, id),
+   _len         = input_config_get_bind_string(settings, s, keybind,
+         auto_bind, input_config_bind_names(index_offset, id),
          input_autoconf_bind_names(index_offset, id), len);
+   /* a hotkey's, then the controllers' own */
+   if (id >= RARCH_FIRST_META_KEY && _len < len)
+      _len     += input_config_plays_as_hotkey_string(id, s + _len,
+            len - _len);
+   return _len;
 }
 
 static int setting_action_action_ok(
@@ -3673,6 +3732,23 @@ static size_t setting_get_string_representation_video_font_path(
          "", len);
 }
 
+#ifdef HAVE_VULKAN_CUSTOM_DRIVER
+static size_t setting_get_string_representation_vulkan_driver(
+      rarch_setting_t *setting, char *s, size_t len)
+{
+   if (!setting)
+      return 0;
+   if (vulkan_custom_driver_safe_mode())
+      return strlcpy(s, msg_hash_to_str(
+               MENU_ENUM_LABEL_VALUE_VIDEO_VULKAN_DRIVER_PATH_SAFE_MODE), len);
+   if (!setting->value.target.string || !*setting->value.target.string)
+      return strlcpy(s, msg_hash_to_str(
+               MENU_ENUM_LABEL_VALUE_VIDEO_VULKAN_DRIVER_PATH_SYSTEM), len);
+   return fill_pathname(s, path_basename(setting->value.target.string),
+         "", len);
+}
+#endif
+
 static size_t setting_get_string_representation_video_hdr_expand_gamut(
       rarch_setting_t *setting, char *s, size_t len)
 {
@@ -3809,22 +3885,83 @@ static size_t setting_get_string_representation_video_screen_layout(
 }
 
 #ifdef HAVE_VIDEO_WINDOWS
-static size_t setting_get_string_representation_video_screen_window_mode(
+unsigned menu_setting_video_screens(void)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   unsigned screens               = 2;
+   if (     video_st->views_presented
+         && video_st->views_core.num_screens > screens)
+      screens = video_st->views_core.num_screens;
+   if (screens > RETRO_VIDEO_VIEWS_MAX)
+      screens = RETRO_VIDEO_VIEWS_MAX;
+   return screens;
+}
+
+bool menu_setting_video_menu_follows_offered(unsigned follows)
+{
+   return follows < menu_setting_video_screens()
+       || follows >= VIDEO_MENU_FOLLOWS_SEPARATE;
+}
+
+/* Left and right pass over the screens Menu Follows does not offer */
+static int setting_video_menu_follows_step(rarch_setting_t *setting,
+      size_t idx, bool wraparound, bool right)
+{
+   unsigned tries;
+   if (!setting)
+      return -1;
+   for (tries = 0; tries < VIDEO_MENU_FOLLOWS_SEPARATE; tries++)
+   {
+      if (right)
+         setting_uint_action_right_with_refresh(setting, idx, wraparound);
+      else
+         setting_uint_action_left_with_refresh(setting, idx, wraparound);
+      if (menu_setting_video_menu_follows_offered(
+               *setting->value.target.unsigned_integer))
+         break;
+   }
+   return 0;
+}
+
+static int setting_uint_action_left_video_menu_follows(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{
+   return setting_video_menu_follows_step(setting, idx, wraparound, false);
+}
+
+static int setting_uint_action_right_video_menu_follows(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{
+   return setting_video_menu_follows_step(setting, idx, wraparound, true);
+}
+
+static size_t setting_get_string_representation_video_menu_follows(
+      rarch_setting_t *setting, char *s, size_t len)
+{
+   unsigned follows;
+   if (!setting)
+      return 0;
+   follows = *setting->value.target.unsigned_integer;
+   if (follows >= VIDEO_MENU_FOLLOWS_SEPARATE)
+      return strlcpy(s, msg_hash_to_str(
+               MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_SEPARATE), len);
+   return snprintf(s, len, msg_hash_to_str(
+            MENU_ENUM_LABEL_VALUE_VIDEO_MENU_FOLLOWS_SCREEN), follows + 1);
+}
+
+static size_t setting_get_string_representation_video_notifications_window(
       rarch_setting_t *setting, char *s, size_t len)
 {
    if (setting)
    {
       switch (*setting->value.target.unsigned_integer)
       {
-         case VIDEO_WINDOW_ATTACHED:
+         case VIDEO_NOTIFICATIONS_WITH_GAME:
             return strlcpy(s, msg_hash_to_str(
-                     MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_ATTACHED), len);
-         case VIDEO_WINDOW_SEPARATE:
+                     MENU_ENUM_LABEL_VALUE_VIDEO_NOTIFICATIONS_WITH_GAME), len);
+         case VIDEO_NOTIFICATIONS_WITH_MENU:
             return strlcpy(s, msg_hash_to_str(
-                     MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_SEPARATE), len);
-         case VIDEO_WINDOW_HIDDEN:
-            return strlcpy(s, msg_hash_to_str(
-                     MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_HIDDEN), len);
+                     MENU_ENUM_LABEL_VALUE_VIDEO_NOTIFICATIONS_WITH_MENU), len);
       }
    }
    return 0;
@@ -3911,6 +4048,165 @@ static int setting_action_ok_video_screen_window_monitor(
    setting->max = (float)last;
    return setting_action_ok_uint(setting, idx, wraparound);
 }
+
+/* The display rows' values: "" for Auto, "|key" a display, then
+ * "|off"; the menu's row has no Off */
+static char setting_video_screen_display_list[
+      VIDEO_WINDOW_DISPLAYS_MAX * VIDEO_WINDOW_DISPLAY_NAME_SIZE
+      + sizeof("|" VIDEO_WINDOW_DISPLAY_OFF)];
+static char setting_video_menu_display_list[
+      VIDEO_WINDOW_DISPLAYS_MAX * VIDEO_WINDOW_DISPLAY_NAME_SIZE + 1];
+/* The rows' copy of the published list, about 1 KiB, kept off the
+ * stack; app thread */
+static video_window_display_t setting_video_screen_displays[
+      VIDEO_WINDOW_DISPLAYS_MAX];
+
+/* A key the values can hold: named, no '|' in it, and not Off's */
+static bool setting_video_screen_display_offered(const char *key)
+{
+   return key[0] && !strchr(key, '|')
+      && !string_is_equal(key, VIDEO_WINDOW_DISPLAY_OFF);
+}
+
+void menu_setting_video_screen_display_values(void)
+{
+   video_window_display_t *displays = setting_video_screen_displays;
+   char key[VIDEO_WINDOW_DISPLAY_NAME_SIZE];
+   unsigned i;
+   size_t len     = 0;
+   unsigned count = video_driver_get_window_displays(displays,
+         VIDEO_WINDOW_DISPLAYS_MAX);
+   setting_video_screen_display_list[0] = '\0';
+   for (i = 0; i < count; i++)
+   {
+      video_windows_display_key(displays, i, key, sizeof(key));
+      if (!setting_video_screen_display_offered(key))
+         continue;
+      len += strlcpy(setting_video_screen_display_list + len, "|",
+            sizeof(setting_video_screen_display_list) - len);
+      len += strlcpy(setting_video_screen_display_list + len, key,
+            sizeof(setting_video_screen_display_list) - len);
+   }
+   /* "" alone lists nothing in the dropdown, not even Auto */
+   strlcpy(setting_video_menu_display_list,
+         len ? setting_video_screen_display_list : "|",
+         sizeof(setting_video_menu_display_list));
+   strlcpy(setting_video_screen_display_list + len,
+         "|" VIDEO_WINDOW_DISPLAY_OFF,
+         sizeof(setting_video_screen_display_list) - len);
+}
+
+static size_t setting_get_string_representation_video_screen_display(
+      rarch_setting_t *setting, char *s, size_t len)
+{
+   video_window_display_t *displays = setting_video_screen_displays;
+   char key[VIDEO_WINDOW_DISPLAY_NAME_SIZE];
+   unsigned i, count;
+   size_t _len;
+   const char *value;
+   if (!setting)
+      return 0;
+   value = setting->value.target.string;
+   if (string_is_equal(value, VIDEO_WINDOW_DISPLAY_OFF))
+      return strlcpy(s, msg_hash_to_str(
+               setting->enum_idx == MENU_ENUM_LABEL_VIDEO_MENU_DISPLAY
+               ? MENU_ENUM_LABEL_VALUE_AUTO : MENU_ENUM_LABEL_VALUE_OFF),
+            len);
+   if (!value[0])
+      return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_AUTO), len);
+   _len = snprintf(s, len, msg_hash_to_str(
+            MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_DISPLAY), value);
+   if (_len >= len)
+      return _len;
+   count = video_driver_get_window_displays(displays,
+         VIDEO_WINDOW_DISPLAYS_MAX);
+   for (i = 0; i < count; i++)
+   {
+      unsigned w = VIDEO_SCALE_W(displays[i].dims);
+      unsigned h = VIDEO_SCALE_H(displays[i].dims);
+      video_windows_display_key(displays, i, key, sizeof(key));
+      if (!string_is_equal(key, value))
+         continue;
+      if (displays[i].model[0] && displays[i].dims)
+         return _len + snprintf(s + _len, len - _len, " (%s %ux%u)",
+               displays[i].model, w, h);
+      if (displays[i].model[0])
+         return _len + snprintf(s + _len, len - _len, " (%s)",
+               displays[i].model);
+      if (displays[i].dims)
+         return _len + snprintf(s + _len, len - _len, " (%ux%u)", w, h);
+      break;
+   }
+   return _len;
+}
+
+/* Left and right go through Auto, the displays listed and, on a
+ * screen's row, Off; one no longer listed goes to Auto on the right and
+ * the last on the left */
+static int setting_video_screen_display_step(rarch_setting_t *setting,
+      bool right)
+{
+   video_window_display_t *displays = setting_video_screen_displays;
+   char key[VIDEO_WINDOW_DISPLAY_NAME_SIZE];
+   unsigned listed[VIDEO_WINDOW_DISPLAYS_MAX];
+   unsigned i, count, pos, last;
+   unsigned n = 0;
+   bool off;
+   char *value;
+   if (!setting)
+      return -1;
+   value = setting->value.target.string;
+   off   = setting->enum_idx != MENU_ENUM_LABEL_VIDEO_MENU_DISPLAY;
+   count = video_driver_get_window_displays(displays,
+         VIDEO_WINDOW_DISPLAYS_MAX);
+   pos   = value[0] ? VIDEO_WINDOW_DISPLAYS_MAX + 2 : 0;
+   for (i = 0; i < count; i++)
+   {
+      video_windows_display_key(displays, i, key, sizeof(key));
+      if (!setting_video_screen_display_offered(key))
+         continue;
+      if (value[0] && string_is_equal(key, value))
+         pos = n + 1;
+      listed[n++] = i;
+   }
+   last = off ? n + 1 : n;
+   if (off && string_is_equal(value, VIDEO_WINDOW_DISPLAY_OFF))
+      pos = last;
+   if (pos > last)
+      pos = right ? 0 : last;
+   else
+      pos = right ? (pos + 1) % (last + 1) : (pos + last) % (last + 1);
+   if (!pos)
+      value[0] = '\0';
+   else if (pos > n)
+      strlcpy(value, VIDEO_WINDOW_DISPLAY_OFF, setting->size);
+   else
+      video_windows_display_key(displays, listed[pos - 1], value,
+            setting->size);
+   config_get_ptr()->flags |= SETTINGS_FLG_MODIFIED;
+   return 0;
+}
+
+static int setting_string_action_left_video_screen_display(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{
+   return setting_video_screen_display_step(setting, false);
+}
+
+static int setting_string_action_right_video_screen_display(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{
+   return setting_video_screen_display_step(setting, true);
+}
+
+/* The values again: the list may have changed since the screens' list
+ * was built */
+static int setting_string_action_ok_video_screen_display(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{
+   menu_setting_video_screen_display_values();
+   return setting_action_ok_uint(setting, idx, wraparound);
+}
 #endif
 
 static size_t setting_get_string_representation_video_openxr_controllers(
@@ -3950,6 +4246,228 @@ static size_t setting_get_string_representation_video_openxr_laser(
       }
    }
    return 0;
+}
+
+static size_t setting_get_string_representation_video_openxr_laser_beam(
+      rarch_setting_t *setting, char *s, size_t len)
+{
+   if (setting)
+   {
+      switch (*setting->value.target.unsigned_integer)
+      {
+         case VIDEO_OPENXR_LASER_BEAM_OFF:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_BEAM_OFF), len);
+         case VIDEO_OPENXR_LASER_BEAM_EDIT:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_BEAM_EDIT), len);
+         case VIDEO_OPENXR_LASER_BEAM_ALWAYS:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_BEAM_ALWAYS),
+                  len);
+      }
+   }
+   return 0;
+}
+
+static size_t setting_get_string_representation_video_openxr_edit_snap_angles(
+      rarch_setting_t *setting, char *s, size_t len)
+{
+   if (setting)
+   {
+      switch (*setting->value.target.unsigned_integer)
+      {
+         case VIDEO_OPENXR_EDIT_SNAP_ANGLES_OFF:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_SNAP_ANGLES_OFF),
+                  len);
+         case VIDEO_OPENXR_EDIT_SNAP_ANGLES_15:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_SNAP_ANGLES_15),
+                  len);
+         case VIDEO_OPENXR_EDIT_SNAP_ANGLES_30:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_SNAP_ANGLES_30),
+                  len);
+         case VIDEO_OPENXR_EDIT_SNAP_ANGLES_45:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_SNAP_ANGLES_45),
+                  len);
+         case VIDEO_OPENXR_EDIT_SNAP_ANGLES_90:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_SNAP_ANGLES_90),
+                  len);
+      }
+   }
+   return 0;
+}
+
+static size_t setting_get_string_representation_video_openxr_edit_hinge_gap(
+      rarch_setting_t *setting, char *s, size_t len)
+{
+   if (setting)
+   {
+      switch (*setting->value.target.unsigned_integer)
+      {
+         case VIDEO_OPENXR_EDIT_HINGE_GAP_0:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_HINGE_GAP_0),
+                  len);
+         case VIDEO_OPENXR_EDIT_HINGE_GAP_1:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_HINGE_GAP_1),
+                  len);
+         case VIDEO_OPENXR_EDIT_HINGE_GAP_2:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_HINGE_GAP_2),
+                  len);
+         case VIDEO_OPENXR_EDIT_HINGE_GAP_3:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_HINGE_GAP_3),
+                  len);
+         case VIDEO_OPENXR_EDIT_HINGE_GAP_5:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_HINGE_GAP_5),
+                  len);
+         case VIDEO_OPENXR_EDIT_HINGE_GAP_10:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_HINGE_GAP_10),
+                  len);
+      }
+   }
+   return 0;
+}
+
+static size_t setting_get_string_representation_video_openxr_edit_smoothing(
+      rarch_setting_t *setting, char *s, size_t len)
+{
+   if (setting)
+   {
+      switch (*setting->value.target.unsigned_integer)
+      {
+         case VIDEO_OPENXR_EDIT_SMOOTHING_OFF:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_SMOOTHING_OFF),
+                  len);
+         case VIDEO_OPENXR_EDIT_SMOOTHING_LOW:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_SMOOTHING_LOW),
+                  len);
+         case VIDEO_OPENXR_EDIT_SMOOTHING_MEDIUM:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_SMOOTHING_MEDIUM),
+                  len);
+         case VIDEO_OPENXR_EDIT_SMOOTHING_HIGH:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_SMOOTHING_HIGH),
+                  len);
+      }
+   }
+   return 0;
+}
+
+static size_t setting_get_string_representation_video_openxr_edit_pause(
+      rarch_setting_t *setting, char *s, size_t len)
+{
+   if (!setting)
+      return 0;
+   return strlcpy(s, msg_hash_to_str(*setting->value.target.boolean
+            ? MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_PAUSE_ON
+            : MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_PAUSE_OFF), len);
+}
+
+static size_t setting_get_string_representation_video_openxr_touch_hands(
+      rarch_setting_t *setting, char *s, size_t len)
+{
+   if (setting)
+   {
+      switch (*setting->value.target.unsigned_integer)
+      {
+         case VIDEO_OPENXR_TOUCH_HANDS_BOTH:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_HANDS_BOTH), len);
+         case VIDEO_OPENXR_TOUCH_HANDS_LEFT:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_HANDS_LEFT), len);
+         case VIDEO_OPENXR_TOUCH_HANDS_RIGHT:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_HANDS_RIGHT), len);
+         case VIDEO_OPENXR_TOUCH_HANDS_NONE:
+            return strlcpy(s, msg_hash_to_str(
+                     MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_HANDS_NONE), len);
+      }
+   }
+   return 0;
+}
+
+static size_t setting_get_string_representation_video_openxr_touch_button(
+      rarch_setting_t *setting, char *s, size_t len)
+{
+   enum msg_hash_enums name;
+   if (!setting)
+      return 0;
+   switch (*setting->value.target.unsigned_integer)
+   {
+      case VIDEO_OPENXR_TOUCH_BUTTON_TRIGGER:
+         name = MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_BUTTON_TRIGGER;
+         break;
+      case VIDEO_OPENXR_TOUCH_BUTTON_GRIP:
+         name = MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_BUTTON_GRIP;
+         break;
+      case VIDEO_OPENXR_TOUCH_BUTTON_STICK:
+         name = MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_BUTTON_STICK;
+         break;
+      case VIDEO_OPENXR_TOUCH_BUTTON_BUMPER:
+         name = MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_BUTTON_BUMPER;
+         break;
+      case VIDEO_OPENXR_TOUCH_BUTTON_A:
+         name = MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_BUTTON_A;
+         break;
+      case VIDEO_OPENXR_TOUCH_BUTTON_B:
+         name = MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_BUTTON_B;
+         break;
+      case VIDEO_OPENXR_TOUCH_BUTTON_X:
+         name = MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_BUTTON_X;
+         break;
+      case VIDEO_OPENXR_TOUCH_BUTTON_Y:
+         name = MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_BUTTON_Y;
+         break;
+      default:
+         return 0;
+   }
+#ifdef HAVE_OPENXR
+   if (!input_openxr_touch_offered(*setting->value.target.unsigned_integer))
+      return snprintf(s, len, msg_hash_to_str(
+               MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_BUTTON_MISSING),
+            msg_hash_to_str(name));
+#endif
+   return strlcpy(s, msg_hash_to_str(name), len);
+}
+
+/* The next or previous Touch Button the controllers have, round. The
+ * row is listed only with HAVE_OPENXR. */
+static int setting_uint_step_video_openxr_touch_button(
+      rarch_setting_t *setting, bool forward)
+{
+   if (!setting)
+      return -1;
+#ifdef HAVE_OPENXR
+   *setting->value.target.unsigned_integer = input_openxr_touch_step(
+         *setting->value.target.unsigned_integer, forward);
+#endif
+   return 0;
+}
+
+static int setting_uint_action_left_video_openxr_touch_button(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{
+   return setting_uint_step_video_openxr_touch_button(setting, false);
+}
+
+static int setting_uint_action_right_video_openxr_touch_button(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{
+   return setting_uint_step_video_openxr_touch_button(setting, true);
 }
 
 static size_t setting_get_string_representation_video_openxr_placement(
@@ -6808,7 +7326,7 @@ static int setting_action_left_input_remap_port(
       return -1;
 
    port = setting->index_offset;
-   was  = settings->uints.input_remap_ports[port];
+   was  = input_remapping_user_port(port);
 
    /* MAX_USERS is 'None', between the last port and the first */
    if (settings->uints.input_remap_ports[port] > 0)
@@ -6816,7 +7334,7 @@ static int setting_action_left_input_remap_port(
    else
       settings->uints.input_remap_ports[port] = MAX_USERS;
    setting_input_remap_port_follow(menu_st, was,
-         settings->uints.input_remap_ports[port]);
+         input_remapping_user_port(port));
    input_first_press_set_by_hand(port);
 
    /* Must be called whenever settings->uints.input_remap_ports
@@ -6900,6 +7418,9 @@ static int setting_action_left_input_device_index(
    *p = p_new;
 
    settings->flags |= SETTINGS_FLG_MODIFIED;
+   /* Port N Controls' controller rows follow it */
+   menu_state_get_ptr()->flags |= MENU_ST_FLAG_PREVENT_POPULATE
+                               |  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
    return 0;
 }
 
@@ -8641,6 +9162,7 @@ static size_t setting_get_string_representation_input_rotation(
    return strlcpy(s, msg_hash_to_str(e), len);
 }
 
+#ifdef HAVE_OVERLAY
 static size_t setting_get_string_representation_overlay_contact_method(
       rarch_setting_t *setting, char *s, size_t len)
 {
@@ -8658,6 +9180,7 @@ static size_t setting_get_string_representation_overlay_contact_method(
    }
    return strlcpy(s, msg_hash_to_str(e), len);
 }
+#endif
 
 static size_t setting_get_string_representation_socd(
       rarch_setting_t *setting, char *s, size_t len)
@@ -9376,6 +9899,10 @@ static const enum settings_list_type settings_list_build_order[] =
       SETTINGS_LIST_MANUAL_CONTENT_SCAN
    };
 
+static bool setting_append_list_video_screen_settings(
+      rarch_setting_t **list, rarch_setting_info_t *list_info,
+      const char *parent_group);
+
 static bool setting_append_list(settings_t *settings,
       enum settings_list_type type, rarch_setting_t **list,
       rarch_setting_info_t *list_info, const char *parent_group);
@@ -9608,6 +10135,9 @@ static int setting_action_start_input_device_index(rarch_setting_t *setting)
          settings->uints.input_joypad_index[setting->index_offset],
          setting->index_offset);
    input_driver_deadzones_refresh();
+   /* Port N Controls' controller rows follow it */
+   menu_state_get_ptr()->flags |= MENU_ST_FLAG_PREVENT_POPULATE
+                               |  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
    return 0;
 }
 
@@ -9738,7 +10268,7 @@ static int setting_action_start_libretro_device_type(rarch_setting_t *setting)
 
 static int setting_action_start_input_remap_port(rarch_setting_t *setting)
 {
-   unsigned port;
+   unsigned port, was;
    settings_t *settings                    = config_get_ptr();
    struct menu_state *menu_st              = menu_state_get_ptr();
 
@@ -9746,9 +10276,10 @@ static int setting_action_start_input_remap_port(rarch_setting_t *setting)
       return -1;
 
    port                                    = setting->index_offset;
-   setting_input_remap_port_follow(menu_st,
-         settings->uints.input_remap_ports[port], port);
+   was                                     = input_remapping_user_port(port);
    settings->uints.input_remap_ports[port] = port;
+   setting_input_remap_port_follow(menu_st, was,
+         input_remapping_user_port(port));
    input_first_press_set_by_hand(port);
 
    /* Must be called whenever settings->uints.input_remap_ports
@@ -9881,14 +10412,14 @@ static int setting_action_right_input_remap_port(
       return -1;
 
    port = setting->index_offset;
-   was  = settings->uints.input_remap_ports[port];
+   was  = input_remapping_user_port(port);
 
    if (settings->uints.input_remap_ports[port] < MAX_USERS)
       settings->uints.input_remap_ports[port]++;
    else
       settings->uints.input_remap_ports[port] = 0;
    setting_input_remap_port_follow(menu_st, was,
-         settings->uints.input_remap_ports[port]);
+         input_remapping_user_port(port));
    input_first_press_set_by_hand(port);
 
    /* Must be called whenever settings->uints.input_remap_ports
@@ -9928,6 +10459,9 @@ static int setting_action_right_input_device_index(
    *p = p_new;
 
    settings->flags |= SETTINGS_FLG_MODIFIED;
+   /* Port N Controls' controller rows follow it */
+   menu_state_get_ptr()->flags |= MENU_ST_FLAG_PREVENT_POPULATE
+                               |  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
    return 0;
 }
 
@@ -10267,6 +10801,194 @@ static size_t get_string_representation_input_mouse_index(
    return _len;
 }
 
+static unsigned setting_video_screen_mask(void)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   const video_views_map_t *map = &video_st->views_core;
+   unsigned i, mask = 0;
+   /* A frame without a map is screen 1. */
+   if (!video_st->views_presented)
+      return 1u;
+   for (i = 0; i < map->num_views && i < RETRO_VIDEO_VIEWS_MAX; i++)
+      if (map->views[i].screen < RETRO_VIDEO_VIEWS_MAX)
+         mask |= 1u << map->views[i].screen;
+#ifdef HAVE_OPENXR
+   if (     video_driver_vr_content_active()
+         && (video_driver_xr_headset() & VIDEO_XR_HEADSET_TRACKING))
+   {
+      int eyes[2];
+      if (video_views_eye_pair(map, eyes))
+         mask &= ~(1u << map->views[eyes[0]].screen);
+   }
+#endif
+   return mask;
+}
+
+static unsigned setting_video_screen_bind(rarch_setting_t *setting)
+{
+   settings_t *settings = config_get_ptr();
+   struct menu_state *menu_st = menu_state_get_ptr();
+   unsigned screen = menu_st->video_screen_selected;
+   unsigned mask = setting_video_screen_mask();
+   if (screen >= RETRO_VIDEO_VIEWS_MAX || !(mask & (1u << screen)))
+   {
+      for (screen = 0; screen < RETRO_VIDEO_VIEWS_MAX; screen++)
+         if (mask & (1u << screen))
+            break;
+      menu_st->video_screen_selected = screen < RETRO_VIDEO_VIEWS_MAX
+         ? screen : 0;
+   }
+   if (setting->enum_idx == MENU_ENUM_LABEL_VIDEO_SCREEN_SELECTED)
+   {
+      setting->value.target.unsigned_integer = mask
+         ? &menu_st->video_screen_selected : NULL;
+      return mask;
+   }
+   if (!mask)
+      return 0;
+   screen = menu_st->video_screen_selected;
+   setting->index_offset = screen;
+   switch (setting->enum_idx)
+   {
+      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_X:
+         setting->value.target.fraction = &settings->floats.video_screen_xr_x[screen];
+         break;
+      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_Y:
+         setting->value.target.fraction = &settings->floats.video_screen_xr_y[screen];
+         break;
+      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_Z:
+         setting->value.target.fraction = &settings->floats.video_screen_xr_z[screen];
+         break;
+      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_YAW:
+         setting->value.target.fraction = &settings->floats.video_screen_xr_yaw[screen];
+         break;
+      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_PITCH:
+         setting->value.target.fraction = &settings->floats.video_screen_xr_pitch[screen];
+         break;
+      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_ROLL:
+         setting->value.target.fraction = &settings->floats.video_screen_xr_roll[screen];
+         break;
+      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_SCALE:
+         setting->value.target.fraction = &settings->floats.video_screen_xr_scale[screen];
+         break;
+      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_VISIBLE:
+         setting->value.target.boolean = &settings->bools.video_screen_xr_visible[screen];
+         break;
+   }
+   return mask;
+}
+
+static void setting_video_screen_read(rarch_setting_t *setting)
+{
+   setting_video_screen_bind(setting);
+}
+
+static void setting_video_screen_change(rarch_setting_t *setting)
+{
+   if (setting->enum_idx != MENU_ENUM_LABEL_VIDEO_SCREEN_SELECTED)
+      config_get_ptr()->flags |= SETTINGS_FLG_MODIFIED;
+}
+
+static size_t setting_video_screen_repr(rarch_setting_t *setting,
+      char *s, size_t len)
+{
+   if (!setting_video_screen_bind(setting))
+      return strlcpy(s, "", len);
+   if (setting->enum_idx == MENU_ENUM_LABEL_VIDEO_SCREEN_SELECTED)
+      return snprintf(s, len, "%u", menu_state_get_ptr()->video_screen_selected + 1);
+   if (setting->type == ST_FLOAT)
+      return setting_get_string_representation_st_float(setting, s, len);
+   if (setting->type == ST_BOOL)
+      return setting_get_string_representation_st_bool(setting, s, len);
+   return strlcpy(s, "", len);
+}
+
+static int setting_video_screen_step(rarch_setting_t *setting,
+      size_t idx, bool right)
+{
+   unsigned mask = setting_video_screen_bind(setting);
+   if (!mask)
+      return -1;
+   if (setting->enum_idx == MENU_ENUM_LABEL_VIDEO_SCREEN_SELECTED)
+   {
+      struct menu_state *menu_st = menu_state_get_ptr();
+      unsigned screen = menu_st->video_screen_selected;
+      unsigned i;
+      for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+      {
+         screen = (screen + (right ? 1 : RETRO_VIDEO_VIEWS_MAX - 1))
+            % RETRO_VIDEO_VIEWS_MAX;
+         if (mask & (1u << screen))
+            break;
+      }
+      if (i == RETRO_VIDEO_VIEWS_MAX)
+         return -1;
+      menu_st->video_screen_selected = screen;
+      menu_st->flags |= MENU_ST_FLAG_PREVENT_POPULATE
+         | MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+      return 0;
+   }
+   if (setting->type == ST_BOOL)
+      return setting_bool_action_ok_default(setting, idx, false);
+   if (right)
+      return setting_fraction_action_right_default(setting, idx, false);
+   return setting_fraction_action_left_default(setting, idx, false);
+}
+
+static int setting_video_screen_left(rarch_setting_t *setting,
+      size_t idx, bool wraparound)
+{
+   return setting_video_screen_step(setting, idx, false);
+}
+
+static int setting_video_screen_right(rarch_setting_t *setting,
+      size_t idx, bool wraparound)
+{
+   return setting_video_screen_step(setting, idx, true);
+}
+
+static int setting_video_screen_start(rarch_setting_t *setting)
+{
+   if (!setting_video_screen_bind(setting))
+      return -1;
+   if (setting->enum_idx == MENU_ENUM_LABEL_VIDEO_SCREEN_SELECTED)
+   {
+      menu_state_get_ptr()->video_screen_selected = RETRO_VIDEO_VIEWS_MAX;
+      setting_video_screen_bind(setting);
+      return 0;
+   }
+   return setting_generic_action_start_default(setting);
+}
+
+static int setting_video_screen_reset(rarch_setting_t *setting,
+      size_t idx, bool wraparound)
+{
+   settings_t *settings = config_get_ptr();
+   struct menu_state *menu_st = menu_state_get_ptr();
+   if (setting->enum_idx == MENU_ENUM_LABEL_VIDEO_SCREEN_XR_RESET_ALL)
+   {
+      config_reset_video_screen_xr(settings, 0, RETRO_VIDEO_VIEWS_MAX);
+      config_reset_video_menu_xr(settings);
+   }
+   else
+   {
+      if (!setting_video_screen_bind(setting))
+         return -1;
+      config_reset_video_screen_xr(settings, menu_st->video_screen_selected, 1);
+   }
+   settings->flags |= SETTINGS_FLG_MODIFIED;
+   menu_st->flags |= MENU_ST_FLAG_PREVENT_POPULATE
+      | MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+   return 0;
+}
+
+static int setting_video_screen_edit(rarch_setting_t *setting,
+      size_t idx, bool wraparound)
+{
+   command_event(CMD_EVENT_HEADSET_EDIT_SCREENS, NULL);
+   return 0;
+}
+
 static void general_read_handler(rarch_setting_t *setting)
 {
    settings_t      *settings = config_get_ptr();
@@ -10385,19 +11107,30 @@ static void general_write_handler(rarch_setting_t *setting)
    if (     setting->enum_idx >= MENU_ENUM_LABEL_INPUT_KEYBOARD_INDEX
          && setting->enum_idx <= MENU_ENUM_LABEL_INPUT_KEYBOARD_INDEX_LAST)
       input_keyboard_pin_from_index(setting->index_offset);
+   /* and a controller, over Plays As moves or the headset's */
+   if (     setting->enum_idx >= MENU_ENUM_LABEL_INPUT_DEVICE_INDEX
+         && setting->enum_idx <= MENU_ENUM_LABEL_INPUT_DEVICE_INDEX_LAST)
+      input_driver_ports_user_set(setting->index_offset);
 #ifdef HAVE_VIDEO_WINDOWS
    /* a screen sent back to the main window gets another try at the
     * window or display it is now given */
-   if (     (   setting->enum_idx >= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_MODE
-             && setting->enum_idx <= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_MODE_LAST)
-         || (   setting->enum_idx >= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_MONITOR
+   if (     (   setting->enum_idx >= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_MONITOR
              && setting->enum_idx <= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_MONITOR_LAST)
-         || setting->enum_idx == MENU_ENUM_LABEL_VIDEO_WINDOWS_ENABLE)
+         || (   setting->enum_idx >= MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY
+             && setting->enum_idx <= MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY_LAST)
+         || setting->enum_idx == MENU_ENUM_LABEL_VIDEO_WINDOWS_ENABLE
+         || setting->enum_idx == MENU_ENUM_LABEL_VIDEO_MENU_FOLLOWS
+         || setting->enum_idx == MENU_ENUM_LABEL_VIDEO_MENU_DISPLAY
+         || setting->enum_idx == MENU_ENUM_LABEL_VIDEO_NOTIFICATIONS_WINDOW)
       video_driver_restore_windows();
 #endif
 
    switch (setting->enum_idx)
    {
+      case MENU_ENUM_LABEL_VIDEO_GPU_INDEX:
+         video_driver_gpu_index_select(video_context_driver_get_api(),
+               *setting->value.target.integer);
+         break;
       case MENU_ENUM_LABEL_VIDEO_SHADERS_ENABLE:
 #if defined(HAVE_CG) || defined(HAVE_GLSL) || defined(HAVE_SLANG) || defined(HAVE_HLSL)
          video_shader_toggle(settings, true);
@@ -10420,6 +11153,37 @@ static void general_write_handler(rarch_setting_t *setting)
          /* Push the new policy to the active SSL backend so it takes
           * effect on the next HTTPS connection without a restart. */
          ssl_socket_set_verify_mode(*setting->value.target.unsigned_integer);
+         break;
+#endif
+#ifdef HAVE_SMBCLIENT
+      case MENU_ENUM_LABEL_SMB_CLIENT_SERVER:
+      case MENU_ENUM_LABEL_SMB_CLIENT_SHARE:
+      case MENU_ENUM_LABEL_SMB_CLIENT_SUBDIR:
+      case MENU_ENUM_LABEL_SMB_CLIENT_USERNAME:
+      case MENU_ENUM_LABEL_SMB_CLIENT_PASSWORD:
+      case MENU_ENUM_LABEL_SMB_CLIENT_WORKGROUP:
+      case MENU_ENUM_LABEL_SMB_CLIENT_REALM:
+      case MENU_ENUM_LABEL_SMB_CLIENT_KDC:
+      case MENU_ENUM_LABEL_SMB_CLIENT_AUTH_MODE:
+      case MENU_ENUM_LABEL_SMB_CLIENT_NUM_CONTEXTS:
+      case MENU_ENUM_LABEL_SMB_CLIENT_TIMEOUT:
+      case MENU_ENUM_LABEL_SMB_CLIENT_READAHEAD:
+         /* the client keeps copies of the numbers */
+         retroarch_smb_init();
+         break;
+#endif
+#ifdef HAVE_NFSCLIENT
+      case MENU_ENUM_LABEL_NFS_CLIENT_SERVER:
+      case MENU_ENUM_LABEL_NFS_CLIENT_EXPORT:
+      case MENU_ENUM_LABEL_NFS_CLIENT_TIMEOUT:
+      case MENU_ENUM_LABEL_NFS_CLIENT_NUM_CONTEXTS:
+      case MENU_ENUM_LABEL_NFS_CLIENT_PORT:
+      case MENU_ENUM_LABEL_NFS_CLIENT_MOUNT_PORT:
+      case MENU_ENUM_LABEL_NFS_CLIENT_VERSION:
+      case MENU_ENUM_LABEL_NFS_CLIENT_READAHEAD:
+         /* the client keeps copies of the numbers, and connections
+          * made with the old settings */
+         retroarch_nfs_init();
          break;
 #endif
 #ifndef HAVE_LAKKA
@@ -10839,6 +11603,9 @@ static void general_write_handler(rarch_setting_t *setting)
          break;
       case MENU_ENUM_LABEL_INPUT_MAX_USERS:
          command_event(CMD_EVENT_CONTROLLER_INIT, NULL);
+         /* a player past Max Users plays Auto: placed again */
+         if (input_config_plays_as_active())
+            input_autoconfigure_reallocate_ports(MAX_USERS);
          break;
 #ifdef ANDROID
       case MENU_ENUM_LABEL_INPUT_SELECT_PHYSICAL_KEYBOARD:
@@ -10970,6 +11737,18 @@ static void general_write_handler(rarch_setting_t *setting)
             }
          }
          break;
+#ifdef HAVE_COCOATOUCH
+      case MENU_ENUM_LABEL_VIDEO_IOS_MARGIN_LEFT:
+      case MENU_ENUM_LABEL_VIDEO_IOS_MARGIN_RIGHT:
+      case MENU_ENUM_LABEL_VIDEO_IOS_MARGIN_TOP:
+      case MENU_ENUM_LABEL_VIDEO_IOS_MARGIN_BOTTOM:
+         {
+            /* ui_cocoatouch.m */
+            void cocoa_request_layout(void);
+            cocoa_request_layout();
+         }
+         break;
+#endif
       case MENU_ENUM_LABEL_SCREEN_ORIENTATION:
 #ifndef ANDROID
          /* FIXME: Changing at runtime on Android causes setting to somehow be incremented again, many times */
@@ -11670,11 +12449,47 @@ static void update_streaming_url_write_handler(rarch_setting_t *setting)
    recording_driver_update_streaming_url();
 }
 
+static void setting_record_buffer_range(rarch_setting_t *setting)
+{
+   settings_t *settings = config_get_ptr();
+   const record_driver_t *driver;
+   if (!setting || !settings)
+      return;
+   driver = recording_driver_find(settings->arrays.record_driver);
+   if (recording_is_native_gpu(driver))
+   {
+      setting->min = recording_native_buffer_min(driver->ident);
+      setting->max = RECORD_GPU_QUEUE_SLOTS;
+      setting->step = 1;
+      setting->offset_by = (unsigned)setting->min;
+      setting->default_value.unsigned_integer = 4;
+      setting_uint_set(setting, recording_native_buffer_count(driver->ident,
+               setting_uint_get(setting)));
+   }
+   else
+   {
+      setting->min = MIN_VIDEO_RECORD_FIFO_FRAMES;
+      setting->max = MAX_VIDEO_RECORD_FIFO_FRAMES;
+      setting->step = 4;
+      setting->offset_by = MIN_VIDEO_RECORD_FIFO_FRAMES;
+      setting->default_value.unsigned_integer = DEFAULT_VIDEO_RECORD_FIFO_FRAMES;
+      if (setting_uint_get(setting) < MIN_VIDEO_RECORD_FIFO_FRAMES)
+         setting_uint_set(setting, MIN_VIDEO_RECORD_FIFO_FRAMES);
+   }
+}
+
 static void record_driver_write_handler(rarch_setting_t *setting)
 {
    /* Force the recording settings page to rebuild so that
     * driver-specific items are shown/hidden immediately. */
    struct menu_state *menu_st = menu_state_get_ptr();
+   settings_t *settings       = config_get_ptr();
+   setting_record_buffer_range(menu_setting_find_enum(
+            MENU_ENUM_LABEL_VIDEO_RECORD_FIFO_FRAMES));
+   if (settings && recording_driver_can_stream(settings->arrays.record_driver)
+         && !recording_driver_streaming_mode_supported(
+            settings->arrays.record_driver, settings->uints.streaming_mode))
+      settings->uints.streaming_mode = STREAMING_MODE_CUSTOM;
    menu_st->flags |= MENU_ST_FLAG_PREVENT_POPULATE
                     | MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
 }
@@ -12453,6 +13268,8 @@ static void settings_list_add_desc(
                (enum ui_setting_type)d->ui_type;
       if (d->values)
          MENU_SETTINGS_LIST_CURRENT_ADD_VALUES(list, list_info, d->values);
+      if (d->name_enum == MENU_ENUM_LABEL_VIDEO_RECORD_FIFO_FRAMES)
+         setting_record_buffer_range(&(*list)[list_info->index - 1]);
    }
 }
 
@@ -13283,6 +14100,13 @@ static const setting_desc_t vid_desc_3[] = {
 };
 #endif
 
+#ifdef HAVE_VULKAN_CUSTOM_DRIVER
+static const setting_desc_t vulkan_driver_desc[] = {
+/* GENERATED: rows come from settings_def_vulkan_driver_path.h in order. */
+#include "../settings/settings_def_vulkan_driver_path.h"
+};
+#endif
+
 #ifdef HAVE_D3D10
 static const setting_desc_t vid_desc_4[] = {
 /* GENERATED: rows come from settings_def_gpu_index_d3d10.h in order. */
@@ -13503,6 +14327,10 @@ static const setting_desc_t upscaler_desc[] = {
 #include "../settings/settings_def_video_upscaler.h"
 };
 #endif
+
+static const setting_desc_t video_screens_desc[] = {
+#include "../settings/settings_def_video_screens.h"
+};
 
 static const setting_desc_t headset_desc[] = {
 /* GENERATED: rows come from settings_def_video_headset.h in order. */
@@ -15086,9 +15914,9 @@ static void settings_build_core(
 
          unsigned i, listing = 0;
 #ifndef HAVE_DYNAMIC
-         struct bool_entry bool_entries[11];
+         struct bool_entry bool_entries[12];
 #else
-         struct bool_entry bool_entries[10];
+         struct bool_entry bool_entries[11];
 #endif
          START_GROUP(list, list_info, &group_info,
                msg_hash_to_str(MENU_ENUM_LABEL_VALUE_CORE_SETTINGS), parent_group);
@@ -15179,6 +16007,12 @@ static void settings_build_core(
             bool_entries[listing].flags      |= SD_FLAG_DEFAULT_VALUE;
          listing++;
 #endif
+         bool_entries[listing].target         = &settings->bools.core_firmware_notification_enable;
+         bool_entries[listing].name_enum_idx  = MENU_ENUM_LABEL_CORE_FIRMWARE_NOTIFICATION_ENABLE;
+         bool_entries[listing].SHORT_enum_idx = MENU_ENUM_LABEL_VALUE_CORE_FIRMWARE_NOTIFICATION_ENABLE;
+         bool_entries[listing].flags          = SD_FLAG_DEFAULT_VALUE;
+         listing++;
+
          /* Iterate the filled count, not the array capacity:
           * the capacities above are upper bounds and iterating
           * ARRAY_SIZE registered one setting from uninitialized
@@ -16147,7 +16981,7 @@ static void settings_build_cheat_search(
 }
 
 #ifdef HAVE_VIDEO_WINDOWS
-/* Screens 2 and up: where each one goes, and on which display */
+/* Each screen's display, then the menu's */
 static void setting_append_list_video_screen_windows(
       settings_t *settings,
       rarch_setting_t **list, rarch_setting_info_t *list_info,
@@ -16156,33 +16990,41 @@ static void setting_append_list_video_screen_windows(
       const char *parent_group)
 {
    unsigned screen;
-   for (screen = 1; screen < RETRO_VIDEO_VIEWS_MAX; screen++)
+   for (screen = 0; screen < RETRO_VIDEO_VIEWS_MAX; screen++)
    {
       char name[64];
       char label[64];
 
       snprintf(name, sizeof(name),
-            MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_MODE_STR, screen + 1);
+            MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY_STR, screen + 1);
       snprintf(label, sizeof(label), msg_hash_to_str(
-               MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_WINDOW_MODE), screen + 1);
-      CONFIG_UINT_ALT(
+               MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_DISPLAY), screen + 1);
+      CONFIG_STRING_ALT(
             list, list_info,
-            &settings->uints.video_screen_window_mode[screen],
+            settings->arrays.video_screen_display[screen],
+            sizeof(settings->arrays.video_screen_display[screen]),
             name,
             label,
-            VIDEO_WINDOW_SEPARATE,
+            "",
             group_info,
             subgroup_info,
             parent_group,
             general_write_handler,
             general_read_handler);
+      /* Values from the platform's list, as the theme row has its own */
+      (*list)[list_info->index - 1].type         = ST_STRING_OPTIONS;
+      (*list)[list_info->index - 1].ui_type      = ST_UI_TYPE_STRING_COMBOBOX;
+      (*list)[list_info->index - 1].aux.values   = setting_video_screen_display_list;
       (*list)[list_info->index - 1].index_offset = screen;
-      SETTINGS_ACTION_SET(ok, &(*list)[list_info->index - 1], &setting_action_ok_uint)
-      SETTINGS_ACTION_SET(repr, &(*list)[list_info->index - 1], &setting_get_string_representation_video_screen_window_mode)
-      menu_settings_list_current_add_range(list, list_info, 0, VIDEO_WINDOW_HIDDEN, 1.0, true, true);
+      SETTINGS_ACTION_SET(left, &(*list)[list_info->index - 1], &setting_string_action_left_video_screen_display)
+      SETTINGS_ACTION_SET(right, &(*list)[list_info->index - 1], &setting_string_action_right_video_screen_display)
+      SETTINGS_ACTION_SET(ok, &(*list)[list_info->index - 1], &setting_string_action_ok_video_screen_display)
+      SETTINGS_ACTION_SET(repr, &(*list)[list_info->index - 1], &setting_get_string_representation_video_screen_display)
       MENU_SETTINGS_LIST_CURRENT_ADD_ENUM_IDX_PTR(list, list_info,
-            (enum msg_hash_enums)(MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_MODE + screen));
+            (enum msg_hash_enums)(MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY + screen));
 
+      if (!screen)
+         continue;
       snprintf(name, sizeof(name),
             MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_MONITOR_STR, screen + 1);
       snprintf(label, sizeof(label), msg_hash_to_str(
@@ -16208,6 +17050,26 @@ static void setting_append_list_video_screen_windows(
       MENU_SETTINGS_LIST_CURRENT_ADD_ENUM_IDX_PTR(list, list_info,
             (enum msg_hash_enums)(MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_MONITOR + screen));
    }
+
+   CONFIG_STRING(
+         list, list_info,
+         settings->arrays.video_menu_display,
+         sizeof(settings->arrays.video_menu_display),
+         MENU_ENUM_LABEL_VIDEO_MENU_DISPLAY,
+         MENU_ENUM_LABEL_VALUE_VIDEO_MENU_DISPLAY,
+         "",
+         group_info,
+         subgroup_info,
+         parent_group,
+         general_write_handler,
+         general_read_handler);
+   (*list)[list_info->index - 1].type       = ST_STRING_OPTIONS;
+   (*list)[list_info->index - 1].ui_type    = ST_UI_TYPE_STRING_COMBOBOX;
+   (*list)[list_info->index - 1].aux.values = setting_video_menu_display_list;
+   SETTINGS_ACTION_SET(left, &(*list)[list_info->index - 1], &setting_string_action_left_video_screen_display)
+   SETTINGS_ACTION_SET(right, &(*list)[list_info->index - 1], &setting_string_action_right_video_screen_display)
+   SETTINGS_ACTION_SET(ok, &(*list)[list_info->index - 1], &setting_string_action_ok_video_screen_display)
+   SETTINGS_ACTION_SET(repr, &(*list)[list_info->index - 1], &setting_get_string_representation_video_screen_display)
 }
 #endif
 
@@ -16264,6 +17126,11 @@ static void settings_build_video(
 
             ADD_DESC(vid_desc_3);
          }
+#endif
+#ifdef HAVE_VULKAN_CUSTOM_DRIVER
+         /* Any video driver: HW cores force Vulkan under gl too */
+         if (vulkan_custom_driver_supported())
+            ADD_DESC(vulkan_driver_desc);
 #endif
 
 #ifdef HAVE_D3D10
@@ -16511,6 +17378,7 @@ static void settings_build_video(
          setting_append_list_video_screen_windows(settings, list, list_info,
                &group_info, &subgroup_info, parent_group);
 #endif
+         setting_append_list_video_screen_settings(list, list_info, parent_group);
 
          END_SUB_GROUP(list, list_info, parent_group);
 
@@ -17125,6 +17993,8 @@ static void settings_build_recording(
             update_streaming_url_write_handler,
             general_read_handler);
             SETTINGS_ACTION_SET(ok, &(*list)[list_info->index - 1], &setting_action_ok_uint)
+            SETTINGS_ACTION_SET(left, &(*list)[list_info->index - 1], &setting_uint_action_left_streaming_mode)
+            SETTINGS_ACTION_SET(right, &(*list)[list_info->index - 1], &setting_uint_action_right_streaming_mode)
             SETTINGS_ACTION_SET(repr, &(*list)[list_info->index - 1], &setting_get_string_representation_streaming_mode)
          menu_settings_list_current_add_range(list, list_info, 0, STREAMING_MODE_CUSTOM, 1, true, true);
 
@@ -19486,7 +20356,7 @@ static void settings_build_smbclient(
          &group_info,
          &subgroup_info,
          parent_group,
-         NULL,
+         general_write_handler,
          NULL);
       SETTINGS_DATA_LIST_CURRENT_ADD_FLAGS(list, list_info, SD_FLAG_ALLOW_INPUT);
 
@@ -19500,7 +20370,7 @@ static void settings_build_smbclient(
          &group_info,
          &subgroup_info,
          parent_group,
-         NULL,
+         general_write_handler,
          NULL);
       SETTINGS_DATA_LIST_CURRENT_ADD_FLAGS(list, list_info, SD_FLAG_ALLOW_INPUT);
 
@@ -19514,7 +20384,7 @@ static void settings_build_smbclient(
          &group_info,
          &subgroup_info,
          parent_group,
-         NULL,
+         general_write_handler,
          NULL);
       SETTINGS_DATA_LIST_CURRENT_ADD_FLAGS(list, list_info, SD_FLAG_ALLOW_INPUT);
 
@@ -19528,7 +20398,7 @@ static void settings_build_smbclient(
          &group_info,
          &subgroup_info,
          parent_group,
-         NULL,
+         general_write_handler,
          NULL);
       SETTINGS_DATA_LIST_CURRENT_ADD_FLAGS(list, list_info, SD_FLAG_ALLOW_INPUT);
 
@@ -19542,7 +20412,7 @@ static void settings_build_smbclient(
          &group_info,
          &subgroup_info,
          parent_group,
-         NULL,
+         general_write_handler,
          NULL);
       SETTINGS_DATA_LIST_CURRENT_ADD_FLAGS(list, list_info, SD_FLAG_ALLOW_INPUT);
       SETTINGS_ACTION_SET(repr, &(*list)[list_info->index - 1], setting_get_string_representation_smb_password)
@@ -19557,7 +20427,7 @@ static void settings_build_smbclient(
          &group_info,
          &subgroup_info,
          parent_group,
-         NULL,
+         general_write_handler,
          NULL);
       SETTINGS_DATA_LIST_CURRENT_ADD_FLAGS(list, list_info, SD_FLAG_ALLOW_INPUT);
 
@@ -19573,7 +20443,7 @@ static void settings_build_smbclient(
    CONFIG_STRING(list, list_info, settings->arrays.field,                \
          sizeof(settings->arrays.field), MENU_ENUM_LABEL_##T,            \
          MENU_ENUM_LABEL_VALUE_##T, "", &group_info, &subgroup_info,     \
-         parent_group, NULL, NULL);                                      \
+         parent_group, general_write_handler, NULL);                     \
    SETTINGS_DATA_LIST_CURRENT_ADD_FLAGS(list, list_info, SD_FLAG_ALLOW_INPUT)
 #define NFS_UINT(field, T, def, mn, mx)                                  \
    CONFIG_UINT(list, list_info, &settings->uints.field,                  \
@@ -19651,6 +20521,54 @@ static void settings_build_desc_group(
       settings_list_add_desc(list, list_info, settings,
             e->rows, e->count, &group_info, &subgroup_info, parent_group);
    GROUP_END();
+}
+
+static bool setting_append_list_video_screen_settings(
+      rarch_setting_t **list, rarch_setting_info_t *list_info,
+      const char *parent_group)
+{
+   settings_t *settings = config_get_ptr();
+   rarch_setting_group_info_t group_info;
+   rarch_setting_group_info_t subgroup_info;
+   unsigned first = list_info->index;
+   int i;
+   group_info.name = msg_hash_to_str(MENU_ENUM_LABEL_VALUE_VIDEO_SETTINGS);
+   subgroup_info.name = "Stereo 3D & Screens";
+   CONFIG_UINT(list, list_info, &menu_state_get_ptr()->video_screen_selected,
+         MENU_ENUM_LABEL_VIDEO_SCREEN_SELECTED,
+         MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_SELECTED, 0,
+         &group_info, &subgroup_info, parent_group,
+         setting_video_screen_change, setting_video_screen_read);
+   settings_list_add_desc(list, list_info, settings, video_screens_desc + 1,
+         ARRAY_SIZE(video_screens_desc) - 1, &group_info, &subgroup_info,
+         parent_group);
+   for (i = first; i < list_info->index; i++)
+   {
+      rarch_setting_t *setting = &(*list)[i];
+      SETTINGS_ACTION_SET(read, setting, setting_video_screen_read)
+      SETTINGS_ACTION_SET(change, setting, setting_video_screen_change)
+      if (setting->enum_idx == MENU_ENUM_LABEL_VIDEO_SCREEN_XR_EDIT)
+      {
+         SETTINGS_ACTION_SET(ok, setting, setting_video_screen_edit)
+         SETTINGS_ACTION_SET(sel, setting, setting_video_screen_edit)
+      }
+      else if (setting->type == ST_ACTION)
+      {
+         SETTINGS_ACTION_SET(ok, setting, setting_video_screen_reset)
+         SETTINGS_ACTION_SET(sel, setting, setting_video_screen_reset)
+      }
+      else
+      {
+         SETTINGS_ACTION_SET(repr, setting, setting_video_screen_repr)
+         SETTINGS_ACTION_SET(left, setting, setting_video_screen_left)
+         SETTINGS_ACTION_SET(right, setting, setting_video_screen_right)
+         SETTINGS_ACTION_SET(ok, setting, setting_video_screen_right)
+         SETTINGS_ACTION_SET(sel, setting, setting_video_screen_right)
+         SETTINGS_ACTION_SET(start, setting, setting_video_screen_start)
+      }
+      setting_video_screen_bind(setting);
+   }
+   return true;
 }
 
 static const settings_build_entry_t settings_build_registry[] = {
@@ -20001,6 +20919,9 @@ static const settings_desc_table_t settings_desc_registry[] = {
 #endif
 #ifdef HAVE_VULKAN
    { vid_desc_3, (uint16_t)ARRAY_SIZE(vid_desc_3) },
+#endif
+#ifdef HAVE_VULKAN_CUSTOM_DRIVER
+   { vulkan_driver_desc, (uint16_t)ARRAY_SIZE(vulkan_driver_desc) },
 #endif
 #ifdef HAVE_D3D10
    { vid_desc_4, (uint16_t)ARRAY_SIZE(vid_desc_4) },

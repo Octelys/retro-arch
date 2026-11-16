@@ -33,6 +33,18 @@
  *    held - nothing is made or read under the playlist directory,
  *    the playlists tab lists nothing - and the release makes the
  *    builtin folder, loads favorites and history, and lists the tab;
+ *  - playlist state slot: an entry run from its Load State list loads
+ *    the slot picked there, over an auto state and with none, and Auto
+ *    loads the auto state with Auto Load State off, though the menu has
+ *    moved on by the time the load reaches the content;
+ *  - core title held: the menu's core title shows the title from
+ *    before a playlist Run or the one after it, nothing in between;
+ *  - menu sound close: a menu sound playing when Close Content is
+ *    confirmed plays on through the staged close and past it - the
+ *    device carried through the driver stage, never stopped, the
+ *    sound not reloaded under itself - and the tone handed over whole;
+ *  - screenshot history: a screenshot is added to the image history,
+ *    with or without the imageviewer core;
  *  - quit waits for a save: a quit from the frame loop while a state
  *    is being written returns to the loop at once, which presents
  *    frames - the core not run - until the state is written, and only
@@ -45,6 +57,7 @@
  */
 
 #include <stdint.h>
+#include <math.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -455,6 +468,7 @@ static void lane_audio_kept(void)
    struct load_frame log[LOAD_FRAMES];
    audio_driver_t saved = audio_null;
    unsigned had         = failures;
+   bool time_stretch    = config_get_ptr()->bools.audio_time_stretch;
    unsigned n;
 
    audio_null.init               = kept_init;
@@ -482,6 +496,25 @@ static void lane_audio_kept(void)
          "across the load the audio device was closed %u and opened %u time(s)",
          kept_frees, kept_opens);
 
+   /* Time stretch keeps the rate from changing in place: the device
+    * is set aside through the driver stage and taken back instead. */
+   kept_opens = kept_frees = 0;
+   configuration_set_bool(config_get_ptr(),
+         config_get_ptr()->bools.audio_time_stretch, true);
+   open_menu();
+   CHECK(task_push_load_contentless_core_from_menu(core_path),
+         "the time-stretch load was not started");
+   n = run_load(log, LOAD_FRAMES);
+   configuration_set_bool(config_get_ptr(),
+         config_get_ptr()->bools.audio_time_stretch, time_stretch);
+   CHECK(n < LOAD_FRAMES && core_is_up(),
+         "the time-stretch load did not bring the core up within %u frames",
+         LOAD_FRAMES);
+   CHECK(kept_opens == 0 && kept_frees == 0
+         && audio_state_get_ptr()->context_audio_data == &kept_token,
+         "with time stretch, across the load the audio device was closed"
+         " %u and opened %u time(s)", kept_frees, kept_opens);
+
    kept_opens = kept_frees = 0;
    putenv((char*)"RETROARCH_AUDIO_KEEP=0");
    open_menu();
@@ -502,6 +535,227 @@ static void lane_audio_kept(void)
       fprintf(stderr, "[pass] audio kept lane: the device stays open across"
             " a content load; with keeping off it is closed and opened\n");
 }
+
+#ifdef HAVE_AUDIOMIXER
+/* ------------------------------------------------------------------ */
+/* Lane: menu sound through a confirmed Close Content                  */
+/* ------------------------------------------------------------------ */
+
+/* The null driver gets a device that records what it is handed, and
+ * whether it was running when it was handed it. */
+#define TAP_MAX (48000 * 2 * 4)
+static int16_t  tap_buf[TAP_MAX];
+static size_t   tap_len;
+static unsigned tap_stops, tap_writes_stopped;
+static bool     tap_running;
+static int      tap_token;
+static void *tap_init(const char *device, unsigned rate, unsigned latency,
+      unsigned *new_rate)
+{
+   (void)device; (void)latency;
+   *new_rate   = rate;
+   tap_running = true;
+   return &tap_token;
+}
+static ssize_t tap_write(void *data, const void *buf, size_t len)
+{
+   size_t n = len / sizeof(int16_t);
+   (void)data;
+   if (!tap_running)
+      tap_writes_stopped++;
+   if (tap_len + n > TAP_MAX)
+      n = TAP_MAX - tap_len;
+   memcpy(tap_buf + tap_len, buf, n * sizeof(int16_t));
+   tap_len += n;
+   return (ssize_t)len;
+}
+static bool tap_stop(void *data)
+{
+   (void)data;
+   tap_stops++;
+   tap_running = false;
+   return true;
+}
+static bool tap_start(void *data, bool shutdown)
+{
+   (void)data; (void)shutdown;
+   tap_running = true;
+   return true;
+}
+static bool tap_alive(void *data) { (void)data; return tap_running; }
+static void tap_nonblock(void *data, bool state) { (void)data; (void)state; }
+static bool tap_float(void *data) { (void)data; return false; }
+static void tap_free(void *data) { (void)data; tap_running = false; }
+
+/* One second of a 440 Hz stereo tone, ramped in and out over 10 ms */
+#define TONE_RATE 48000
+#define TONE_AMP  12000.0
+static bool write_tone(const char *path)
+{
+   static const unsigned frames = TONE_RATE;
+   unsigned char hdr[44];
+   FILE *f;
+   unsigned i;
+
+   memcpy(hdr, "RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x02\0"
+         "\0\0\0\0\0\0\0\0\x04\0\x10\0data\0\0\0\0", 44);
+#define PUT32(o, v) do { uint32_t v_ = (uint32_t)(v); hdr[(o)] = v_ & 0xff; \
+   hdr[(o) + 1] = (v_ >> 8) & 0xff; hdr[(o) + 2] = (v_ >> 16) & 0xff; \
+   hdr[(o) + 3] = (v_ >> 24) & 0xff; } while (0)
+   PUT32(4,  36 + frames * 4);
+   PUT32(24, TONE_RATE);
+   PUT32(28, TONE_RATE * 4);
+   PUT32(40, frames * 4);
+#undef PUT32
+   if (!(f = fopen(path, "wb")))
+      return false;
+   fwrite(hdr, 1, sizeof(hdr), f);
+   for (i = 0; i < frames; i++)
+   {
+      unsigned char s[4];
+      double env  = 1.0;
+      int16_t v;
+      if (i < 480)
+         env = i / 480.0;
+      else if (frames - i < 480)
+         env = (frames - i) / 480.0;
+      v    = (int16_t)(TONE_AMP * env
+            * sin(2.0 * 3.14159265358979 * 440.0 * i / TONE_RATE));
+      s[0] = s[2] = (unsigned char)((uint16_t)v & 0xff);
+      s[1] = s[3] = (unsigned char)(((uint16_t)v >> 8) & 0xff);
+      fwrite(s, 1, sizeof(s), f);
+   }
+   fclose(f);
+   return true;
+}
+
+/* The largest step between neighbouring left samples from @from on:
+ * the tone moves at most 2*pi*440/48000*TONE_AMP (~690) per sample,
+ * a cut or a splice moves much further. */
+static int tap_worst_step(size_t from)
+{
+   size_t i;
+   int worst = 0;
+   for (i = from + 2; i < tap_len; i += 2)
+   {
+      int d = tap_buf[i] - tap_buf[i - 2];
+      if (d < 0)
+         d = -d;
+      if (d > worst)
+         worst = d;
+   }
+   return worst;
+}
+
+/* A menu sound playing when Close Content is confirmed keeps playing
+ * through the staged close: the device is not stopped while the menu
+ * feeds it between the stages, and what it is handed is the tone,
+ * whole, on both sides of the driver stage. */
+static void lane_menu_sound_close(void)
+{
+   audio_driver_t saved       = audio_null;
+   settings_t *settings       = config_get_ptr();
+   struct menu_state *menu_st = menu_state_get_ptr();
+   bool menu_audio            = settings->bools.audio_enable_menu;
+   bool menu_audio_ok         = settings->bools.audio_enable_menu_ok;
+   char assets[sizeof(settings->paths.directory_assets)];
+   char sounds[600], tone[640];
+   size_t i, last_heard = 0, switch_end = 0;
+   unsigned n;
+   unsigned had = failures;
+   int worst;
+
+   audio_null.init               = tap_init;
+   audio_null.write              = tap_write;
+   audio_null.stop               = tap_stop;
+   audio_null.start              = tap_start;
+   audio_null.alive              = tap_alive;
+   audio_null.set_nonblock_state = tap_nonblock;
+   audio_null.free               = tap_free;
+   audio_null.use_float          = tap_float;
+   configuration_set_bool(settings, settings->bools.audio_enable_menu, true);
+   configuration_set_bool(settings, settings->bools.audio_enable_menu_ok, true);
+   command_event(CMD_EVENT_AUDIO_REINIT, NULL);
+   pump(5);
+
+   /* The tone is the menu's OK sound, found where an install keeps its
+    * sounds and loaded the way the frontend loads them - and loads
+    * them again after every driver stage. */
+   strlcpy(assets, settings->paths.directory_assets, sizeof(assets));
+   strlcpy(settings->paths.directory_assets, harness_dir,
+         sizeof(settings->paths.directory_assets));
+   snprintf(sounds, sizeof(sounds), "%s/sounds", harness_dir);
+   path_mkdir(sounds);
+   snprintf(tone, sizeof(tone), "%s/ok.wav", sounds);
+   CHECK(write_tone(tone), "the tone was not written");
+   audio_driver_load_system_sounds();
+   pump(10);
+
+   open_menu();
+   CHECK(task_push_load_contentless_core_from_menu(core_path),
+         "the load was not started");
+   pump(LOAD_FRAMES);
+   CHECK(core_is_up(), "the load did not go through");
+   open_menu();
+   pump(5);
+
+   /* The OK of the confirmation plays; the confirmed command runs on
+    * the next iteration, as from the dialog. Each frame takes a
+    * display period, so the menu's feed is the device's. */
+   tap_len   = 0;
+   tap_stops = tap_writes_stopped = 0;
+   audio_driver_mixer_play_menu_sound(AUDIO_MIXER_SYSTEM_SLOT_OK);
+   pump(1);
+   retro_sleep(16);
+   menu_st->dialog_st.pending_cmd = CMD_EVENT_CLOSE_CONTENT;
+   for (n = 0; n < 30; n++)
+   {
+      bool was_switching = runloop_is_content_switching();
+      pump(1);
+      if (was_switching && !runloop_is_content_switching())
+         switch_end = tap_len;
+      retro_sleep(16);
+   }
+   CHECK(!runloop_is_content_switching() && switch_end
+         && runloop_state_get_ptr()->current_core_type == CORE_TYPE_DUMMY,
+         "the close did not finish");
+
+   CHECK(tap_stops == 0 && tap_writes_stopped == 0,
+         "the device was stopped %u time(s) across the close, and handed"
+         " %u write(s) while stopped", tap_stops, tap_writes_stopped);
+   worst = tap_worst_step(0);
+   CHECK(worst < 1000,
+         "the sound handed to the device jumps by %d in one sample", worst);
+   for (i = 0; i < tap_len; i += 2)
+      if (tap_buf[i] > 1000 || tap_buf[i] < -1000)
+         last_heard = i;
+   CHECK(last_heard > switch_end,
+         "the sound did not play on past the close"
+         " (last heard at %lu, the close done at %lu)",
+         (unsigned long)last_heard, (unsigned long)switch_end);
+
+   /* Start Core, as the menu would, to leave a core running. */
+   {
+      content_ctx_info_t content_info = {0};
+      CHECK(task_push_start_current_core(&content_info),
+            "Start Core was not started");
+      pump(LOAD_FRAMES);
+   }
+   configuration_set_bool(settings, settings->bools.audio_enable_menu,
+         menu_audio);
+   configuration_set_bool(settings, settings->bools.audio_enable_menu_ok,
+         menu_audio_ok);
+   strlcpy(settings->paths.directory_assets, assets,
+         sizeof(settings->paths.directory_assets));
+   audio_null = saved;
+   command_event(CMD_EVENT_AUDIO_REINIT, NULL);
+   pump(5);
+   remove(tone);
+   rmdir(sounds);
+   if (failures == had)
+      fprintf(stderr, "[pass] menu-sound-close lane\n");
+}
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Lanes: MIDI                                                         */
@@ -1977,7 +2231,33 @@ static bool rr_ask(command_t *cmd,
    rr_replies  = rr_in_command_replies = 0;
    rr_reply[0] = '\0';
    ok          = rr_run(cmd, handler, arg);
-   for (n = 0; n < 300 && !rr_replies; n++)
+   for (n = 0; n < 5000 && !rr_replies; n++)
+      pump(1);
+   return ok;
+}
+
+/* Frames a reply has to turn up in once the load it answers is
+ * through: it is sent from the same frame. */
+#define RR_REPLY_GRACE_FRAMES 30
+
+/* As rr_ask(), for a command that must not be answered: waits for the
+ * load the command started to be through, then a grace period for a
+ * reply that should not come. rr_ask() waited out its whole bound -
+ * 5000 frames, 83 s at 60 Hz - for the reply that never comes. */
+static bool rr_ask_unanswered(command_t *cmd,
+      bool (*handler)(command_t *cmd, const char *arg), const char *arg)
+{
+   unsigned n;
+   bool ok;
+   rr_replies  = rr_in_command_replies = 0;
+   rr_reply[0] = '\0';
+   ok          = rr_run(cmd, handler, arg);
+   for (n = 0; n < 5000
+         && (   runloop_is_content_switching()
+             || (content_state_get_ptr()->flags
+                & CONTENT_ST_FLAG_DEFERRED_LOAD_PENDING)); n++)
+      pump(1);
+   for (n = 0; n < RR_REPLY_GRACE_FRAMES && !rr_replies; n++)
       pump(1);
    return ok;
 }
@@ -2163,6 +2443,570 @@ static void lane_state_slot_reply(void)
       fprintf(stderr, "[pass] state-slot-reply lane\n");
 }
 
+#ifdef HAVE_DYNAMIC
+/* ------------------------------------------------------------------ */
+/* Lane: state load latency                                            */
+/* ------------------------------------------------------------------ */
+
+/* A Load State is never turned away by a task that is not a state
+ * task. Screenshots, Bluetooth and Wi-Fi tasks were TASK_TYPE_BLOCKING,
+ * which made the queue refuse every save and load pushed while one ran:
+ * the hotkey did nothing, silently, for as long as a save's thumbnail
+ * or a 4K capture took to encode, or a ten-second Bluetooth scan; and
+ * one pressed while a save was still writing was dropped as well. Each
+ * case fires Load State as the hotkey does and runs frames until the
+ * core has unserialized the state; a load is a few frames' work. */
+#define STATE_LOAD_MAX_FRAMES 30
+
+static void core_mark_state(unsigned mark)
+{
+   dylib_t lib = runloop_state_get_ptr()->lib_handle;
+   void (*fn)(unsigned) = lib
+      ? (void (*)(unsigned))dylib_proc(lib, "harness_core_set_state_mark")
+      : NULL;
+   if (fn)
+      fn(mark);
+}
+
+static bool state_any_task(retro_task_t *task, void *user_data)
+{
+   (void)user_data;
+   return !(task_get_flags(task) & RETRO_TASK_FLG_FINISHED);
+}
+
+static bool state_tasks_settle(void)
+{
+   unsigned i;
+   for (i = 0; i < 5000; i++)
+   {
+      if (     !content_save_state_in_progress(NULL)
+            && !content_load_state_in_progress(NULL))
+         return true;
+      pump(1);
+   }
+   return false;
+}
+
+/* Saves the running core marked @mark and waits the save out; the
+ * save's own callback may leave a thumbnail screenshot running. */
+static bool state_save_marked(unsigned mark)
+{
+   core_mark_state(mark);
+   if (!command_event(CMD_EVENT_SAVE_STATE, NULL))
+      return false;
+   return state_tasks_settle();
+}
+
+/* Fires Load State and runs frames until the core has unserialized
+ * @mark; the frames taken, or 0 when it did not land in the bound. */
+static unsigned state_load_frames(unsigned mark)
+{
+   unsigned n;
+   /* the core runs on with another mark until the load lands */
+   core_mark_state((mark + 1) & 0xff);
+   command_event(CMD_EVENT_LOAD_STATE, NULL);
+   for (n = 1; n <= STATE_LOAD_MAX_FRAMES; n++)
+   {
+      pump(1);
+      if (core_export_ul("harness_core_state_loaded") == mark)
+         return n;
+   }
+   return 0;
+}
+
+static void lane_state_load_latency(void)
+{
+   settings_t *settings = config_get_ptr();
+   bool compress        = settings->bools.savestate_file_compression;
+   bool thumbnail       = settings->bools.savestate_thumbnail_enable;
+   char path[PATH_MAX_LENGTH];
+   unsigned had = failures, worst = 0, frames, round;
+   static const char *const cases[] = {
+      "after the save", "beside the save's thumbnail",
+      "beside a screenshot", "after a video reinit",
+      "straight after Save State" };
+
+   run_harness_core();
+   /* threaded tasks and compressed states, as most users run */
+   configuration_set_bool(settings,
+         settings->bools.threaded_data_runloop_enable, true);
+   task_queue_set_threaded();
+   configuration_set_bool(settings,
+         settings->bools.savestate_file_compression, true);
+   runloop_get_current_savestate_path(path, sizeof(path));
+   remove(path);
+   pump(4);
+
+   for (round = 0; round < 3; round++)
+   {
+      unsigned c;
+      for (c = 0; c < 5; c++)
+      {
+         unsigned mark = 0x10 + round * 5 + c;
+         configuration_set_bool(settings,
+               settings->bools.savestate_thumbnail_enable, c == 1);
+         /* the last: Load State in the same frame as Save State, the
+          * save still writing - held behind it, it loads what it wrote */
+         if (c == 4)
+         {
+            core_mark_state(mark);
+            CHECK(command_event(CMD_EVENT_SAVE_STATE, NULL),
+                  "the save was not taken (%s)", cases[c]);
+         }
+         else
+            CHECK(state_save_marked(mark), "the save did not finish (%s)",
+                  cases[c]);
+#ifdef HAVE_SCREENSHOTS
+         if (c == 2)
+         {
+            /* taken on the next frame: the load is fired while it runs */
+            command_event(CMD_EVENT_TAKE_SCREENSHOT, NULL);
+            pump(1);
+         }
+#endif
+         if (c == 3)
+         {
+            command_event(CMD_EVENT_REINIT, NULL);
+            pump(1);
+         }
+         frames = state_load_frames(mark);
+         CHECK(frames, "Load State %s did not land within %u frames",
+               cases[c], STATE_LOAD_MAX_FRAMES);
+         if (frames > worst)
+            worst = frames;
+         /* the screenshot and thumbnail out of the way of the next save */
+         {
+            task_finder_data_t find;
+            unsigned i;
+            find.func     = state_any_task;
+            find.userdata = NULL;
+            for (i = 0; i < 600 && task_queue_find(&find); i++)
+               pump(1);
+         }
+         state_tasks_settle();
+      }
+   }
+
+   remove(path);
+   configuration_set_bool(settings,
+         settings->bools.savestate_thumbnail_enable, thumbnail);
+   configuration_set_bool(settings,
+         settings->bools.savestate_file_compression, compress);
+   configuration_set_bool(settings,
+         settings->bools.threaded_data_runloop_enable, false);
+   task_queue_unset_threaded();
+   pump(2);
+   if (failures == had)
+      fprintf(stderr, "[pass] state-load-latency lane (worst %u frames)\n",
+            worst);
+}
+#endif
+
+#if defined(HAVE_DYNAMIC) && defined(HAVE_SCREENSHOTS)
+/* ------------------------------------------------------------------ */
+/* Lane: screenshots held                                              */
+/* ------------------------------------------------------------------ */
+
+/* A screenshot asked for while another is encoding is held and taken
+ * after it. Turned away, the Screenshot hotkey did nothing while a
+ * save's thumbnail encoded, and a second screenshot straight after the
+ * first was lost. */
+static void lane_screenshots_held(const char *dir)
+{
+   settings_t *settings = config_get_ptr();
+   bool thumbnail       = settings->bools.savestate_thumbnail_enable;
+   char a[600], b[600], c[600], state[PATH_MAX_LENGTH], thumb[PATH_MAX_LENGTH + 8];
+   unsigned had = failures, i;
+   task_finder_data_t find;
+
+   run_harness_core();
+   configuration_set_bool(settings,
+         settings->bools.threaded_data_runloop_enable, true);
+   task_queue_set_threaded();
+   pump(4);
+   snprintf(a, sizeof(a), "%s/held_shot_a.png", dir);
+   snprintf(b, sizeof(b), "%s/held_shot_b.png", dir);
+   snprintf(c, sizeof(c), "%s/held_shot_c.png", dir);
+   remove(a);
+   remove(b);
+   remove(c);
+   find.func     = state_any_task;
+   find.userdata = NULL;
+
+   /* the second while the first is still encoding */
+   CHECK(take_screenshot(dir, a, false, false, true, true),
+         "the first screenshot was not taken");
+   CHECK(take_screenshot(dir, b, false, false, true, true),
+         "a screenshot asked for while one encodes was turned away");
+   for (i = 0; i < 600 && task_queue_find(&find); i++)
+      pump(1);
+   CHECK(path_is_valid(a) && path_is_valid(b),
+         "both screenshots were not written (%d, %d)",
+         path_is_valid(a), path_is_valid(b));
+
+   /* the hotkey's screenshot behind a save's thumbnail */
+   configuration_set_bool(settings,
+         settings->bools.savestate_thumbnail_enable, true);
+   runloop_get_current_savestate_path(state, sizeof(state));
+   snprintf(thumb, sizeof(thumb), "%s.png", state);
+   remove(thumb);
+   CHECK(command_event(CMD_EVENT_SAVE_STATE, NULL), "the save was not taken");
+   CHECK(state_tasks_settle(), "the save did not finish");
+   CHECK(take_screenshot(dir, c, false, false, true, true),
+         "a screenshot behind a save's thumbnail was turned away");
+   for (i = 0; i < 600 && task_queue_find(&find); i++)
+      pump(1);
+   CHECK(path_is_valid(c), "the screenshot behind the thumbnail was not written");
+   CHECK(path_is_valid(thumb), "the save's thumbnail was not written");
+
+   remove(a);
+   remove(b);
+   remove(c);
+   remove(thumb);
+   remove(state);
+   configuration_set_bool(settings,
+         settings->bools.savestate_thumbnail_enable, thumbnail);
+   configuration_set_bool(settings,
+         settings->bools.threaded_data_runloop_enable, false);
+   task_queue_unset_threaded();
+   pump(2);
+   if (failures == had)
+      fprintf(stderr, "[pass] screenshots-held lane\n");
+}
+#endif
+
+#ifdef HAVE_DYNAMIC
+/* ------------------------------------------------------------------ */
+/* Lane: state hold full                                               */
+/* ------------------------------------------------------------------ */
+
+static bool queued_message(const char *want);
+
+/* Saves and loads behind the one in flight are held up to a bound;
+ * one past it is turned away, and says so rather than the hotkey
+ * doing nothing. The held ones still run. */
+static void lane_state_hold_full(void)
+{
+   settings_t *settings = config_get_ptr();
+   bool thumbnail       = settings->bools.savestate_thumbnail_enable;
+   char path[PATH_MAX_LENGTH];
+   unsigned had = failures, i, taken = 0;
+
+   run_harness_core();
+   configuration_set_bool(settings,
+         settings->bools.threaded_data_runloop_enable, true);
+   task_queue_set_threaded();
+   configuration_set_bool(settings,
+         settings->bools.savestate_thumbnail_enable, false);
+   runloop_get_current_savestate_path(path, sizeof(path));
+   remove(path);
+   pump(4);
+   CHECK(state_save_marked(0x40), "the first save did not finish");
+
+   queued_message("");
+   /* a save in flight, and six loads in the same frame behind it */
+   CHECK(command_event(CMD_EVENT_SAVE_STATE, NULL), "the save was not taken");
+   for (i = 0; i < 6; i++)
+      if (command_event(CMD_EVENT_LOAD_STATE, NULL))
+         taken++;
+   CHECK(taken > 0 && taken < 6,
+         "%u of 6 loads behind a save were taken, not some", taken);
+   CHECK(queued_message(msg_hash_to_str(MSG_FAILED_TO_LOAD_STATE)),
+         "a load turned away said nothing on screen");
+
+   /* With Increment Save State Index on, the slot moves up before the
+    * save is pushed; a save turned away wrote nothing there, and left
+    * advanced the slot named one the next load found empty. */
+   {
+      bool auto_index = settings->bools.savestate_auto_index;
+      int  slot       = settings->ints.state_slot;
+      configuration_set_bool(settings,
+            settings->bools.savestate_auto_index, true);
+      CHECK(!command_event(CMD_EVENT_SAVE_STATE, NULL),
+            "a save past the hold was taken");
+      CHECK(settings->ints.state_slot == slot,
+            "a save turned away moved the slot from %d to %d",
+            slot, settings->ints.state_slot);
+      configuration_set_bool(settings,
+            settings->bools.savestate_auto_index, auto_index);
+   }
+   CHECK(state_tasks_settle(), "the held loads did not finish");
+
+   remove(path);
+   configuration_set_bool(settings,
+         settings->bools.savestate_thumbnail_enable, thumbnail);
+   configuration_set_bool(settings,
+         settings->bools.threaded_data_runloop_enable, false);
+   task_queue_unset_threaded();
+   pump(2);
+   if (failures == had)
+      fprintf(stderr, "[pass] state-hold-full lane (%u of 6 taken)\n", taken);
+}
+#endif
+
+#if defined(HAVE_DYNAMIC) && defined(HAVE_MENU)
+/* ------------------------------------------------------------------ */
+/* Lane: playlist Load State slot                                      */
+/* ------------------------------------------------------------------ */
+
+static void core_set_state_mark(unsigned mark)
+{
+   dylib_t lib = runloop_state_get_ptr()->lib_handle;
+   void (*fn)(unsigned) = lib
+      ? (void (*)(unsigned))dylib_proc(lib, "harness_core_set_state_mark")
+      : NULL;
+   if (fn)
+      fn(mark);
+}
+
+/* Runs frames until no content load - read ahead or staged - and no
+ * state task is in flight: a load waits out a save still inside the
+ * core, which under a sanitizer takes many frames. */
+static bool load_in_flight(void)
+{
+   return runloop_is_content_switching()
+      || (content_state_get_ptr()->flags & CONTENT_ST_FLAG_DEFERRED_LOAD_PENDING)
+      || state_task_in_flight();
+}
+
+static bool settle(void)
+{
+   unsigned i;
+   for (i = 0; i < 5000 && load_in_flight(); i++)
+      pump(1);
+   pump(2);
+   return !load_in_flight();
+}
+
+/* Saves the running core to @slot, its state marked @mark: retried
+ * across frames while another state task holds the queue. */
+static bool save_marked_slot(unsigned slot, unsigned mark, const char *path)
+{
+   settings_t *settings = config_get_ptr();
+   unsigned i;
+
+   remove(path);
+   core_set_state_mark(mark);
+   configuration_set_int(settings, settings->ints.state_slot, (int)slot);
+   for (i = 0; i < 200 && !path_is_valid(path); i++)
+   {
+      if (!state_task_in_flight() && !runloop_is_content_switching())
+         command_event(CMD_EVENT_SAVE_STATE, NULL);
+      pump(1);
+   }
+   for (i = 0; i < 1000 && state_task_in_flight(); i++)
+      pump(1);
+   return path_is_valid(path) && !state_task_in_flight();
+}
+
+/* Runs the playlist's first entry from its Load State list, OK on
+ * slot @slot as the menu does, and runs the frames of the load. */
+static void playlist_run_from_slot(const char *slot)
+{
+   struct menu_state *menu_st = menu_state_get_ptr();
+
+   menu_st->driver_data->rpl_entry_selection_ptr = 0;
+   CHECK(accept_open_screen(DISPLAYLIST_STATE_SLOT_RUN,
+            MENU_ENUM_LABEL_STATE_SLOT_RUN_STR,
+            MENU_ENUM_LABEL_STATE_SLOT_RUN, "Load State") > 1,
+         "the entry's Load State list is empty");
+   CHECK(accept_press_ok(slot), "no slot %s in the Load State list", slot);
+   CHECK(runloop_is_content_switching(),
+         "OK on a Load State slot did not start a staged load");
+   CHECK(settle() && core_is_up(),
+         "the load from the playlist did not go through");
+}
+
+/* A playlist entry run from its Load State list starts at the slot
+ * picked there - over an auto state, and with no auto state - though
+ * the menu has rebuilt its lists by the time the load reaches the
+ * content. */
+static void lane_playlist_state_slot(void)
+{
+   playlist_config_t cfg;
+   struct playlist_entry entry;
+   content_ctx_info_t info;
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   settings_t *settings        = config_get_ptr();
+   bool auto_load              = settings->bools.savestate_auto_load;
+   char game[600], lpl[600], slot_path[PATH_MAX_LENGTH];
+   char spare_path[PATH_MAX_LENGTH], auto_path[PATH_MAX_LENGTH + 8];
+   FILE *f;
+   unsigned had = failures;
+
+   snprintf(game, sizeof(game), "%s/slots.bin", harness_dir);
+   if ((f = fopen(game, "wb")))
+   {
+      fputs("harness content", f);
+      fclose(f);
+   }
+   memset(&info, 0, sizeof(info));
+   CHECK(settle(), "a load or state task from before is still in flight");
+   open_menu();
+
+   /* Slot 4 holds one state, the auto state another. */
+   CHECK(task_push_load_content_with_new_core_from_menu(core_path, game,
+            &info, CORE_TYPE_PLAIN, NULL, NULL),
+         "the content load was not started");
+   CHECK(settle() && core_is_up()
+         && strstr(path_get(RARCH_PATH_BASENAME), "slots"),
+         "the content load did not go through");
+
+   runloop_get_savestate_path(slot_path,  sizeof(slot_path),  4);
+   runloop_get_savestate_path(spare_path, sizeof(spare_path), 7);
+   snprintf(auto_path, sizeof(auto_path), "%s.auto",
+         runloop_st->name.savestate);
+
+   CHECK(save_marked_slot(4, 0x11, slot_path),
+         "slot 4 was not written to %s", slot_path);
+   CHECK(save_marked_slot(7, 0x22, spare_path),
+         "slot 7 was not written to %s", spare_path);
+   remove(auto_path);
+   CHECK(rename(spare_path, auto_path) == 0, "no auto state at %s", auto_path);
+   configuration_set_int(settings, settings->ints.state_slot, 0);
+   configuration_set_bool(settings, settings->bools.savestate_auto_load, true);
+
+   /* The playlist holds the content, with no slot of its own. */
+   memset(&cfg, 0, sizeof(cfg));
+   snprintf(lpl, sizeof(lpl), "%s/playlists/slots.lpl", harness_dir);
+   playlist_config_set_path(&cfg, lpl);
+   cfg.capacity = 16;
+   CHECK(playlist_init_cached(&cfg), "the playlist was not cached");
+   memset(&entry, 0, sizeof(entry));
+   entry.path      = game;
+   entry.label     = (char*)"slots";
+   entry.core_path = core_path;
+   entry.core_name = (char*)"content_load_harness";
+   CHECK(playlist_get_cached()
+         && playlist_push(playlist_get_cached(), &entry),
+         "the entry was not added to the playlist");
+
+   /* Leave the content, so the entry's run is a new load. */
+   CHECK(task_push_load_contentless_core_from_menu(core_path),
+         "the contentless load was not started");
+   CHECK(settle() && core_is_up(), "the contentless load did not go through");
+
+   playlist_run_from_slot("4");
+   CHECK(core_export("harness_core_state_loaded") == 0x11,
+         "with an auto state, the load started from %s, not slot 4",
+         core_export("harness_core_state_loaded") == 0x22
+         ? "the auto state" : "no state");
+   CHECK(settings->ints.state_slot == 4,
+         "the active slot is %d after starting from slot 4",
+         settings->ints.state_slot);
+
+   /* Auto, picked by name, loads the auto state with Auto Load State
+    * off. */
+   configuration_set_bool(settings, settings->bools.savestate_auto_load, false);
+   CHECK(task_push_load_contentless_core_from_menu(core_path),
+         "the contentless load before Auto was not started");
+   CHECK(settle() && core_is_up(),
+         "the contentless load before Auto did not go through");
+   playlist_run_from_slot("Auto");
+   CHECK(core_export("harness_core_state_loaded") == 0x22,
+         "Auto picked with Auto Load State off started from %s",
+         core_export("harness_core_state_loaded") == 0x11
+         ? "slot 4" : "no state");
+   configuration_set_bool(settings, settings->bools.savestate_auto_load, true);
+
+   /* Again with no auto state to fall back on. */
+   remove(auto_path);
+   CHECK(task_push_load_contentless_core_from_menu(core_path),
+         "the second contentless load was not started");
+   CHECK(settle() && core_is_up(),
+         "the second contentless load did not go through");
+   playlist_run_from_slot("4");
+   CHECK(core_export("harness_core_state_loaded") == 0x11,
+         "without an auto state, the load started from %s, not slot 4",
+         core_export("harness_core_state_loaded") ? "a state" : "no state");
+   CHECK(!menu_state_get_ptr()->driver_data->state_slot_run_pending,
+         "the Load State pick outlived the load it was made for");
+
+   configuration_set_bool(settings, settings->bools.savestate_auto_load,
+         auto_load);
+   playlist_free_cached();
+   remove(lpl);
+   remove(slot_path);
+   remove(auto_path);
+   {
+      char png[PATH_MAX_LENGTH + 8];
+      snprintf(png, sizeof(png), "%s.png", slot_path);
+      remove(png);
+      snprintf(png, sizeof(png), "%s.png", spare_path);
+      remove(png);
+   }
+   remove(game);
+   if (failures == had)
+      fprintf(stderr, "[pass] playlist-state-slot lane\n");
+}
+#endif
+
+#if defined(HAVE_DYNAMIC) && defined(HAVE_MENU)
+/* ------------------------------------------------------------------ */
+/* Lane: core title held through a load                                */
+/* ------------------------------------------------------------------ */
+
+/* The menu's core title, read every frame of a playlist Run, shows
+ * the title from before the load or the one after it - nothing in
+ * between - and changes at most once. */
+static void lane_core_title_held(void)
+{
+   content_ctx_info_t info;
+   char game[600];
+   char first[256], last[256], cur[256];
+   char other[256] = "";
+   unsigned n, changes = 0;
+   FILE *f;
+   unsigned had = failures;
+
+   snprintf(game, sizeof(game), "%s/title.bin", harness_dir);
+   if ((f = fopen(game, "wb")))
+   {
+      fputs("harness content", f);
+      fclose(f);
+   }
+   memset(&info, 0, sizeof(info));
+   CHECK(settle(), "a load or state task from before is still in flight");
+   open_menu();
+   CHECK(task_push_load_contentless_core_from_menu(core_path),
+         "the contentless load was not started");
+   CHECK(settle() && core_is_up(), "the contentless load did not go through");
+
+   menu_entries_get_core_title(first, sizeof(first));
+   strlcpy(last, first, sizeof(last));
+   CHECK(task_push_load_content_from_playlist_from_menu(core_path, game,
+            "title", &info, NULL, NULL),
+         "the playlist Run was not started");
+   for (n = 0; n < 5000; n++)
+   {
+      bool going = load_in_flight();
+      menu_entries_get_core_title(cur, sizeof(cur));
+      if (!string_is_equal(cur, last))
+      {
+         changes++;
+         strlcpy(last, cur, sizeof(last));
+         if (!string_is_equal(cur, first) && !*other)
+            strlcpy(other, cur, sizeof(other));
+      }
+      if (!going)
+         break;
+      pump(1);
+   }
+   CHECK(!load_in_flight() && core_is_up()
+         && strstr(path_get(RARCH_PATH_BASENAME), "title"),
+         "the playlist Run did not go through");
+   /* The one change allowed is to the title the load ends on */
+   CHECK(changes <= 1 && (!*other || string_is_equal(other, last)),
+         "the core title changed %u time(s) during the load"
+         " (\"%s\" -> \"%s\" -> \"%s\")",
+         changes, first, other, last);
+
+   remove(game);
+   if (failures == had)
+      fprintf(stderr, "[pass] core-title-held lane\n");
+}
+#endif
+
 /* LOAD_CONTENT and CLOSE_CONTENT, asked by a structured interface,
  * answer once the load is through. The command interfaces outlive the
  * load, and are not polled while it runs: what reaches them waits. */
@@ -2213,7 +3057,7 @@ static void lane_content_reply(const char *dir)
    /* a line-based interface has never been told, and is not */
    cmd.structured = false;
    snprintf(arg, sizeof(arg), "%s|%s", core_path, content);
-   rr_ask(&cmd, command_load_content, arg);
+   rr_ask_unanswered(&cmd, command_load_content, arg);
    CHECK(rr_replies == 0, "a line-based interface was answered \"%s\"",
          rr_reply);
    cmd.structured = true;
@@ -2240,7 +3084,10 @@ static void lane_content_reply(const char *dir)
  * by the clock; waiting out a whole period first makes this open the
  * one that starts it, so the screenshot opens well inside the same
  * window, not across a reset that would hand it a fresh one. */
+/* tasks/task_nbio_slice.c's window period */
+#define SS_SLICE_PERIOD_USEC 16666
 static bool ss_hog_stop;
+static retro_time_t ss_hog_open;
 static void ss_hog_handler(retro_task_t *task)
 {
    nbio_budget_t b;
@@ -2249,15 +3096,30 @@ static void ss_hog_handler(retro_task_t *task)
       task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
       return;
    }
-   retro_sleep(17);
+   /* by the clock: a signal can cut a sleep short */
+   while (cpu_features_get_time_usec() - ss_hog_open < 17000)
+      retro_sleep(1);
    task_nbio_slice_open(&b);
+   ss_hog_open = b.start;
    while (task_nbio_slice_within_budget(&b, 0, 0)) { }
    task_nbio_slice_close(&b);
 }
 
+/* A check the harness was descheduled through for a whole period may
+ * have handed the screenshot a fresh window; such a run proves nothing
+ * either way and is taken again. */
+static bool ss_check_late(void)
+{
+   task_queue_check();
+   return cpu_features_get_time_usec() - ss_hog_open
+      >= SS_SLICE_PERIOD_USEC;
+}
+
+/* The only other task these lanes run is the hog */
 static bool ss_is_screenshot(retro_task_t *task, void *user_data)
 {
-   if (task->type != TASK_TYPE_BLOCKING)
+   if (     task->handler == ss_hog_handler
+         || (task_get_flags(task) & RETRO_TASK_FLG_FINISHED))
       return false;
    if (user_data)
       *(retro_task_t**)user_data = task;
@@ -2297,7 +3159,7 @@ static void lane_screenshot_steps(const char *dir)
    settings_t *settings = config_get_ptr();
    retro_task_t *hog;
    char path[600], file[640];
-   unsigned had = failures, checks = 0, rows = 240;
+   unsigned had = failures, checks = 0, rows = 240, late = 0, attempt;
 
    if (!core_is_up())
    {
@@ -2320,28 +3182,35 @@ static void lane_screenshot_steps(const char *dir)
    /* With fullpath the name is the file, as given */
    snprintf(path, sizeof(path), "%s/harness_shot.png", dir);
    snprintf(file, sizeof(file), "%s", path);
-   remove(file);
-   CHECK(take_screenshot(dir, path, false, false, true, true),
-         "the screenshot was not started");
-   while (ss_in_flight() && checks < 4 * rows)
+   for (attempt = 0; attempt < 3; attempt++)
    {
-      task_queue_check();
-      checks++;
+      remove(file);
+      CHECK(take_screenshot(dir, path, false, false, true, true),
+            "the screenshot was not started");
+      for (checks = 0, late = 0; ss_in_flight() && checks < 4 * rows; checks++)
+         late += ss_check_late();
+      CHECK(!ss_in_flight(), "the screenshot did not finish in %u checks", checks);
+      CHECK(ss_png_complete(file), "the screenshot file is not a whole PNG");
+      if (!late)
+         break;
    }
-   CHECK(!ss_in_flight(), "the screenshot did not finish in %u checks", checks);
-   CHECK(checks >= rows,
+   CHECK(!late, "a period-long stall in each of %u attempts", attempt);
+   CHECK(late || checks >= rows,
          "the screenshot finished in %u checks for %u rows: encoded in one go",
          checks, rows);
-   CHECK(ss_png_complete(file), "the screenshot file is not a whole PNG");
    remove(file);
 
    /* Cancelled part way through */
-   CHECK(take_screenshot(dir, path, false, false, true, true),
-         "the second screenshot was not started");
+   for (attempt = 0; attempt < 3; attempt++)
    {
       unsigned n;
-      for (n = 0; n < 20; n++)
-         task_queue_check();
+      CHECK(take_screenshot(dir, path, false, false, true, true),
+            "the second screenshot was not started");
+      for (n = 0, late = 0; n < 20; n++)
+         late += ss_check_late();
+      if (ss_in_flight() || !late)
+         break;
+      remove(file);
    }
    CHECK(ss_in_flight(), "the second screenshot was already done");
    {
@@ -2367,6 +3236,52 @@ static void lane_screenshot_steps(const char *dir)
       fprintf(stderr, "[pass] screenshot-steps lane (%u checks for %u rows)\n",
             checks, rows);
 }
+
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
+/* A screenshot lands on the image history, the Images tab's list, in
+ * a build without the imageviewer core too: the list is the menu's */
+static void lane_screenshot_history(const char *dir)
+{
+   const struct playlist_entry *entry = NULL;
+   playlist_t *hist = g_defaults.image_history;
+   char path[600];
+   size_t before;
+   unsigned had = failures, n;
+
+   CHECK(hist, "history: no image history playlist");
+   if (!hist)
+      return;
+   CHECK(config_get_ptr()->bools.history_list_enable,
+         "history: history lists are off");
+   before = playlist_size(hist);
+
+   snprintf(path, sizeof(path), "%s/harness_history_shot.png", dir);
+   remove(path);
+   CHECK(take_screenshot(dir, path, false, false, true, true),
+         "history: the screenshot was not started");
+   for (n = 0; n < 2000 && ss_in_flight(); n++)
+      task_queue_check();
+   CHECK(!ss_in_flight(), "history: the screenshot did not finish");
+   CHECK(ss_png_complete(path), "history: the screenshot file is not a whole PNG");
+
+   CHECK(playlist_size(hist) == before + 1,
+         "history: %u entries after the screenshot, %u before",
+         (unsigned)playlist_size(hist), (unsigned)before);
+   if (playlist_size(hist))
+      playlist_get_index(hist, 0, &entry);
+   CHECK(entry && entry->path && string_is_equal(
+            path_basename(entry->path), "harness_history_shot.png"),
+         "history: the newest entry is \"%s\", not the screenshot",
+         (entry && entry->path) ? entry->path : "");
+   CHECK(entry && string_is_equal(entry->core_name, "imageviewer"),
+         "history: the entry's core is \"%s\"",
+         (entry && entry->core_name) ? entry->core_name : "");
+
+   remove(path);
+   if (failures == had)
+      fprintf(stderr, "[pass] screenshot-history lane\n");
+}
+#endif
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -2986,6 +3901,9 @@ int main(int argc, char *argv[])
    lane_staged();
    lane_core_opened_once();
    lane_audio_kept();
+#ifdef HAVE_AUDIOMIXER
+   lane_menu_sound_close();
+#endif
    lane_midi_requested();
 #if defined(HAVE_DYNAMIC)
    lane_probe_cached();
@@ -3019,9 +3937,25 @@ int main(int argc, char *argv[])
    lane_replay_reply(dir);
 #endif
    lane_state_slot_reply();
+#ifdef HAVE_DYNAMIC
+   lane_state_load_latency();
+#endif
+#if defined(HAVE_DYNAMIC) && defined(HAVE_SCREENSHOTS)
+   lane_screenshots_held(dir);
+#endif
+#ifdef HAVE_DYNAMIC
+   lane_state_hold_full();
+#endif
+#if defined(HAVE_DYNAMIC) && defined(HAVE_MENU)
+   lane_playlist_state_slot();
+   lane_core_title_held();
+#endif
    lane_content_reply(dir);
 #if defined(HAVE_SCREENSHOTS) && defined(HAVE_RPNG)
    lane_screenshot_steps(dir);
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
+   lane_screenshot_history(dir);
+#endif
 #endif
 #if defined(HAVE_DYNAMIC) && defined(HAVE_MENU)
    /* Last: a content load leaves its save state name behind for the

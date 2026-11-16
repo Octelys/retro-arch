@@ -104,7 +104,6 @@ static const struct
    char s_7607974d[14];
    char s_bdf1165f[35];
    char s_6a15d029[21];
-   char s_3817de39[389];
    char s_16ae54ac[283];
    char s_b3e89428[271];
    char s_7af11c30[94];
@@ -1022,6 +1021,7 @@ static const struct
    char s_800197ff[26];
    char s_93d13126[11];
    char s_7785c81e[33];
+   char s_4c280c7b[16];
    char s_38cf005e[39];
    char s_7e9108fa[10];
    char s_f455cf63[8];
@@ -1260,7 +1260,6 @@ static const struct
    char s_5b3c8098[27];
    char s_ceb820ad[8];
    char s_63af41a7[29];
-   char s_a4b769ca[34];
 #ifdef HAVE_MIST
    char s_53788998[30];
 #endif
@@ -1525,6 +1524,7 @@ static const struct
    char s_e6e43c7d[40];
    char s_c1ddd207[40];
    char s_ded83500[45];
+   char s_69c06e41[4];
    char s_690802fe[10];
    char s_7895cc5b[32];
    char s_e46faa42[16];
@@ -2351,6 +2351,8 @@ static const struct
 #endif
 #endif
    char s_f4341e25[29];
+   char s_e09bad69[10];
+   char s_f66c7b67[10];
    char s_cc973e8a[6];
    char s_b9d37039[167];
    char s_d0a04fe4[12];
@@ -2406,10 +2408,29 @@ static const struct
    char s_4b582a0c[24];
    char s_61213f1d[16];
    char s_95e4b29f[71];
+   char s_181a290c[7];
+   char s_181d8487[7];
+   char s_0cfd4fd0[12];
+   char s_d64659c4[10];
+   char s_fa462638[6];
+   char s_29f97e35[7];
+   char s_569b0627[6];
+   char s_99b1b2f6[8];
+   char s_569b11b0[12];
+   char s_328ddae3[12];
    char s_60258de0[7];
    char s_caf61308[13];
+   char s_5410e874[7];
+   char s_7563a069[18];
+   char s_9eb59c3e[12];
    char s_34b2592a[12];
    char s_c7a27b20[13];
+   char s_f7d0f128[6];
+   char s_12be9dca[10];
+   char s_d65a7d95[4];
+   char s_d65fcd13[5];
+   char s_d6611158[5];
+   char s_a2c83706[6];
    char s_317b17ed[11];
    char s_94c8d15f[11];
    char s_de16b5d2[9];
@@ -2454,6 +2475,8 @@ static const struct
    char s_52e3d6ea[26];
    char s_2c868ae4[8];
    char s_9c535394[8];
+   char s_5c12d979[9];
+   char s_3253994e[6];
    char s_c992346c[39];
    char s_580e244f[6];
    char s_a9c8430e[14];
@@ -2498,12 +2521,10 @@ static const struct
    char s_a72a3c80[13];
    char s_482ee1f1[13];
    char s_214b7699[12];
+   char s_3e628390[9];
+   char s_6b25e2a0[17];
    char s_f90edcc2[54];
    char s_ad14307a[26];
-#if defined(RARCH_MOBILE)
-   char s_774121c7[55];
-   char s_774121c8[55];
-#endif
    char s_b0fb58d3[34];
    char s_b0fb58d4[34];
    char s_92a02470[53];
@@ -2520,14 +2541,17 @@ static const struct
 #endif
    char s_84c46931[28];
    char s_ebf10493[15];
+   char s_539d5393[14];
    char s_a64b3a0b[27];
    char s_83e8dc72[28];
    char s_7cf985f0[37];
    char s_0f5266ce[16];
+   char s_0f97fdc1[7];
    char s_ea2674d3[32];
    char s_ea2674d4[30];
    char s_2d8cb7ce[23];
    char s_68190518[39];
+   char s_6448376a[10];
    char s_b9e24170[22];
    char s_30140cb5[17];
    char s_25a21976[84];
@@ -2682,7 +2706,6 @@ static const struct
    char s_aa08c6d6[71];
 #endif
 #endif
-   char s_27aef25c[59];
 #ifdef _3DS
    char s_2873cef1[75];
    char s_b4816da6[53];
@@ -2900,7 +2923,6 @@ static const struct
    char s_aa771128[426];
    char s_e531c55e[119];
    char s_deab66ee[136];
-   char s_5ce79fca[178];
 #ifdef HAVE_GAME_AI
    char s_b7dcc585[30];
    char s_328f4fd8[18];
@@ -3201,7 +3223,6 @@ static const struct
    char s_7963c9c6[77];
    char s_ee3a489b[40];
    char s_236bd8d5[54];
-   char s_87c7d8b8[137];
 #ifdef HAVE_MIST
    char s_40e907c6[55];
 #endif
@@ -3331,9 +3352,7 @@ static const struct
 #ifdef HAVE_NFSCLIENT
    char s_0dc9bb2c[63];
    char s_1536325c[256];
-   char s_ad621411[48];
    char s_f6ec26c1[52];
-   char s_4f7fb41f[46];
    char s_3487ce71[34];
 #endif
 #if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
@@ -3611,7 +3630,6 @@ static const struct
    char s_a55bf936[34];
    char s_c519f84d[28];
    char s_48aefa30[27];
-   char s_5d383a58[42];
    char s_dcf8bd8b[30];
    char s_bce9b94f[45];
    char s_d32f5a63[32];
@@ -3867,10 +3885,8 @@ static const struct
    char s_7e96b5ce[40];
    char s_c2314d30[198];
 #if defined(RARCH_MOBILE)
-   char s_82c9e375[164];
-   char s_82c9e376[142];
+   char s_82c9e376[121];
 #endif
-   char s_73658ec1[143];
    char s_73658ec2[121];
    char s_8010a29e[148];
    char s_81120e85[149];
@@ -4116,7 +4132,6 @@ static const struct
    char s_a363d07a[40];
    char s_9e5bd759[36];
    char s_8d7296ed[42];
-   char s_21580d7c[103];
    char s_fc5e1d2c[65];
    char s_51b22327[43];
    char s_2f6a6e51[29];
@@ -4303,6 +4318,7 @@ static const struct
    char s_8ab54d62[92];
    char s_aa554847[21];
    char s_ac2c797c[25];
+   char s_b512be06[9];
    char s_3fe94404[8];
    char s_80528b14[41];
    char s_eae21890[37];
@@ -4613,12 +4629,6 @@ static const struct
    "Plik shadera.",
    "Plik ustawie\305\204 wst\304\231pnych shadera.",
    "Plik konfiguracyjny.",
-   "W\305\202\304\205czenie Linux GameMode mo\305\274e poprawi\304\207 op\303\263\305\272nienie, nap"
-   "rawi\304\207 problemy z d\305\272wi\304\231kiem i zwi\304\231kszy\304\207 og\303\263ln\304\205 w"
-   "ydajno\305\233\304\207 przez automatyczne ustawienie twojego procesora i karty graficznej na naj"
-   "lepsz\304\205 wydajno\305\233\304\207.\nOprogramowanie GameMode musi by\304\207 zainstalowane, a"
-   "by to dzia\305\202a\305\202o. Sprawd\305\272 https://github.com/FeralInteractive/gamemode po inf"
-   "ormacje o tym jak zainstalowa\304\207 GameMode.",
    "Przypisuje wybran\304\205 ga\305\202k\304\231 analogow\304\205 do wej\305\233\304\207 D-Pad-a.\n"
    "Je\305\233li rdze\305\204 ma natywn\304\205 obs\305\202ug\304\231 ga\305\202ek, przypisywanie D-"
    "Pad-a b\304\231dzie wy\305\202\304\205czone, chyba \305\274e zostanie wybrana opcja '(Wymuszone)"
@@ -5750,6 +5760,7 @@ static const struct
    "Poka\305\274 sterowanie z portu",
    "Dotkni\304\231te",
    "Poka\305\274 kursor myszy z nak\305\202adk\304\205",
+   "Dodaj kontroler",
    "Zachowanie pollingu (Wymagany restart)",
    "Wcze\305\233nie",
    "P\303\263\305\272no",
@@ -5989,7 +6000,6 @@ static const struct
    "Przyspieszenie przewijania",
    "Wygl\304\205d",
    "Poka\305\274 'Plik konfiguracyjny'",
-   "Poka\305\274 komunikaty potwierdzaj\304\205ce",
 #ifdef HAVE_MIST
    "Poka\305\274 'Zarz\304\205dzaj rdzeniami'",
 #endif
@@ -6256,6 +6266,7 @@ static const struct
    "(Pejza\305\274) Regulacja proporcji nak\305\202adki",
    "(Portret) Regulacja proporcji nak\305\202adki",
    "Automatycznie \305\202aduj preferowan\304\205 nak\305\202adk\304\231",
+   "Oba",
    "Nak\305\202adki",
    "Nak\305\202adka pistoletu \305\233wietlnego",
    "Nak\305\202adka myszy",
@@ -7092,6 +7103,8 @@ static const struct
 #endif
 #endif
    "Wy\305\202\304\205cz kompozycj\304\231 pulpitu",
+   "Domy\305\233lny",
+   "Domy\305\233lny",
    "Wideo",
    "Sterownik grafiki nie jest kompatybilny z bie\305\274\304\205cym sterownikiem wideo w RetroArch,"
    " powr\303\263t do sterownika %s. Uruchom ponownie RetroArch, aby zmiany odnios\305\202y efekt.",
@@ -7149,10 +7162,29 @@ static const struct
    "Indeks monitora",
    "W\305\202\304\205cz pe\305\202ny ekran nad wyci\304\231ciem na urz\304\205dzeniach z Androidem i"
    " iOS",
+   "Z gr\304\205",
+   "Z menu",
+   "Po\305\202\304\205czone",
+   "Oddzielne",
+   "Pauza",
+   "Wysoki",
+   "Niski",
+   "\305\232redni",
+   "Wy\305\202\304\205czony",
+   "Wy\305\202\304\205czony",
    "Zawsze",
    "Automatyczny",
+   "Zawsze",
+   "Tylko tryb edycji",
+   "Wy\305\202\304\205czony",
    "Wy\305\202\304\205czony",
    "Automatyczny",
+   "Chwyt",
+   "Wyzwalacz",
+   "Oba",
+   "Lewo",
+   "Brak",
+   "Prawo",
    "180 stopni",
    "270 stopni",
    "Normalna",
@@ -7198,6 +7230,8 @@ static const struct
    "Symulacja prze\305\233wietlania",
    "Poziomo",
    "Pionowo",
+   "Ekran %u",
+   "Skala",
    "Prze\305\202\304\205czanie trybu wy\305\233wietlania SDL",
    "Wideo",
    "Shadery Video",
@@ -7242,12 +7276,10 @@ static const struct
    "Automatyczny",
    "Zbalansowany",
    "Wydajno\305\233\304\207",
+   "Jako\305\233\304\207",
+   "Ultrawydajno\305\233\304\207",
    "U\305\274ywaj bufor\303\263w argument\303\263w Metal (Wymagany restart)",
    "Pozbywanie si\304\231 migotania",
-#if defined(RARCH_MOBILE)
-   "Odchylenie zakotwiczenia widoku X (orientacja pionowa)",
-   "Odchylenie zakotwiczenia widoku Y (orientacja pionowa)",
-#endif
    "Odchylenie zakotwiczenia widoku X",
    "Odchylenie zakotwiczenia widoku Y",
    "Niestandardowy wsp\303\263\305\202czynnik proporcji (wysoko\305\233\304\207)",
@@ -7264,14 +7296,17 @@ static const struct
 #endif
    "Tryb pe\305\202noekranowy w oknie",
    "Tryb okienkowy",
+   "Przy\305\202\304\205czone",
    "Maksymalna wysoko\305\233\304\207 okna",
    "Maksymalna szeroko\305\233\304\207 okna",
    "U\305\274yj niestandardowego rozmiaru okna",
    "Wysoko\305\233\304\207 okna",
+   "Ukryte",
    "Przesuni\304\231cie ekranu w poziomie",
    "Przesuni\304\231cie ekranu w pionie",
    "Przezroczysto\305\233\304\207 okna",
    "Zapami\304\231taj po\305\202o\305\274enie i rozmiar okna",
+   "Oddzielne",
    "Poka\305\274 dekoracje okna",
    "Szeroko\305\233\304\207 okna",
    "Synchronizuj, aby uzyska\304\207 dok\305\202adn\304\205 liczb\304\231 klatek na sekund\304\231 ("
@@ -7506,7 +7541,6 @@ static const struct
    "ze\305\204",
 #endif
 #endif
-   "Skanuj w poszukiwaniu urz\304\205dze\305\204 bluetooth i pod\305\202\304\205cz je.",
 #ifdef _3DS
    "Katalog zasob\303\263w dolnego ekranu. Katalog musi zawiera\304\207 \"bottom_menu.png\".",
    "Dostosuj niebieski kolor czcionki na dolnym ekranie.",
@@ -7840,9 +7874,6 @@ static const struct
    "dy wideo wielow\304\205tkowe jest wy\305\202\304\205czone.",
    "Ustaw poziom dziennika dla front-endu. Je\305\233li poziom dziennika wydany przez frontend jest "
    "poni\305\274ej tej warto\305\233ci, zostanie zignorowany.",
-   "Mo\305\274e poprawi\304\207 wydajno\305\233\304\207, zmniejszy\304\207 op\303\263\305\272nienie "
-   "i naprawi\304\207 problemy z trzeszczeniem audio. Potrzebujesz https://github.com/FeralInteracti"
-   "ve/gamemode, aby to zadzia\305\202a\305\202o.",
 #ifdef HAVE_GAME_AI
    "Etykieta nadpisania gracza AI",
    "Zast\304\205p gracza 01",
@@ -8366,9 +8397,6 @@ static const struct
    "Maksymalna pr\304\231dko\305\233\304\207 kursora podczas przytrzymywania kierunku przewijania.",
    "Zmie\305\204 ustawienia wygl\304\205du ekranu menu.",
    "Poka\305\274 opcj\304\231 'Plik konfiguracyjny' w menu g\305\202\303\263wnym.",
-   "Popro\305\233 o potwierdzenie przed wyj\305\233ciem, zresetowaniem lub zamkni\304\231ciem tre"
-   "\305\233ci. Gdy wy\305\202\304\205czone, te czynno\305\233ci staj\304\205 si\304\231 natychmiast"
-   ".",
 #ifdef HAVE_MIST
    "Poka\305\274 opcj\304\231 \"Zarz\304\205dzaj rdzeniami\" w menu g\305\202\303\263wnym.",
 #endif
@@ -8579,9 +8607,7 @@ static const struct
    "werze dzia\305\202a r\303\263wnie\305\274 dla NFS w wersji 4, gdzie serwer mo\305\274e wy\305"
    "\233wietla\304\207 j\304\205 pod kr\303\263tsz\304\205 nazw\304\205. Pozostaw puste, aby poda"
    "\304\207 eksport w adresie jako nfs://serwer/eksport/\305\233cie\305\274ka.",
-   "Port us\305\202ugi MOUNT. 0 prosi portmapper serwera.",
    "Po\305\202\304\205czenia, kt\303\263re pozostan\304\205 otwarte do serwera.",
-   "Port us\305\202ugi NFS. 0 prosi portmapper serwera.",
    "Adres IP serwera lub nazwa hosta.",
 #endif
 #if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
@@ -9055,7 +9081,6 @@ static const struct
    "Poka\305\274 ustawienia \"op\303\263\305\272nienia\".",
    "Poka\305\274 ustawienia \"Log\303\263w\".",
    "Poka\305\274 ustawienia \"Sie\304\207\".",
-   "Poka\305\274 ustawienia 'Nak\305\202adka na ekranie'.",
    "Poka\305\274 ustawienia 'Playlist'.",
    "Poka\305\274 ustawienia 'Zarz\304\205dzanie zasilaniem'.",
    "Poka\305\274 ustawienia 'Nagrywanie'.",
@@ -9508,15 +9533,10 @@ static const struct
    "psu\304\207 niekt\303\263re shadery, zw\305\202aszcza na starych sprz\304\231tach i wersjach sys"
    "temu.",
 #if defined(RARCH_MOBILE)
-   "Poziome po\305\202o\305\274enie tre\305\233ci, gdy widok jest szerszy ni\305\274 szeroko\305\233"
-   "\304\207 tre\305\233ci. 0.0 jest daleko na lewo, 0.5 to \305\233rodek, 1.0 to daleko na prawo. ("
-   "orientacja pionowa)",
    "Pionowe po\305\202o\305\274enie tre\305\233ci, gdy widok jest wy\305\274szy ni\305\274 wysoko"
    "\305\233\304\207 tre\305\233ci. 0.0 to g\303\263ra, 0.5 to \305\233rodek, 1.0 to d\303\263\305"
-   "\202. (orientacja pionowa)",
+   "\202.",
 #endif
-   "Poziome po\305\202o\305\274enie tre\305\233ci, gdy widok jest szerszy ni\305\274 szeroko\305\233"
-   "\304\207 tre\305\233ci. 0.0 jest daleko na lewo, 0.5 to \305\233rodek, 1.0 to daleko na prawo.",
    "Pionowe po\305\202o\305\274enie tre\305\233ci, gdy widok jest wy\305\274szy ni\305\274 wysoko"
    "\305\233\304\207 tre\305\233ci. 0.0 to g\303\263ra, 0.5 to \305\233rodek, 1.0 to d\303\263\305"
    "\202.",
@@ -9818,8 +9838,6 @@ static const struct
    "Nie uda\305\202o si\304\231 po\305\202\304\205czy\304\207 z serwerem.",
    "Nie uda\305\202o si\304\231 utworzy\304\207 katalogu.",
    "Nie uda\305\202o si\304\231 wej\305\233\304\207 do trybu GameMode",
-   "Nie uda\305\202o si\304\231 wej\305\233\304\207 do GameMode \342\200\224 sprawd\305\272, czy dae"
-   "mon GameMode jest zainstalowany i uruchomiony",
    "Nie uda\305\202o si\304\231 wyodr\304\231bni\304\207 zawarto\305\233ci z pliku skompresowanego",
    "Nie uda\305\202o si\304\231 uzyska\304\207 nicku od klienta.",
    "Nie uda\305\202o si\304\231 za\305\202adowa\304\207.",
@@ -10019,6 +10037,7 @@ static const struct
    "isu na playli\305\233cie.",
    "Rdzenie pomini\304\231te: ",
    "Rdzenie zaktualizowane: ",
+   "Ekran %u",
    "P\305\202aski",
    "Nak\305\202adka klawiatury nie jest ustawiona.",
    "Nie zapisuj\304\231. Nadpisywanie aktywne.",
@@ -10217,7 +10236,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_pl_blob_check[
-      (sizeof(msg_hash_pl_blob) == (200318u
+      (sizeof(msg_hash_pl_blob) == (199514u
 #ifdef ANDROID
        + 385u
 #endif
@@ -10472,10 +10491,6 @@ typedef char msg_hash_pl_blob_check[
 #ifdef HAVE_ODROIDGO2
        + 15u
 #endif
-#if defined(RARCH_MOBILE)
-       + 55u
-       + 55u
-#endif
 #if defined (WIIU)
 #ifdef WIIU
        + 49u
@@ -10590,9 +10605,7 @@ typedef char msg_hash_pl_blob_check[
 #ifdef HAVE_NFSCLIENT
        + 63u
        + 256u
-       + 48u
        + 52u
-       + 46u
        + 34u
 #endif
 #if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
@@ -10705,8 +10718,7 @@ typedef char msg_hash_pl_blob_check[
        + 72u
 #endif
 #if defined(RARCH_MOBILE)
-       + 164u
-       + 142u
+       + 121u
 #endif
 #if defined (WIIU)
 #ifdef WIIU
@@ -10831,7 +10843,6 @@ static const msg_hash_id_t msg_hash_pl_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_HELP_FILE_BROWSER_SHADER,
    (msg_hash_id_t)MENU_ENUM_LABEL_HELP_FILE_BROWSER_SHADER_PRESET,
    (msg_hash_id_t)MENU_ENUM_LABEL_HELP_FILE_CONFIG,
-   (msg_hash_id_t)MENU_ENUM_LABEL_HELP_GAMEMODE_ENABLE,
    (msg_hash_id_t)MENU_ENUM_LABEL_HELP_INPUT_ADC_TYPE,
    (msg_hash_id_t)MENU_ENUM_LABEL_HELP_INPUT_DRIVER_LINUXRAW,
    (msg_hash_id_t)MENU_ENUM_LABEL_HELP_INPUT_DRIVER_NO_DETAILS,
@@ -11743,6 +11754,7 @@ static const msg_hash_id_t msg_hash_pl_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_INPUT_OVERLAY_SHOW_INPUTS_PORT,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_INPUT_OVERLAY_SHOW_INPUTS_TOUCHED,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_INPUT_OVERLAY_SHOW_MOUSE_CURSOR,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_INPUT_PLAYS_AS_ADD,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_INPUT_POLL_TYPE_BEHAVIOR,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_INPUT_POLL_TYPE_BEHAVIOR_EARLY,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_INPUT_POLL_TYPE_BEHAVIOR_LATE,
@@ -11981,7 +11993,6 @@ static const msg_hash_id_t msg_hash_pl_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_MENU_SCROLL_FAST,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_MENU_SETTINGS,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_MENU_SHOW_CONFIGURATIONS,
-   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_MENU_SHOW_CONFIRM,
 #ifdef HAVE_MIST
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_MENU_SHOW_CORE_MANAGER_STEAM,
 #endif
@@ -12246,6 +12257,7 @@ static const msg_hash_id_t msg_hash_pl_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_OVERLAY_ASPECT_ADJUST_LANDSCAPE,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_OVERLAY_ASPECT_ADJUST_PORTRAIT,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_OVERLAY_AUTOLOAD_PREFERRED,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_OVERLAY_CONTACT_METHOD_BOTH,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_OVERLAY_DIRECTORY,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_OVERLAY_LIGHTGUN_SETTINGS,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_OVERLAY_MOUSE_SETTINGS,
@@ -13071,6 +13083,8 @@ static const msg_hash_id_t msg_hash_pl_ids[] =
 #endif
 #endif
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_DISABLE_COMPOSITION,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_DLSS_NR_PRESET_DEFAULT,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_DLSS_NR_STYLE_DEFAULT,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_DRIVER,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_DRIVER_FALLBACK,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_FILTER,
@@ -13126,10 +13140,29 @@ static const msg_hash_id_t msg_hash_pl_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_MESSAGE_POS_Y,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_MONITOR_INDEX,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_NOTCH_WRITE_OVER,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_NOTIFICATIONS_WITH_GAME,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_NOTIFICATIONS_WITH_MENU,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_CONTROLLERS_COMBINED,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_CONTROLLERS_SEPARATE,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_PAUSE_ON,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_SMOOTHING_HIGH,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_SMOOTHING_LOW,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_SMOOTHING_MEDIUM,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_SMOOTHING_OFF,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_EDIT_SNAP_ANGLES_OFF,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_ALWAYS,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_AUTO,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_BEAM_ALWAYS,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_BEAM_EDIT,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_BEAM_OFF,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_OFF,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_REFRESH_AUTO,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_BUTTON_GRIP,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_BUTTON_TRIGGER,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_HANDS_BOTH,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_HANDS_LEFT,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_HANDS_NONE,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_TOUCH_HANDS_RIGHT,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED_ROTATED,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_NORMAL,
@@ -13174,6 +13207,8 @@ static const msg_hash_id_t msg_hash_pl_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCAN_SUBFRAMES,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT_HORIZONTAL,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT_VERTICAL,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_WINDOW_MODE,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_XR_SCALE,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SDL_DISPLAY_SERVER,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SETTINGS,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHADERS_ENABLE,
@@ -13218,12 +13253,10 @@ static const msg_hash_id_t msg_hash_pl_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_QUALITY_AUTO,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_QUALITY_BALANCED,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_QUALITY_PERFORMANCE,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_QUALITY_QUALITY,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_TEMPORAL_UPSCALER_QUALITY_ULTRA_PERFORMANCE,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_USE_METAL_ARG_BUFFERS,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VFILTER,
-#if defined(RARCH_MOBILE)
-   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_BIAS_PORTRAIT_X,
-   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_BIAS_PORTRAIT_Y,
-#endif
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_BIAS_X,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_BIAS_Y,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_CUSTOM_HEIGHT,
@@ -13240,14 +13273,17 @@ static const msg_hash_id_t msg_hash_pl_ids[] =
 #endif
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOWED_FULLSCREEN,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOWED_MODE_SETTINGS,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_ATTACHED,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_AUTO_HEIGHT_MAX,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_AUTO_WIDTH_MAX,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_CUSTOM_SIZE_ENABLE,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_HEIGHT,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_HIDDEN,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_OFFSET_X,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_OFFSET_Y,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_OPACITY,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_SAVE_POSITION,
+   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_SEPARATE,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_SHOW_DECORATIONS,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_WIDTH,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VRR_RUNLOOP_ENABLE,
@@ -13399,7 +13435,6 @@ static const msg_hash_id_t msg_hash_pl_ids[] =
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_BLUETOOTH_ERTM_DISABLE,
 #endif
 #endif
-   (msg_hash_id_t)MENU_ENUM_SUBLABEL_BLUETOOTH_SETTINGS,
 #ifdef _3DS
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_BOTTOM_ASSETS_DIRECTORY,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_BOTTOM_FONT_COLOR_BLUE,
@@ -13617,7 +13652,6 @@ static const msg_hash_id_t msg_hash_pl_ids[] =
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_FRAME_TIME_COUNTER_AUTO_RESET,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_FRAME_TIME_COUNTER_SETTINGS,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_FRONTEND_LOG_LEVEL,
-   (msg_hash_id_t)MENU_ENUM_SUBLABEL_GAMEMODE_ENABLE_LINUX,
 #ifdef HAVE_GAME_AI
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_GAME_AI_MENU_OPTION,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_GAME_AI_OVERRIDE_P1,
@@ -13918,7 +13952,6 @@ static const msg_hash_id_t msg_hash_pl_ids[] =
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_MENU_SCROLL_FAST,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_MENU_SETTINGS,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_MENU_SHOW_CONFIGURATIONS,
-   (msg_hash_id_t)MENU_ENUM_SUBLABEL_MENU_SHOW_CONFIRM,
 #ifdef HAVE_MIST
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_MENU_SHOW_CORE_MANAGER_STEAM,
 #endif
@@ -14048,9 +14081,7 @@ static const msg_hash_id_t msg_hash_pl_ids[] =
 #ifdef HAVE_NFSCLIENT
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_NFS_CLIENT_BROWSE,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_NFS_CLIENT_EXPORT,
-   (msg_hash_id_t)MENU_ENUM_SUBLABEL_NFS_CLIENT_MOUNT_PORT,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_NFS_CLIENT_NUM_CONTEXTS,
-   (msg_hash_id_t)MENU_ENUM_SUBLABEL_NFS_CLIENT_PORT,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_NFS_CLIENT_SERVER,
 #endif
 #if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
@@ -14328,7 +14359,6 @@ static const msg_hash_id_t msg_hash_pl_ids[] =
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_SETTINGS_SHOW_LATENCY,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_SETTINGS_SHOW_LOGGING,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_SETTINGS_SHOW_NETWORK,
-   (msg_hash_id_t)MENU_ENUM_SUBLABEL_SETTINGS_SHOW_ONSCREEN_DISPLAY,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_SETTINGS_SHOW_PLAYLISTS,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_SETTINGS_SHOW_POWER_MANAGEMENT,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_SETTINGS_SHOW_RECORDING,
@@ -14584,10 +14614,8 @@ static const msg_hash_id_t msg_hash_pl_ids[] =
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_SYNCHRONIZATION_SETTINGS,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_USE_METAL_ARG_BUFFERS,
 #if defined(RARCH_MOBILE)
-   (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_BIAS_PORTRAIT_X,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_BIAS_PORTRAIT_Y,
 #endif
-   (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_BIAS_X,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_BIAS_Y,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_CUSTOM_HEIGHT,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_CUSTOM_WIDTH,
@@ -14833,7 +14861,6 @@ static const msg_hash_id_t msg_hash_pl_ids[] =
    (msg_hash_id_t)MSG_FAILED_TO_CONNECT_TO_HOST,
    (msg_hash_id_t)MSG_FAILED_TO_CREATE_THE_DIRECTORY,
    (msg_hash_id_t)MSG_FAILED_TO_ENTER_GAMEMODE,
-   (msg_hash_id_t)MSG_FAILED_TO_ENTER_GAMEMODE_LINUX,
    (msg_hash_id_t)MSG_FAILED_TO_EXTRACT_CONTENT_FROM_COMPRESSED_FILE,
    (msg_hash_id_t)MSG_FAILED_TO_GET_NICKNAME_FROM_CLIENT,
    (msg_hash_id_t)MSG_FAILED_TO_LOAD,
@@ -15020,6 +15047,7 @@ static const msg_hash_id_t msg_hash_pl_ids[] =
    (msg_hash_id_t)MSG_NO_THUMBNAIL_DOWNLOAD_POSSIBLE,
    (msg_hash_id_t)MSG_NUM_CORES_LOCKED,
    (msg_hash_id_t)MSG_NUM_CORES_UPDATED,
+   (msg_hash_id_t)MSG_OPENXR_EDIT_TAG_SCREEN,
    (msg_hash_id_t)MSG_OPENXR_HEADSET_VIEW_FLAT,
    (msg_hash_id_t)MSG_OSK_OVERLAY_NOT_SET,
    (msg_hash_id_t)MSG_OVERRIDES_ACTIVE_NOT_SAVING,

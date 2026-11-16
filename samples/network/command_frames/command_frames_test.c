@@ -461,6 +461,14 @@ int main(int argc, char **argv)
    /* a family of commands as one: the word picks the command, and only
     * the ones that take a number take what follows */
    reply[0]=0; cmd.error=false;
+#ifdef HAVE_SCREENSHOTS
+   /* GET_FRAME answers with an image, which a line interface cannot carry */
+   reply[0]=0; cmd.error=false;
+   CHECK(!command_get_frame(&cmd,"") && strstr(reply,"carries no image"));
+   reply[0]=0; cmd.error=false;
+   CHECK(!command_get_frame(&cmd,"1000") && strstr(reply,"64 to 640"));
+#endif
+   reply[0]=0; cmd.error=false;
    CHECK(!command_menu(&cmd,"toggle") && strstr(reply,"MENU ERROR one of show|"));
    reply[0]=0;
    CHECK(!command_menu(&cmd,"up 5") && strstr(reply,"up takes no index"));
@@ -1284,6 +1292,19 @@ int main(int argc, char **argv)
       reply[0]=0;
       CHECK(command_steps(&cmd,"|on") && !strcmp(reply,"QUEUED 0\n")
             && !(loop->frame_work & RUNLOOP_WORK_RUN_FRAMES));
+      /* so does achievements' hardcore mode taking effect, which lets
+       * go of held input too, and says why the queue ended */
+      reply[0]=0;
+      CHECK(command_steps(&cmd,"run 100|on"));
+      runloop_iterate();
+      CHECK(command_set_input(&cmd,"1 a 1")
+            && input_driver_command_held(0,axes) != 0);
+      command_hardcore_entered();
+      CHECK(input_driver_command_held(0,axes) == 0
+            && !(loop->frame_work & RUNLOOP_WORK_RUN_FRAMES));
+      reply[0]=0;
+      CHECK(command_steps(&cmd,"|on") && !strcmp(reply,
+            "QUEUED 0\nPREVIOUS ERROR achievements hardcore mode is on\n"));
       /* idle is time the content sat paused: a frame it runs ends it */
       reply[0]=0;
       CHECK(command_steps(&cmd,"run 1|on"));

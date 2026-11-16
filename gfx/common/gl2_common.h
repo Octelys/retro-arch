@@ -34,6 +34,18 @@
 
 #include "../video_driver.h"
 #include "gl_common.h"
+#if defined(HAVE_SHADERPIPELINE) && defined(HAVE_GLSL)
+#include "../drivers_shader/shader_glsl.h"
+#endif
+/* The menu effects: made from GLSL, or from Cg where the build has no
+ * GLSL or an effect's GLSL will not build */
+#if defined(HAVE_SHADERPIPELINE) && defined(HAVE_CG) && !defined(HAVE_OPENGLES)
+#define GL2_EFFECT_CG
+#include "../drivers_shader/shader_gl_cg.h"
+#endif
+#if defined(HAVE_SHADERPIPELINE) && (defined(HAVE_GLSL) || defined(GL2_EFFECT_CG))
+#define GL2_EFFECTS
+#endif
 
 /* A software core's frames sampled where it writes them, on KMS */
 #if defined(HAVE_KMS) && defined(HAVE_EGL) && !defined(HAVE_PSGL)
@@ -161,6 +173,24 @@ struct gl2
       uint32_t id;
    } meshes[8];
    uint64_t mesh_draws;
+#ifdef GL2_EFFECTS
+   /* The menu effects' programs, as installed: GLSL, or Cg when cg */
+   struct gl2_effect
+   {
+#ifdef HAVE_GLSL
+      gl_glsl_effect_t glsl;
+#endif
+#ifdef GL2_EFFECT_CG
+      gl_cg_effect_t cg;
+#endif
+      unsigned flags;
+      bool is_cg;
+   } effects[16];
+   unsigned effect_count;
+#endif
+#ifdef HAVE_GL_MENU_BLOOM
+   gl_menu_bloom_t *menu_bloom;
+#endif
    const shader_backend_t *shader;
    void *shader_data;
    void *renderchain_data;
@@ -343,7 +373,13 @@ struct gl2
       /* Made for a software frame's view written straight in, as the
        * frame's textures are, not for a copy drawn into it */
       bool                  tex_written[RETRO_VIDEO_VIEWS_MAX][GL2_VIEWS_HISTORY];
+      /* Its min filter and wrap as last set, wrap in the high half; 0
+       * none yet */
+      unsigned              tex_params[RETRO_VIDEO_VIEWS_MAX][GL2_VIEWS_HISTORY];
       unsigned              head[RETRO_VIDEO_VIEWS_MAX];
+      /* A bit a view: written straight in this frame, which the screens'
+       * own windows then draw as they are */
+      unsigned              written;
       struct video_tex_info prev[RETRO_VIDEO_VIEWS_MAX][GL2_VIEWS_HISTORY];
       /* What a feedback pass drew for each view the frame before */
       struct gl2_views_fbo  feedback[RETRO_VIDEO_VIEWS_MAX];
@@ -367,6 +403,10 @@ struct gl2
       bool                  ui_pass;
       bool                  direct_seen;
       bool                  written_seen;
+      bool                  in_place_seen;
+      /* This view: the preset reads the frame where it lies, in this
+       * texture, not a copy; 0 for a copy */
+      GLuint                in_place_tex;
       /* Some copy or feedback target is held */
       bool                  copies;
       /* Each view's prev is filled */
@@ -382,6 +422,17 @@ struct gl2
       video_windows_held_t  held;
       /* gl2_frame()'s, for the preset's passes in them */
       unsigned              frame_count;
+      /* The UI layers drawn in another window, in one image, only
+       * while they cannot be drawn on that window's back buffer */
+      struct gl2_views_fbo  ui;
+      video_views_target_t  ui_target;
+      /* This frame: the window the UI is still to go in, 0 for none */
+      unsigned              ui_window;
+      /* This frame: the layers drawn straight on ui_window's back
+       * buffer, 0 when the image goes there; their size and message */
+      unsigned              ui_direct;
+      unsigned              ui_dims;
+      const char           *ui_msg;
    } windows;
 #endif
 

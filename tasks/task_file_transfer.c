@@ -15,6 +15,7 @@
 
 #include <string.h>
 #include <formats/data_transfer.h>
+#include <streams/data_transfer_file.h>
 #include <features/features_cpu.h>
 #include <compat/strl.h>
 #include <retro_miscellaneous.h>
@@ -332,6 +333,7 @@ do_transfer:
          case NBIO_TYPE_BMP:
          case NBIO_TYPE_WEBP:
          case NBIO_TYPE_MP4:
+         case NBIO_TYPE_GIF:
             if (!task_image_load_handler(task))
                task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
             break;

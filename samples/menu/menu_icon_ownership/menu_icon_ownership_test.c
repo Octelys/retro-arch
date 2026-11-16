@@ -16,6 +16,10 @@
  *
  *   xmb         The same fixture against the other horizontal list;
  *               the explore view's node no longer aliases the cursor.
+ *               Each horizontal-list node owns a copy of its
+ *               playlist's console name; every copy of the fixture
+ *               playlist's name must be freed by deinit. The link
+ *               wraps strdup and free (see build.sh) to count them.
  *
  *   materialui  An icon whose decode is still queued when the playlist
  *               icon array is freed and rebuilt (RESET_HORIZONTAL_LIST
@@ -29,7 +33,12 @@
  *               fallback icon and the core's own; both are freed at
  *               deinit.
  *
- * Usage: menu_icon_ownership_test ozone|xmb|materialui|contentless
+ *   rgui        The framebuffer RGUI uploads is held by the video
+ *               driver. A video reinit with the menu up starts a
+ *               driver without it, and nothing in the menu changes to
+ *               redraw it: the next upload must still reach the new one.
+ *
+ * Usage: menu_icon_ownership_test ozone|xmb|materialui|contentless|rgui
  *
  * Requires a completed non-Qt build, same as the other menu harnesses:
  *
@@ -57,6 +66,7 @@
 #include "../../../menu/menu_displaylist.h"
 #include "../../../gfx/gfx_display.h"
 #include "../../../gfx/video_driver.h"
+#include "../../../frontend/frontend.h"
 #include "../../../frontend/frontend_driver.h"
 
 static unsigned failures = 0;
@@ -71,6 +81,53 @@ static unsigned failures = 0;
          failures++; \
       } \
    } while (0)
+
+/* --- the string accounting ----------------------------------------- */
+
+/* build.sh links with --wrap=strdup --wrap=free. Every strdup of
+ * watch_text is recorded until it is freed; whatever is still recorded
+ * after deinit was never freed. Inert while watch_text is NULL. */
+#define WATCH_MAX 64
+
+char *__real_strdup(const char *s);
+void  __real_free(void *p);
+
+static const char *watch_text;
+static void       *watched[WATCH_MAX];
+static unsigned    watched_count;
+static unsigned    watched_overflow;
+static unsigned    watched_seen;
+
+char *__wrap_strdup(const char *s)
+{
+   char *p = __real_strdup(s);
+   if (p && watch_text && !strcmp(s, watch_text))
+   {
+      watched_seen++;
+      if (watched_count < WATCH_MAX)
+         watched[watched_count++] = p;
+      else
+         watched_overflow++;
+   }
+   return p;
+}
+
+void __wrap_free(void *p)
+{
+   if (p && watched_count)
+   {
+      unsigned i;
+      for (i = 0; i < watched_count; i++)
+      {
+         if (watched[i] == p)
+         {
+            watched[i] = watched[--watched_count];
+            break;
+         }
+      }
+   }
+   __real_free(p);
+}
 
 /* --- the accounting driver ----------------------------------------- */
 
@@ -120,6 +177,19 @@ static void harness_unload_texture(void *data, bool threaded, uintptr_t id)
    fprintf(stderr, "unload of a handle not live: %p\n", (void*)id);
 }
 
+static unsigned frame_uploads;
+
+static void harness_set_texture_frame(void *data, const void *frame,
+      bool rgb32, unsigned dims, float alpha)
+{
+   (void)data;
+   (void)frame;
+   (void)rgb32;
+   (void)dims;
+   (void)alpha;
+   frame_uploads++;
+}
+
 static const video_poke_interface_t harness_poke = {
    NULL, /* get_flags */
    harness_load_texture,
@@ -134,7 +204,7 @@ static const video_poke_interface_t harness_poke = {
    NULL, /* get_proc_address */
    NULL, /* set_aspect_ratio */
    NULL, /* apply_state_changes */
-   NULL, /* set_texture_frame */
+   harness_set_texture_frame,
    NULL, /* set_texture_enable */
    NULL, /* set_osd_msg */
    NULL, /* show_mouse */
@@ -258,6 +328,7 @@ static bool fixture_make(const char *menu_driver)
     * contentless lane runs on ozone */
    const char *ident = string_is_equal(menu_driver, "materialui") ? "glui"
          : string_is_equal(menu_driver, "contentless") ? "ozone"
+         : string_is_equal(menu_driver, "rgui") ? "rgui"
          : "xmb";
    if (string_is_equal(menu_driver, "ozone"))
       ident = "ozone";
@@ -524,9 +595,10 @@ int main(int argc, char *argv[])
    if (     !string_is_equal(menu_driver, "ozone")
          && !string_is_equal(menu_driver, "xmb")
          && !string_is_equal(menu_driver, "materialui")
-         && !string_is_equal(menu_driver, "contentless"))
+         && !string_is_equal(menu_driver, "contentless")
+         && !string_is_equal(menu_driver, "rgui"))
    {
-      fprintf(stderr, "usage: %s ozone|xmb|materialui|contentless\n",
+      fprintf(stderr, "usage: %s ozone|xmb|materialui|contentless|rgui\n",
             argv[0]);
       return 2;
    }
@@ -546,6 +618,10 @@ int main(int argc, char *argv[])
       fprintf(stderr, "FAIL: could not write the fixture\n");
       return 1;
    }
+
+   /* The fixture playlist's console name, as XMB names its node */
+   if (string_is_equal(menu_driver, "xmb"))
+      watch_text = "Harness System";
 
    rarch_argv[rarch_argc++] = (char*)"retroarch";
    rarch_argv[rarch_argc++] = (char*)"--menu";
@@ -600,6 +676,19 @@ int main(int argc, char *argv[])
       run_tasks();
       one_frame();
    }
+   else if (string_is_equal(menu_driver, "rgui"))
+   {
+      unsigned had;
+      one_frame();
+      menu_st->driver_ctx->set_texture(menu_st->userdata);
+      driver_uninit(DRIVER_VIDEO_MASK, DRIVER_LIFETIME_RESET);
+      drivers_init(config_get_ptr(), DRIVER_VIDEO_MASK,
+            DRIVER_LIFETIME_RESET, false);
+      had = frame_uploads;
+      menu_st->driver_ctx->set_texture(menu_st->userdata);
+      CHECK(frame_uploads > had,
+            "the video driver made by the reinit never got the menu framebuffer");
+   }
    else
    {
       /* The first frame draws the sidebar with the playlist's icon
@@ -621,15 +710,27 @@ int main(int argc, char *argv[])
          "%u unload(s) of a handle that was not live before deinit",
          unknown_unloads);
 
-   retroarch_ctl(RARCH_CTL_MAIN_DEINIT, NULL);
+   /* The program's own exit: the menu is not kept past it, so the
+    * driver's free() runs and everything it owns goes */
+   main_exit(NULL);
 
    CHECK(unknown_unloads == 0,
          "%u unload(s) of a handle that was not live",
          unknown_unloads);
+   if (watch_text)
+   {
+      CHECK(watched_seen > 0,
+            "fixture: no copy of \"%s\" was ever made", watch_text);
+      CHECK(watched_count == 0 && watched_overflow == 0,
+            "%u of %u copies of \"%s\" not freed by deinit",
+            watched_count + watched_overflow, watched_seen, watch_text);
+   }
    CHECK(live_count == 0,
          "%u texture(s) still live after deinit (%u loaded, %u unloaded)",
          live_count, loads, unloads);
-   CHECK(loads > 0, "fixture: the menu loaded no texture at all");
+   /* RGUI draws into its own framebuffer and loads none */
+   CHECK(loads > 0 || string_is_equal(menu_driver, "rgui"),
+         "fixture: the menu loaded no texture at all");
 
    fixture_remove();
 

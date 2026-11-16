@@ -9,6 +9,13 @@ INCDIRS := -I. -I$(LIBRETRO_COMM_DIR)/include -I../../.. -I../../../deps
 
 CFLAGS  += -std=gnu99 -Wall $(INCDIRS) -DRARCH_INTERNAL -D_GNU_SOURCE
 LDFLAGS += -lm
+# ioctl, select, write and close on the modelled device's descriptor
+# are the test's; every other descriptor goes to the real call.
+LDFLAGS += -Wl,--wrap=ioctl,--wrap=select,--wrap=write,--wrap=close
+# RetroFW's driver, whose DMA moves whole 16-byte units
+ifneq ($(RETROFW),)
+   CFLAGS += -DRETROFW=1
+endif
 
 ifneq ($(SANITIZER),)
    CFLAGS  := -fsanitize=$(SANITIZER) -fno-omit-frame-pointer -g1 $(CFLAGS)

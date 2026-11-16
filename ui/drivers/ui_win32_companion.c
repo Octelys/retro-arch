@@ -59,6 +59,7 @@
 #include <features/features_cpu.h>
 #include <file/file_path.h>
 #include <formats/image.h>
+#include <streams/image_texture_file.h>
 #include <lists/string_list.h>
 #include <compat/msvc.h>
 #include <string/stdstring.h>
@@ -73,6 +74,10 @@
 #include "../../version.h"
 #include "../../retroarch.h"
 #include "../../gfx/common/win32_common.h"
+#ifdef HAVE_CORE_LOAD_CHECK
+#include "../../core_load_check.h"
+#include "../../paths.h"
+#endif
 
 #include "../ui_companion_driver.h"
 #include "../companion/companion_core.h"
@@ -4400,7 +4405,16 @@ static void cw_cores_load_selected(ui_companion_win32_wimp_t *w)
    else if (companion_core_load_core(w->core, path))
       cw_status_set(w, "Core loaded.");
    else
+   {
+#ifdef HAVE_CORE_LOAD_CHECK
+      /* Held back by the load check, which says why. The list's path
+       * went with the load's rebuild of the list. */
+      if (core_load_check_refused(path_get(RARCH_PATH_CORE)))
+         cw_status_set(w, "");
+      else
+#endif
       cw_status_set(w, "Failed to load the core.");
+   }
 }
 
 static LRESULT CALLBACK cw_cores_wndproc(HWND hwnd, UINT msg,
@@ -4606,7 +4620,7 @@ static void cw_scan_directory(ui_companion_win32_wimp_t *w)
    if (companion_core_request_scan(w->core, dir))
       cw_status_set(w, "Scanning...");
    else
-      cw_status_set(w, "Scanning is not available in this build.");
+      cw_status_set(w, companion_core_scan_refusal());
 }
 
 static void cw_context_menu(ui_companion_win32_wimp_t *w, HWND from,

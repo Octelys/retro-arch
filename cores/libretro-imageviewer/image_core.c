@@ -12,7 +12,7 @@
 
 #include <streams/file_stream.h>
 
-#if defined(HAVE_RPNG) || defined(HAVE_RJPEG) || defined(HAVE_RTGA) || defined(HAVE_RBMP) || defined(HAVE_RWEBP) || defined(HAVE_RDDS)
+#if defined(HAVE_RPNG) || defined(HAVE_RJPEG) || defined(HAVE_RTGA) || defined(HAVE_RBMP) || defined(HAVE_RWEBP) || defined(HAVE_RDDS) || defined(HAVE_RGIF)
 #define PREFER_NON_STB_IMAGE
 #endif
 
@@ -30,6 +30,7 @@
 #include "stb_image.h"
 #else
 #include <formats/image.h>
+#include <streams/image_texture_file.h>
 #endif
 
 #include <libretro.h>
@@ -87,6 +88,10 @@ static const char image_formats[] =
 "|tga"
 #endif
 
+#ifdef HAVE_RGIF
+"|gif"
+#endif
+
 #ifdef HAVE_RWEBP
 "|webp"
 #endif
@@ -95,7 +100,7 @@ static const char image_formats[] =
 "|dds"
 #endif
 
-#if !defined(HAVE_RJPEG) && !defined(HAVE_RPNG) && !defined(HAVE_RBMP) && !defined(HAVE_RTGA) && !defined(HAVE_RWEBP) && !defined(HAVE_RDDS)
+#if !defined(HAVE_RJPEG) && !defined(HAVE_RPNG) && !defined(HAVE_RBMP) && !defined(HAVE_RTGA) && !defined(HAVE_RWEBP) && !defined(HAVE_RDDS) && !defined(HAVE_RGIF)
 #error "can't build this core with no image formats"
 #endif
 ;

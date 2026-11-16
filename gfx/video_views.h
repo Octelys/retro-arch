@@ -45,7 +45,9 @@ enum video_screen_layout
    VIDEO_SCREEN_LAYOUT_LAST
 };
 
-/* Headset input settings (video_openxr_controllers, video_openxr_laser). */
+/* Headset input settings (video_openxr_controllers, video_openxr_laser,
+ * video_openxr_laser_beam, video_openxr_touch_hands,
+ * video_openxr_touch_button). */
 enum video_openxr_controllers
 {
    VIDEO_OPENXR_CONTROLLERS_COMBINED = 0,
@@ -61,6 +63,28 @@ enum video_openxr_laser
    VIDEO_OPENXR_LASER_LAST
 };
 
+enum video_openxr_touch_hands
+{
+   VIDEO_OPENXR_TOUCH_HANDS_BOTH = 0,
+   VIDEO_OPENXR_TOUCH_HANDS_LEFT,
+   VIDEO_OPENXR_TOUCH_HANDS_RIGHT,
+   VIDEO_OPENXR_TOUCH_HANDS_NONE,
+   VIDEO_OPENXR_TOUCH_HANDS_LAST
+};
+
+enum video_openxr_touch_button
+{
+   VIDEO_OPENXR_TOUCH_BUTTON_TRIGGER = 0,
+   VIDEO_OPENXR_TOUCH_BUTTON_GRIP,
+   VIDEO_OPENXR_TOUCH_BUTTON_STICK,
+   VIDEO_OPENXR_TOUCH_BUTTON_BUMPER,
+   VIDEO_OPENXR_TOUCH_BUTTON_A,
+   VIDEO_OPENXR_TOUCH_BUTTON_B,
+   VIDEO_OPENXR_TOUCH_BUTTON_X,
+   VIDEO_OPENXR_TOUCH_BUTTON_Y,
+   VIDEO_OPENXR_TOUCH_BUTTON_LAST
+};
+
 /* What a core is told the headset shows, cycled by the Headset View
  * hotkey and never saved: IMMERSIVE reports what the headset can do,
  * STEREOSCOPIC withholds RETRO_VIDEO_VIEWS_STATUS_HMD, FLAT also
@@ -71,6 +95,50 @@ enum video_headset_view
    VIDEO_HEADSET_VIEW_STEREOSCOPIC,
    VIDEO_HEADSET_VIEW_FLAT,
    VIDEO_HEADSET_VIEW_LAST
+};
+
+enum video_openxr_laser_beam
+{
+   VIDEO_OPENXR_LASER_BEAM_OFF = 0,
+   VIDEO_OPENXR_LASER_BEAM_EDIT,
+   VIDEO_OPENXR_LASER_BEAM_ALWAYS,
+   VIDEO_OPENXR_LASER_BEAM_LAST
+};
+
+/* Snap to Angles: the step edit mode turns and tilts a held item in
+ * (video_openxr_edit_snap_angles). */
+enum video_openxr_edit_snap_angles
+{
+   VIDEO_OPENXR_EDIT_SNAP_ANGLES_OFF = 0,
+   VIDEO_OPENXR_EDIT_SNAP_ANGLES_15,
+   VIDEO_OPENXR_EDIT_SNAP_ANGLES_30,
+   VIDEO_OPENXR_EDIT_SNAP_ANGLES_45,
+   VIDEO_OPENXR_EDIT_SNAP_ANGLES_90,
+   VIDEO_OPENXR_EDIT_SNAP_ANGLES_LAST
+};
+
+/* Hinge Gap: the gap edit mode leaves between screens whose edges
+ * meet (video_openxr_edit_hinge_gap). */
+enum video_openxr_edit_hinge_gap
+{
+   VIDEO_OPENXR_EDIT_HINGE_GAP_0 = 0,
+   VIDEO_OPENXR_EDIT_HINGE_GAP_1,
+   VIDEO_OPENXR_EDIT_HINGE_GAP_2,
+   VIDEO_OPENXR_EDIT_HINGE_GAP_3,
+   VIDEO_OPENXR_EDIT_HINGE_GAP_5,
+   VIDEO_OPENXR_EDIT_HINGE_GAP_10,
+   VIDEO_OPENXR_EDIT_HINGE_GAP_LAST
+};
+
+/* Edit Smoothing: how much edit mode steadies the controllers' aim
+ * (video_openxr_edit_smoothing). */
+enum video_openxr_edit_smoothing
+{
+   VIDEO_OPENXR_EDIT_SMOOTHING_OFF = 0,
+   VIDEO_OPENXR_EDIT_SMOOTHING_LOW,
+   VIDEO_OPENXR_EDIT_SMOOTHING_MEDIUM,
+   VIDEO_OPENXR_EDIT_SMOOTHING_HIGH,
+   VIDEO_OPENXR_EDIT_SMOOTHING_LAST
 };
 
 /* video_openxr_placement: where the headset keeps the screens. */
@@ -107,6 +175,21 @@ typedef struct video_views_map
    unsigned num_views;
    unsigned num_screens;
 } video_views_map_t;
+
+typedef struct video_screen_xr
+{
+   float x;
+   float y;
+   float z;
+   float yaw;
+   float pitch;
+   float roll;
+   float scale;
+   bool visible;
+} video_screen_xr_t;
+
+void video_views_xr_reset(video_screen_xr_t *screens, unsigned count);
+void video_views_xr_normalize(video_screen_xr_t *screen);
 
 bool video_views_validate(const struct retro_video_view *views,
       unsigned num_views, video_views_map_t *out);

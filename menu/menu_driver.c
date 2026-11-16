@@ -54,6 +54,7 @@
 #include "menu_dirwalk.h"
 #include "menu_cbs.h"
 #include "../driver.h"
+#include "../file_path_special.h"
 #include "../list_special.h"
 #include "../msg_hash_lbl_str.h"
 #include "../paths.h"
@@ -83,15 +84,19 @@
 #endif
 #include "../performance_counters.h"
 #include "../version.h"
-#include "../misc/cpufreq/cpufreq.h"
+#include "../os/lakka/cpufreq/cpufreq.h"
 
 #ifdef HAVE_LIBNX
 #include <switch.h>
-#include "../switch_performance_profiles.h"
+#include "../os/libnx/switch_performance_profiles.h"
 #endif
 
 #ifdef HAVE_MIST
 #include "../steam/steam.h"
+#endif
+
+#ifdef HAVE_CORE_SIGNATURES
+#include "../core_trust_runtime.h"
 #endif
 
 #ifdef HAVE_COCOATOUCH
@@ -428,6 +433,11 @@ struct menu_state *menu_state_get_ptr(void)
    return &menu_driver_state;
 }
 
+static void menu_dialog_press(struct menu_state *menu_st, int idx);
+#ifdef HAVE_CORE_SIGNATURES
+static const char *menu_core_warning_text(void);
+#endif
+
 static bool menu_should_pop_stack(const char *label)
 {
    /* > Info box */
@@ -562,6 +572,7 @@ void menu_entry_get(menu_entry_t *entry, size_t stack_idx,
          switch (entry->type)
          {
             case MENU_SETTING_ACTION_CORE_LOCK:
+            case MENU_SETTING_ACTION_CORE_SIGNATURE_CHECK:
                entry->setting_type  = ST_BOOL;
                break;
             default:
@@ -1738,6 +1749,29 @@ static bool menu_bind_is_trigger(const struct menu_bind_state *state)
    return id == RETRO_DEVICE_ID_JOYPAD_L2 || id == RETRO_DEVICE_ID_JOYPAD_R2;
 }
 
+/* The lowest bit of @now not in @before (NULL: none), or @count bits
+ * past the end for none. */
+static unsigned menu_bind_first_bit(const uint32_t *now,
+      const uint32_t *before, unsigned words)
+{
+   unsigned w;
+   for (w = 0; w < words; w++)
+   {
+      uint32_t bits = before ? (now[w] & ~before[w]) : now[w];
+      if (bits)
+      {
+         unsigned b = w * 32;
+         while (!(bits & 1))
+         {
+            bits >>= 1;
+            b++;
+         }
+         return b;
+      }
+   }
+   return words * 32;
+}
+
 static bool menu_input_key_bind_poll_find_hold_pad(
       struct menu_bind_state *new_state,
       struct retro_keybind *output,
@@ -1745,23 +1779,19 @@ static bool menu_input_key_bind_poll_find_hold_pad(
 {
    unsigned a, b, h;
    const struct menu_bind_state_port *n =
-      (const struct menu_bind_state_port*)
-      &new_state->state[p];
+      &new_state->state[new_state->now][p];
 
-   for (b = RETROK_BACKSPACE; b < RETROK_LAST; b++)
+   b = menu_bind_first_bit(n->keys, NULL, ARRAY_SIZE(n->keys));
+   if (b < RETROK_LAST)
    {
-      bool found = n->keys[b];
-
-      if (!found)
-         continue;
-
       RETRO_KEYBIND_SET_KEY(output, (enum retro_key)b);
+      new_state->from_keys = true;
       return true;
    }
 
    for (b = 0; b < MENU_MAX_MBUTTONS; b++)
    {
-      bool found = n->mouse_buttons[b];
+      bool found = BIT32_GET(n->mouse_buttons, b);
 
       if (!found)
          continue;
@@ -1778,17 +1808,15 @@ static bool menu_input_key_bind_poll_find_hold_pad(
          case RETRO_DEVICE_ID_MOUSE_HORIZ_WHEELUP:
          case RETRO_DEVICE_ID_MOUSE_HORIZ_WHEELDOWN:
             RETRO_KEYBIND_SET_MBUTTON(output, b);
+            new_state->from_keys = true;
             return true;
       }
    }
 
-   for (b = 0; b < MENU_MAX_BUTTONS; b++)
+   b = menu_bind_first_bit(n->buttons.data, NULL,
+         ARRAY_SIZE(n->buttons.data));
+   if (b < MENU_MAX_BUTTONS)
    {
-      bool found = n->buttons[b];
-
-      if (!found)
-         continue;
-
       /* L2 and R2: a trigger that is a button and an axis is bound
        * to its axis, which is analog */
       if (menu_bind_is_trigger(new_state))
@@ -1848,7 +1876,6 @@ static bool menu_input_key_bind_poll_find_hold_pad(
 }
 
 static bool menu_input_key_bind_poll_find_hold(
-      unsigned max_users,
       struct menu_bind_state *new_state,
       struct retro_keybind *output)
 {
@@ -1856,10 +1883,15 @@ static bool menu_input_key_bind_poll_find_hold(
    {
       unsigned i;
 
-      for (i = 0; i < max_users; i++)
+      /* only the slots polled can have anything held */
+      for (i = 0; i < MAX_USERS; i++)
       {
-         if (menu_input_key_bind_poll_find_hold_pad(new_state, output, i))
+         if (     (i == new_state->port || ((new_state->listen >> i) & 1))
+               && menu_input_key_bind_poll_find_hold_pad(new_state, output, i))
+         {
+            new_state->from = i;
             return true;
+         }
       }
    }
 
@@ -1867,31 +1899,27 @@ static bool menu_input_key_bind_poll_find_hold(
 }
 
 static bool menu_input_key_bind_poll_find_trigger_pad(
-      struct menu_bind_state *state,
       struct menu_bind_state *new_state,
       struct retro_keybind *output,
       unsigned p)
 {
    unsigned a, b, h;
-   const struct menu_bind_state_port *n = (const struct menu_bind_state_port*)
-      &new_state->state[p];
-   const struct menu_bind_state_port *o = (const struct menu_bind_state_port*)
-      &state->state[p];
+   const struct menu_bind_state_port *n =
+      &new_state->state[new_state->now][p];
+   const struct menu_bind_state_port *o =
+      &new_state->state[!new_state->now][p];
 
-   for (b = RETROK_BACKSPACE; b < RETROK_LAST; b++)
+   b = menu_bind_first_bit(n->keys, o->keys, ARRAY_SIZE(n->keys));
+   if (b < RETROK_LAST)
    {
-      bool found = n->keys[b] && !o->keys[b];
-
-      if (!found)
-         continue;
-
       RETRO_KEYBIND_SET_KEY(output, (enum retro_key)b);
+      new_state->from_keys = true;
       return true;
    }
 
    for (b = 0; b < MENU_MAX_MBUTTONS; b++)
    {
-      bool found = n->mouse_buttons[b] && !o->mouse_buttons[b];
+      bool found = BIT32_GET(n->mouse_buttons, b) && !BIT32_GET(o->mouse_buttons, b);
 
       if (!found)
          continue;
@@ -1908,20 +1936,18 @@ static bool menu_input_key_bind_poll_find_trigger_pad(
          case RETRO_DEVICE_ID_MOUSE_HORIZ_WHEELUP:
          case RETRO_DEVICE_ID_MOUSE_HORIZ_WHEELDOWN:
             RETRO_KEYBIND_SET_MBUTTON(output, b);
+            new_state->from_keys = true;
             return true;
       }
    }
 
-   for (b = 0; b < MENU_MAX_BUTTONS; b++)
+   b = menu_bind_first_bit(n->buttons.data, o->buttons.data,
+         ARRAY_SIZE(n->buttons.data));
+   if (b < MENU_MAX_BUTTONS)
    {
-      bool found = n->buttons[b] && !o->buttons[b];
-
-      if (!found)
-         continue;
-
       /* L2 and R2: a trigger that is a button and an axis is bound
        * to its axis, which is analog */
-      if (menu_bind_is_trigger(state))
+      if (menu_bind_is_trigger(new_state))
       {
          uint32_t joyaxis = menu_bind_trigger_axis(n->axes,
                new_state->axis_state[p].rested_axes, MENU_MAX_AXES);
@@ -2004,20 +2030,23 @@ static bool menu_input_key_bind_poll_find_trigger_pad(
 }
 
 static bool menu_input_key_bind_poll_find_trigger(
-      unsigned max_users,
-      struct menu_bind_state *state,
       struct menu_bind_state *new_state,
       struct retro_keybind *output)
 {
-   if (state && new_state)
+   if (new_state)
    {
       unsigned i;
 
-      for (i = 0; i < max_users; i++)
+      /* only the slots polled can have anything pressed */
+      for (i = 0; i < MAX_USERS; i++)
       {
-         if (menu_input_key_bind_poll_find_trigger_pad(
-                  state, new_state, output, i))
+         if (     (i == new_state->port || ((new_state->listen >> i) & 1))
+               && menu_input_key_bind_poll_find_trigger_pad(
+                  new_state, output, i))
+         {
+            new_state->from = i;
             return true;
+         }
       }
    }
 
@@ -2030,10 +2059,15 @@ static bool menu_input_key_bind_poll_find_trigger(
 static void menu_input_key_bind_poll_bind_get_rested_axes(
       struct menu_bind_state *state)
 {
+   unsigned s;
    input_driver_capture_pad(state->port, false,
          NULL, 0,
          state->axis_state[state->port].rested_axes, MENU_MAX_AXES,
          NULL, 0);
+   for (s = 0; s < MAX_USERS; s++)
+      if ((state->listen >> s) & 1)
+         input_driver_capture_pad(s, false, NULL, 0,
+               state->axis_state[s].rested_axes, MENU_MAX_AXES, NULL, 0);
 }
 
 MENU_NOINLINE static void input_event_osk_iterate(void *osk_grid, enum osk_type osk_idx)
@@ -2153,8 +2187,10 @@ static bool menu_input_views_fb_point(const gfx_display_t *p_disp,
 {
    struct video_viewport vp = {0};
 
-   /* Drivers keep the aspect once content has loaded. */
-   vp.full_dims             = layout->ui_dims;
+   /* Drivers keep the aspect once content has loaded. A window that
+    * shows no screen has no ui_dims: the UI is the whole window. */
+   vp.full_dims             = layout->num_placements
+      ? layout->ui_dims : video_driver_get_output_dims();
    video_driver_update_viewport(&vp, false, true, true);
 
    if (!VIDEO_SCALE_W(vp.dims) || !VIDEO_SCALE_H(vp.dims))
@@ -2181,6 +2217,18 @@ static void menu_input_views_point(
       *x = ui_x;
       *y = ui_y;
    }
+}
+
+/* A point in the menu's own window, which its UI layer of @width x
+ * @height fills, to RGUI's framebuffer as the driver fits it there */
+static void menu_input_window_fb_point(const gfx_display_t *p_disp,
+      unsigned width, unsigned height, int *x, int *y)
+{
+   struct video_viewport vp = {0};
+   vp.full_dims             = VIDEO_SCALE_PACK(width, height);
+   video_driver_update_viewport(&vp, false, true, true);
+   if (VIDEO_SCALE_W(vp.dims) && VIDEO_SCALE_H(vp.dims))
+      menu_input_fb_point(p_disp, &vp, (float)*x, (float)*y, x, y);
 }
 
 MENU_NOINLINE static void menu_input_get_mouse_hw_state(
@@ -2330,7 +2378,11 @@ MENU_NOINLINE static void menu_input_get_touchscreen_hw_state(
    int pointer_y                                = 0;
    const input_pointer_view_t *view             = input_driver_pointer_view();
    bool state_inited                            = (view->flags & INPUT_PTR_VIEW_VALID) != 0;
-   const video_views_layout_t *layout           = video_driver_get_views_layout();
+   /* The menu's own window, which it fills: no views to map through */
+   unsigned window                              =
+         video_driver_get_ui_layer_window(VIDEO_WINDOW_UI_MENU);
+   const video_views_layout_t *layout           = window
+         ? NULL : video_driver_get_views_layout();
    /* Is a background texture set for the current menu driver?
     * Checks if the menu framebuffer is set.
     * This would usually only return true
@@ -2340,7 +2392,7 @@ MENU_NOINLINE static void menu_input_get_touchscreen_hw_state(
    /* With views the window's point is mapped here: the pointer
     * device's is in the core's packed frame. */
    int pointer_device                           =
-         (menu_has_fb && !layout) ?
+         (menu_has_fb && !layout && !window) ?
                RETRO_DEVICE_POINTER : RARCH_DEVICE_POINTER_SCREEN;
    static uint32_t last_pos                     = 0;
    uint32_t now_pos;
@@ -2361,8 +2413,10 @@ MENU_NOINLINE static void menu_input_get_touchscreen_hw_state(
                         );
 
 #ifdef HAVE_OVERLAY
-   /* Menu pointer controls are ignored when overlays are enabled. */
-   if (overlay_active)
+   /* Menu pointer controls are ignored when overlays are enabled,
+    * unless the menu has a window of its own: the overlay is the main
+    * window's */
+   if (overlay_active && !window)
       pointer_enabled   = false;
 #endif
 
@@ -2386,11 +2440,21 @@ MENU_NOINLINE static void menu_input_get_touchscreen_hw_state(
     * NOT be dependent on this */
    fb_width             = VIDEO_SCALE_W(p_disp->framebuf_dims);
    fb_height            = VIDEO_SCALE_H(p_disp->framebuf_dims);
-   if (layout)
+   if (window)
    {
-      /* The window: the canvas, unless that is offscreen. */
+      unsigned dims     = video_driver_get_ui_layer_dims(
+            VIDEO_WINDOW_UI_MENU);
+      fb_width          = VIDEO_SCALE_W(dims);
+      fb_height         = VIDEO_SCALE_H(dims);
+   }
+   else if (layout)
+   {
+      /* The window: the canvas, unless that is offscreen. One that
+       * shows no screen has neither. */
       unsigned dims     = layout->offscreen
          ? layout->ui_dims : layout->canvas_dims;
+      if (!layout->num_placements)
+         dims           = video_driver_get_output_dims();
       fb_width          = VIDEO_SCALE_W(dims);
       fb_height         = VIDEO_SCALE_H(dims);
    }
@@ -2414,6 +2478,8 @@ MENU_NOINLINE static void menu_input_get_touchscreen_hw_state(
 
    if (layout)
       menu_input_views_point(p_disp, layout, menu_has_fb, &x, &y);
+   else if (window && menu_has_fb)
+      menu_input_window_fb_point(p_disp, fb_width, fb_height, &x, &y);
    hw_state->pos = VIDEO_POS_PACK(x, y);
 
    /* Whether it moved, both axes in one compare.
@@ -3737,7 +3803,8 @@ static enum action_iterate_type action_iterate_type(const char *label, struct me
    /* a combination being set by holding its buttons: over any list */
    if (input_entry_capture_running())
       return ITERATE_TYPE_ENTRY_CAPTURE;
-   if (menu_st->dialog_st.confirm_msg && menu_st->dialog_st.confirm_cmd)
+   if (     (menu_st->dialog_st.confirm_msg && menu_st->dialog_st.confirm_cmd)
+         || menu_st->dialog_st.button_count)
       return ITERATE_TYPE_CONFIRM;
    if (!strcmp(label, "info_screen"))
       return ITERATE_TYPE_INFO;
@@ -3807,45 +3874,51 @@ static void menu_input_key_bind_poll_bind_state(
    unsigned b;
    bool state_inited                       = input_driver_has_device_state();
    unsigned port                           = state->port;
+   struct menu_bind_state_port *ports;
 
-   memset(state->state, 0, sizeof(state->state));
+   /* last frame's stays as it is, to be compared with */
+   state->now                              = !state->now;
+   ports                                   = state->state[state->now];
+   for (b = 0; b < MAX_USERS; b++)
+      if (b == port || ((state->listen >> b) & 1))
+         memset(&ports[b], 0, sizeof(ports[b]));
 
    if (state_inited)
    {
       /* Poll mouse (on the relevant port)
        *
        * Check if key was being pressed by
-       * user with mouse number 'port'
+       * the mouse of the user being bound
        *
        * NOTE: We start iterating on 2 (RETRO_DEVICE_ID_MOUSE_LEFT),
        * because we want to skip the axes
        */
       for (b = 2; b < MENU_MAX_MBUTTONS; b++)
       {
-         state->state[port].mouse_buttons[b] =
-            input_driver_bind_capture_state(
+         if (input_driver_bind_capture_state(
                   joy_idx,
-                  port,
-                  RETRO_DEVICE_MOUSE, 0, b);
+                  state->user,
+                  RETRO_DEVICE_MOUSE, 0, b))
+            BIT32_SET(ports[port].mouse_buttons, b);
       }
 
-      for (b = RETROK_BACKSPACE; b < RETROK_LAST; b++)
-      {
-         state->state[port].keys[b] =
-            input_driver_bind_capture_state(
-                  joy_idx,
-                  0,
-                  RETRO_DEVICE_KEYBOARD, 0, b);
-      }
+      input_driver_bind_capture_keys(joy_idx, ports[port].keys);
    }
 
    state->skip                = timed_out;
 
    /* the controller itself: polled, then read as it has it */
    input_driver_capture_pad(port, true,
-         state->state[port].buttons, MENU_MAX_BUTTONS,
-         state->state[port].axes,    MENU_MAX_AXES,
-         state->state[port].hats,    MENU_MAX_HATS);
+         &ports[port].buttons, MENU_MAX_BUTTONS,
+         ports[port].axes,    MENU_MAX_AXES,
+         ports[port].hats,    MENU_MAX_HATS);
+   /* and for a hotkey, the controllers sharing its core port */
+   for (b = 0; b < MAX_USERS; b++)
+      if (b != port && ((state->listen >> b) & 1))
+         input_driver_capture_pad(b, false,
+               &ports[b].buttons, MENU_MAX_BUTTONS,
+               ports[b].axes,    MENU_MAX_AXES,
+               ports[b].hats,    MENU_MAX_HATS);
 }
 
 MENU_NOINLINE static int menu_dialog_iterate(
@@ -4006,6 +4079,112 @@ static void bundle_decompressed(retro_task_t *task,
    command_event(CMD_EVENT_MENU_SAVE_CURRENT_CONFIG, NULL);
 }
 
+#if defined(HAVE_ONLINE_UPDATER) && defined(HAVE_NETWORKING) && defined(HAVE_COMPRESSION) && defined(HAVE_CONFIGFILE)
+enum menu_first_run_dl
+{
+   MENU_FIRST_RUN_DL_ASSETS     = (1 << 0),
+   MENU_FIRST_RUN_DL_AUTOCONFIG = (1 << 1),
+   MENU_FIRST_RUN_DL_CORE_INFO  = (1 << 2),
+   MENU_FIRST_RUN_DL_DATABASES  = (1 << 3),
+   MENU_FIRST_RUN_DL_OVERLAYS   = (1 << 4)
+};
+
+/* A directory that is configured but missing or empty */
+static bool menu_first_run_dir_missing(const char *dir)
+{
+   return *dir && (!path_is_directory(dir) || path_is_empty_directory(dir));
+}
+
+#ifdef HAVE_UPDATE_ASSETS
+/* A UWP install holds an assets directory with only an empty
+ * wallpapers folder in it, so a look at the top level alone calls
+ * it complete.  Where Ozone is built in, its own folder is the one
+ * to ask: when that has files the parent has them too, so the
+ * parent needs no look of its own. */
+static bool menu_first_run_assets_missing(const char *dir)
+{
+#ifdef HAVE_OZONE
+   char ozone[PATH_MAX_LENGTH];
+
+   if (!*dir)
+      return false;
+
+   fill_pathname_join_special(ozone, dir, "ozone", sizeof(ozone));
+   return menu_first_run_dir_missing(ozone);
+#else
+   return menu_first_run_dir_missing(dir);
+#endif
+}
+#endif
+
+/* On a first run the directory usually does not exist yet, so ask the
+ * nearest existing parent.  An unknown answer (-1) does not hold the
+ * download back; only a known shortfall does. */
+static bool menu_first_run_has_space(const char *dir, int64_t need)
+{
+   char tmp[PATH_MAX_LENGTH];
+   strlcpy(tmp, dir, sizeof(tmp));
+   while (*tmp && !path_is_directory(tmp))
+      path_parent_dir(tmp, strlen(tmp));
+   if (*tmp)
+   {
+      int64_t avail = path_get_free_space(tmp);
+      if (avail >= 0 && avail < need)
+         return false;
+   }
+   return true;
+}
+
+/* Which bundles are missing; scanned once, at menu init */
+static uint8_t menu_first_run_scan(settings_t *settings)
+{
+   uint8_t mask = 0;
+#ifdef HAVE_UPDATE_ASSETS
+   if (     menu_first_run_assets_missing(settings->paths.directory_assets)
+         && menu_first_run_has_space(settings->paths.directory_assets,
+            ASSETS_ZIP_PLUS_DECOMPRESSION_SIZE))
+      mask |= MENU_FIRST_RUN_DL_ASSETS;
+#endif
+   if (menu_first_run_dir_missing(settings->paths.directory_autoconfig))
+      mask |= MENU_FIRST_RUN_DL_AUTOCONFIG;
+#ifdef HAVE_UPDATE_CORE_INFO
+   if (menu_first_run_dir_missing(settings->paths.path_libretro_info))
+      mask |= MENU_FIRST_RUN_DL_CORE_INFO;
+#endif
+#ifdef HAVE_LIBRETRODB
+   if (     menu_first_run_dir_missing(settings->paths.path_content_database)
+         && menu_first_run_has_space(settings->paths.path_content_database,
+            DATABASE_RDB_ZIP_PLUS_DECOMPRESSION_SIZE))
+      mask |= MENU_FIRST_RUN_DL_DATABASES;
+#endif
+#if defined(RARCH_MOBILE) && defined(HAVE_OVERLAY)
+   if (menu_first_run_dir_missing(settings->paths.directory_overlay))
+      mask |= MENU_FIRST_RUN_DL_OVERLAYS;
+#endif
+   return mask;
+}
+
+/* Confirmed: push the downloads found at init, through the same path
+ * as the Online Updater entries (streamed straight to disk) */
+void menu_first_run_download_start(void)
+{
+   uint8_t mask = menu_driver_state.dialog_st.first_run_downloads;
+
+   menu_driver_state.dialog_st.first_run_downloads = 0;
+
+   if (mask & MENU_FIRST_RUN_DL_ASSETS)
+      action_ok_download_bundle(MENU_ENUM_LABEL_CB_UPDATE_ASSETS);
+   if (mask & MENU_FIRST_RUN_DL_AUTOCONFIG)
+      action_ok_download_bundle(MENU_ENUM_LABEL_CB_UPDATE_AUTOCONFIG_PROFILES);
+   if (mask & MENU_FIRST_RUN_DL_CORE_INFO)
+      action_ok_download_bundle(MENU_ENUM_LABEL_CB_UPDATE_CORE_INFO_FILES);
+   if (mask & MENU_FIRST_RUN_DL_DATABASES)
+      action_ok_download_bundle(MENU_ENUM_LABEL_CB_UPDATE_DATABASES);
+   if (mask & MENU_FIRST_RUN_DL_OVERLAYS)
+      action_ok_download_bundle(MENU_ENUM_LABEL_CB_UPDATE_OVERLAYS);
+}
+#endif
+
 static bool rarch_menu_init(
       struct menu_state *menu_st,
       menu_dialog_t        *p_dialog,
@@ -4077,6 +4256,17 @@ static bool rarch_menu_init(
       configuration_set_int(settings,
             settings->uints.bundle_assets_extract_last_version, 1);
    }
+#if defined(HAVE_ONLINE_UPDATER) && defined(HAVE_NETWORKING) && defined(HAVE_CONFIGFILE)
+   /* First run with nothing bundled: offer what is missing */
+   else if (menu_show_start_screen)
+   {
+      p_dialog->first_run_downloads = menu_first_run_scan(settings);
+      if (p_dialog->first_run_downloads)
+         menu_dialog_confirm_set(menu_st,
+               MSG_FIRST_RUN_DOWNLOAD_PROMPT,
+               CMD_EVENT_MENU_FIRST_RUN_DOWNLOAD);
+   }
+#endif
 #endif
 
    return true;
@@ -4641,11 +4831,17 @@ bool menu_entries_append(
    if (!list || !label)
       return false;
 
+   if (!(cbs = menu_cbs_alloc()))
+      return false;
+
    /* Bail out on a failed append rather than carrying on with
     * idx = list->size - 1, which underflows to SIZE_MAX when the
     * list is still empty. */
    if (!file_list_append(list, path, label, type, directory_ptr, entry_idx))
+   {
+      mempool_free(&menu_cbs_pool, cbs);
       return false;
+   }
 
    if (mlist && mlist->size)
       menu_path          = mlist->list[mlist->size - 1].path;
@@ -4691,9 +4887,6 @@ bool menu_entries_append(
     * stack-local file_list_t that menu_displaylist_build_list() is
     * handed directly. */
    list->actiondata_free           = menu_entries_cbs_free;
-
-   if (!(cbs = menu_cbs_alloc()))
-      return false;
 
    cbs->enum_idx                   = enum_idx;
    cbs->checked                    = false;
@@ -4753,7 +4946,13 @@ void menu_entries_prepend(file_list_t *list,
    if (!list || !label)
       return;
 
-   file_list_insert(list, path, label, type, directory_ptr, entry_idx, 0);
+   if (!(cbs = menu_cbs_alloc()))
+      return;
+   if (!file_list_insert(list, path, label, type, directory_ptr, entry_idx, 0))
+   {
+      mempool_free(&menu_cbs_pool, cbs);
+      return;
+   }
    if (mlist && mlist->size)
       menu_path          = mlist->list[mlist->size - 1].path;
 
@@ -4780,11 +4979,6 @@ void menu_entries_prepend(file_list_t *list,
 
    /* See the matching comment in menu_entries_append(). */
    list->actiondata_free           = menu_entries_cbs_free;
-   cbs                             = menu_cbs_alloc();
-
-   if (!cbs)
-      return;
-
    cbs->enum_idx                   = enum_idx;
    cbs->checked                    = false;
    cbs->setting                    = menu_setting_find_enum(cbs->enum_idx);
@@ -5070,6 +5264,11 @@ static const char * msvc_vercode_to_str(const unsigned vercode)
  * (shown at the top of the UI). */
 void menu_entries_get_core_title(char *s, size_t len)
 {
+   /* A content load in flight swaps the core under the menu over
+    * several frames - the next core's library opened, the old one
+    * closed, the next one brought up: the title stays what it was
+    * until the load is through, and changes once. */
+   static char held[NAME_MAX_LENGTH + 64];
    struct retro_system_info *sysinfo = &runloop_state_get_ptr()->system.info;
    const char *core_name             =
        (sysinfo && (sysinfo->library_name && *sysinfo->library_name))
@@ -5079,7 +5278,15 @@ void menu_entries_get_core_title(char *s, size_t len)
       (sysinfo && sysinfo->library_version)
       ? sysinfo->library_version
       : "";
-   size_t _len = strlcpy(s, PACKAGE_VERSION, len);
+   size_t _len;
+
+   if (runloop_is_content_switching() && *held)
+   {
+      strlcpy(s, held, len);
+      return;
+   }
+
+   _len  = strlcpy(s, PACKAGE_VERSION, len);
 #if defined(_MSC_VER)
    _len += strlcpy(s + _len, msvc_vercode_to_str(_MSC_VER), len - _len);
 #endif
@@ -5091,6 +5298,7 @@ void menu_entries_get_core_title(char *s, size_t len)
       _len += strlcpy(s + _len, core_version, len - _len);
       strlcpy_lit(s + _len, ")", len - _len);
    }
+   strlcpy(held, s, sizeof(held));
 }
 
 static bool menu_driver_init_internal(
@@ -5300,6 +5508,49 @@ static bool menu_input_key_bind_custom_bind_keyboard_cb(
 }
 #endif
 
+void menu_input_plays_as_change(unsigned row, unsigned player)
+{
+   settings_t *settings       = config_get_ptr();
+   struct menu_state *menu_st = &menu_driver_state;
+   bool slot                  = row < MAX_INPUT_DEVICES;
+
+   /* gone, or back, since the list was made: the list is made again */
+   if (slot
+         ? !input_config_get_device_name(row)
+         : input_config_plays_as_entry_taken(row - MAX_INPUT_DEVICES))
+   {
+      menu_st->flags &= ~MENU_ST_FLAG_PREVENT_POPULATE;
+      menu_st->flags |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+      return;
+   }
+   /* the same player: nothing is placed again */
+   if (player == (slot
+         ? input_config_plays_as_player(row)
+         : input_config_plays_as_entry_player(row - MAX_INPUT_DEVICES)))
+      return;
+
+   if (slot)
+   {
+      if (!input_config_plays_as_set(row, player))
+      {
+         const char *msg = msg_hash_to_str(MSG_INPUT_PLAYS_AS_FULL);
+         runloop_msg_queue_push(msg, strlen(msg), 1, 180, true, NULL,
+               MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+         return;
+      }
+      input_autoconfigure_reallocate_ports(row);
+   }
+   else
+      input_config_plays_as_set_entry(row - MAX_INPUT_DEVICES, player);
+   settings->flags |= SETTINGS_FLG_MODIFIED;
+   /* the rows follow the controllers: the list is made again, with
+    * the cursor kept on this one */
+   if (menu_st->driver_data)
+      menu_st->driver_data->plays_as_row = row + 1;
+   menu_st->flags  &= ~MENU_ST_FLAG_PREVENT_POPULATE;
+   menu_st->flags  |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+}
+
 bool menu_input_key_bind_set_mode(
       enum menu_input_binds_ctl_state state, void *data)
 {
@@ -5326,11 +5577,18 @@ bool menu_input_key_bind_set_mode(
    index_offset                        = setting->index_offset;
    binds->port                         = settings->uints.input_joypad_index[
       index_offset];
+   /* a hotkey is bound from user 1's pad or a controller that fires
+    * the hotkeys, which keeps the press as its own */
+   binds->listen                       = (binds->out_id >= RARCH_FIRST_META_KEY)
+      ? input_config_hotkey_listen_slots() : 0;
+   binds->from                         = binds->port;
+   binds->from_keys                    = false;
 
+   /* neither what was held nor what was locked in the capture before */
+   memset(binds->state, 0, sizeof(binds->state));
+   memset(binds->axis_state, 0, sizeof(binds->axis_state));
    menu_input_key_bind_poll_bind_get_rested_axes(binds);
-   menu_input_key_bind_poll_bind_state(
-         settings->uints.input_joypad_index[binds->port],
-         binds, false);
+   menu_input_key_bind_poll_bind_state(binds->port, binds, false);
 
    current_usec                        = cpu_features_get_time_usec();
 
@@ -5367,20 +5625,33 @@ MENU_NOINLINE static bool menu_input_key_bind_iterate(
       menu_input_ctx_bind_t *bind,
       retro_time_t current_time)
 {
+   char heard[128];
    bool               timed_out   = false;
    struct menu_state *menu_st     = &menu_driver_state;
    struct menu_bind_state *_binds = &menu_st->input_binds;
    menu_input_t *menu_input       = &menu_st->input_state;
    uint64_t input_bind_hold_us    = settings->uints.input_bind_hold * 1000000;
    uint64_t input_bind_timeout_us = settings->uints.input_bind_timeout * 1000000;
+   unsigned bind_id               = _binds->begin - MENU_SETTINGS_BIND_BEGIN;
+
+   /* a hotkey says whose controllers it hears */
+   heard[0] = '\0';
+   if (bind_id >= RARCH_FIRST_META_KEY && bind_id < RARCH_BIND_LIST_END)
+   {
+      size_t _len = strlcpy(heard, "\n", sizeof(heard));
+      snprintf(heard + _len, sizeof(heard) - _len,
+            msg_hash_to_str(MSG_INPUT_BIND_LISTENING_PLAYER),
+            input_config_user_player(input_config_hotkey_user()) + 1);
+   }
 
    snprintf(bind->s, bind->len,
-         "%s..\n(%s %1.1f %s)\n \n%s\n \n",
+         "%s..\n(%s %1.1f %s)\n \n%s%s\n \n",
          msg_hash_to_str(MSG_INPUT_BIND_PRESS),
          msg_hash_to_str(MSG_INPUT_BIND_TIMEOUT),
          ((float)_binds->timer_timeout.timeout_us / 1000000),
          msg_hash_to_str(MENU_ENUM_LABEL_VALUE_SECONDS),
-         input_config_bind_map_get_desc(_binds->begin - MENU_SETTINGS_BIND_BEGIN));
+         input_config_bind_map_get_desc(bind_id),
+         heard);
 
    /* Tick main timers */
    _binds->timer_hold   .current    = current_time;
@@ -5415,16 +5686,17 @@ MENU_NOINLINE static bool menu_input_key_bind_iterate(
 
    {
       bool complete                         = false;
-      struct menu_bind_state new_binds      = *_binds;
+      bool skipped                          = _binds->skip;
       unsigned bind_index                   = _binds->begin - MENU_SETTINGS_BIND_BEGIN;
-      const struct retro_keybind *old_binds = input_config_bind(new_binds.port, bind_index);
+      const struct retro_keybind *old_binds = input_config_bind(_binds->out_user, bind_index);
       unsigned old_key                      = RETRO_KEYBIND_KEY(old_binds);
 
       input_driver_set_keyboard_mapping_blocked(false);
 
-      menu_input_key_bind_poll_bind_state(
-            settings->uints.input_joypad_index[new_binds.port],
-            &new_binds, timed_out);
+      _binds->from      = _binds->port;
+      _binds->from_keys = false;
+      menu_input_key_bind_poll_bind_state(_binds->port,
+            _binds, timed_out);
 
       /* Wait until keys and buttons are released */
       if (input_driver_waiting_input_release())
@@ -5432,109 +5704,131 @@ MENU_NOINLINE static bool menu_input_key_bind_iterate(
          if (input_bind_hold_us)
          {
             if (!menu_input_key_bind_poll_find_hold(
-                  settings->uints.input_max_users,
-                  &new_binds, &(new_binds.buffer)))
+                  _binds, &(_binds->buffer)))
                input_driver_set_wait_input_release(false);
          }
          else
          {
             if (!menu_input_key_bind_poll_find_trigger(
-                  settings->uints.input_max_users,
-                  _binds, &new_binds, &(new_binds.buffer)))
+                  _binds, &(_binds->buffer)))
                input_driver_set_wait_input_release(false);
          }
 
          if (!input_driver_waiting_input_release())
          {
             /* Reset timeout */
-            new_binds.timer_timeout.timeout_us  = input_bind_timeout_us;
-            new_binds.timer_timeout.current     = current_time;
-            new_binds.timer_timeout.timeout_end = current_time + input_bind_timeout_us;
+            _binds->timer_timeout.timeout_us  = input_bind_timeout_us;
+            _binds->timer_timeout.current     = current_time;
+            _binds->timer_timeout.timeout_end = current_time + input_bind_timeout_us;
          }
          else
             snprintf(bind->s, bind->len,
-                  "%s..\n(%s %1.1f %s)\n \n--- %s ---\n \n",
+                  "%s..\n(%s %1.1f %s)\n \n--- %s ---%s\n \n",
                   msg_hash_to_str(MSG_INPUT_BIND_PRESS),
                   msg_hash_to_str(MSG_INPUT_BIND_TIMEOUT),
                   ((float)_binds->timer_timeout.timeout_us / 1000000),
                   msg_hash_to_str(MENU_ENUM_LABEL_VALUE_SECONDS),
-                  msg_hash_to_str(MSG_INPUT_BIND_RELEASE)
+                  msg_hash_to_str(MSG_INPUT_BIND_RELEASE),
+                  heard
                   );
       }
       else if (input_bind_hold_us)
       {
          /* Keep resetting bind during the hold period,
           * or we'll potentially bind joystick and mouse, etc. */
-         new_binds.buffer                       = *input_config_bind(
-               new_binds.out_user, new_binds.out_id);
+         _binds->buffer                       = *input_config_bind(
+               _binds->out_user, _binds->out_id);
 
          if (menu_input_key_bind_poll_find_hold(
-               settings->uints.input_max_users,
-               &new_binds, &new_binds.buffer))
+               _binds, &_binds->buffer))
          {
             char hold_label[NAME_MAX_LENGTH];
 
             hold_label[0]                       = '\0';
 
             /* Inhibit timeout */
-            new_binds.timer_timeout.timeout_us  = input_bind_timeout_us;
-            new_binds.timer_timeout.current     = current_time;
-            new_binds.timer_timeout.timeout_end = current_time + input_bind_timeout_us;
+            _binds->timer_timeout.timeout_us  = input_bind_timeout_us;
+            _binds->timer_timeout.current     = current_time;
+            _binds->timer_timeout.timeout_end = current_time + input_bind_timeout_us;
 
             /* Run hold timer */
-            new_binds.timer_hold.current        = current_time;
-            new_binds.timer_hold.timeout_us     = new_binds.timer_hold.timeout_end - current_time;
+            _binds->timer_hold.current        = current_time;
+            _binds->timer_hold.timeout_us     = _binds->timer_hold.timeout_end - current_time;
 
             /* Transient bind under capture: it lives on the stack and has
              * no entry in the label arrays, so it carries no labels. */
             input_config_get_bind_string(settings, hold_label,
-                  &new_binds.buffer, NULL, NULL, NULL, sizeof(hold_label));
+                  &_binds->buffer, NULL, NULL, NULL, sizeof(hold_label));
 
             snprintf(bind->s, bind->len,
-                  "%s..\n(%s %1.1f %s)\n \n%s\n   %s",
+                  "%s..\n(%s %1.1f %s)\n \n%s\n   %s%s",
                   msg_hash_to_str(MSG_INPUT_BIND_PRESS),
                   msg_hash_to_str(MSG_INPUT_BIND_HOLD),
-                  ((float)new_binds.timer_hold.timeout_us / 1000000),
+                  ((float)_binds->timer_hold.timeout_us / 1000000),
                   msg_hash_to_str(MENU_ENUM_LABEL_VALUE_SECONDS),
-                  input_config_bind_map_get_desc(_binds->begin - MENU_SETTINGS_BIND_BEGIN),
-                  hold_label);
+                  input_config_bind_map_get_desc(bind_id),
+                  hold_label,
+                  heard);
 
             /* Hold complete? */
-            if (new_binds.timer_hold.timeout_us <= 0)
+            if (_binds->timer_hold.timeout_us <= 0)
                complete = true;
          }
          else
          {
             /* Reset hold countdown */
-            new_binds.timer_hold.timeout_us     = input_bind_hold_us;
-            new_binds.timer_hold.current        = current_time;
-            new_binds.timer_hold.timeout_end    = current_time + input_bind_hold_us;
+            _binds->timer_hold.timeout_us     = input_bind_hold_us;
+            _binds->timer_hold.current        = current_time;
+            _binds->timer_hold.timeout_end    = current_time + input_bind_hold_us;
          }
       }
-      else if ((new_binds.skip && !_binds->skip)
+      else if ((_binds->skip && !skipped)
             || menu_input_key_bind_poll_find_trigger(
-               settings->uints.input_max_users,
-               _binds, &new_binds, &(new_binds.buffer)))
+               _binds, &(_binds->buffer)))
          complete = true;
 
       if (complete)
       {
          /* Always stop binding when not binding all */
-         bool stop_binding                   = new_binds.order == 0 && new_binds.begin == new_binds.last;
+         bool stop_binding                   = _binds->order == 0 && _binds->begin == _binds->last;
 
          /* Update bind */
-         /* written where the bind is kept now, which is asked for
-          * here: the write is counted as a change when it is made,
-          * and no address is carried from the frame the capture
-          * began in */
-         *input_config_bind_edit(new_binds.out_user, new_binds.out_id)
-                                             = new_binds.buffer;
+         /* a sharing controller's press goes to its own bind, and that
+          * of user 1's pad or the hotkey user's does where it has its
+          * own for the hotkey; keys, mouse buttons and the rest go to
+          * the set */
+         if (     !_binds->skip
+               && !_binds->from_keys
+               && input_config_hotkey_bind_own(_binds->from,
+                     _binds->out_id))
+         {
+            /* refused with the controller still connected only when
+             * the list is full */
+            if (     !input_config_plays_as_set_hotkey(_binds->from,
+                        _binds->out_id, _binds->buffer.joykey,
+                        _binds->buffer.joyaxis)
+                  && input_config_get_device_name(_binds->from))
+            {
+               const char *msg = msg_hash_to_str(MSG_INPUT_PLAYS_AS_FULL);
+               runloop_msg_queue_push(msg, strlen(msg), 1, 180, true, NULL,
+                     MESSAGE_QUEUE_ICON_DEFAULT,
+                     MESSAGE_QUEUE_CATEGORY_WARNING);
+            }
+            settings->flags |= SETTINGS_FLG_MODIFIED;
+         }
+         else
+            /* written where the bind is kept now, which is asked for
+             * here: the write is counted as a change when it is made,
+             * and no address is carried from the frame the capture
+             * began in */
+            *input_config_bind_edit(_binds->out_user, _binds->out_id)
+                                             = _binds->buffer;
 
          /* Update keyboard mapping bits */
-         if (RETRO_KEYBIND_KEY(&new_binds.buffer))
+         if (RETRO_KEYBIND_KEY(&_binds->buffer))
          {
             input_keyboard_mapping_bits(0, old_key);
-            input_keyboard_mapping_bits(1, RETRO_KEYBIND_KEY(&new_binds.buffer));
+            input_keyboard_mapping_bits(1, RETRO_KEYBIND_KEY(&_binds->buffer));
          }
 
          /* Avoid new binds triggering things right away. */
@@ -5542,10 +5836,10 @@ MENU_NOINLINE static bool menu_input_key_bind_iterate(
          input_driver_hold_held_input();
 
          /* Use human readable order instead */
-         new_binds.order++;
-         new_binds.begin = MENU_SETTINGS_BIND_BEGIN + input_config_bind_order[new_binds.order];
+         _binds->order++;
+         _binds->begin = MENU_SETTINGS_BIND_BEGIN + input_config_bind_order[_binds->order];
 
-         if (     new_binds.order > ARRAY_SIZE(input_config_bind_order) - 1
+         if (     _binds->order > ARRAY_SIZE(input_config_bind_order) - 1
                || stop_binding)
          {
             input_driver_set_keyboard_press_cb(NULL, NULL);
@@ -5557,20 +5851,19 @@ MENU_NOINLINE static bool menu_input_key_bind_iterate(
          input_driver_set_wait_input_release(true);
 
          /* Next bind */
-         new_binds.out_user                  = new_binds.port;
-         new_binds.out_id                    =
-            input_config_bind_order[new_binds.order];
-         new_binds.buffer = *input_config_bind(
-               new_binds.out_user, new_binds.out_id);
-         new_binds.timer_hold   .timeout_us  = input_bind_hold_us;
-         new_binds.timer_hold   .current     = current_time;
-         new_binds.timer_hold   .timeout_end = current_time + input_bind_hold_us;
-         new_binds.timer_timeout.timeout_us  = input_bind_timeout_us;
-         new_binds.timer_timeout.current     = current_time;
-         new_binds.timer_timeout.timeout_end = current_time + input_bind_timeout_us;
+         _binds->out_user                  = _binds->user;
+         _binds->out_id                    =
+            input_config_bind_order[_binds->order];
+         _binds->buffer = *input_config_bind(
+               _binds->out_user, _binds->out_id);
+         _binds->timer_hold   .timeout_us  = input_bind_hold_us;
+         _binds->timer_hold   .current     = current_time;
+         _binds->timer_hold   .timeout_end = current_time + input_bind_hold_us;
+         _binds->timer_timeout.timeout_us  = input_bind_timeout_us;
+         _binds->timer_timeout.current     = current_time;
+         _binds->timer_timeout.timeout_end = current_time + input_bind_timeout_us;
       }
 
-      *(_binds) = new_binds;
    }
 
    /* Pointer input must be inhibited on each
@@ -5714,12 +6007,17 @@ static unsigned input_combo_type_onkeyup_lut[INPUT_COMBO_LAST] =
 } \
 
 
-/* Set as the menu opens: menu_event() starts its own button memory
- * afresh. Without it, an OK still down when the menu last closed (by
- * its hotkey, say) is remembered as down, and the menu opening later
- * sees it let go - and an entry that acts on release, Resume first of
- * all, acts on the menu's first frame and shuts it again. */
+/* Set as the menu opens or a pointer press is dropped: menu_event()
+ * starts its own button memory afresh. Without it, an OK still down
+ * when the menu last closed (by its hotkey, say) is remembered as down,
+ * and the menu opening later sees it let go - and an entry that acts on
+ * release, Resume first of all, acts on the menu's first frame and
+ * shuts it again. A dropped press would otherwise act as it lifts. */
 static bool menu_event_starts_afresh;
+
+/* Set as the menu opens, if it was not up: a press held then is dropped
+ * as one held across a window change is */
+static bool menu_event_opens;
 
 /* A held direction, once Menu Scroll Delay (the user's) has passed:
  * the list moves 20 entries a second to start with - what the menu gave
@@ -5795,7 +6093,9 @@ unsigned menu_event(
          RETRO_DEVICE_ID_JOYPAD_A : RETRO_DEVICE_ID_JOYPAD_B;
    unsigned ok_current                             =
             BIT256_GET_PTR(p_input, menu_ok_btn)
-         || (pointer_hw_state->flags & MENU_INP_PTR_FLG_PRESS_SELECT);
+         || (   (pointer_hw_state->flags & MENU_INP_PTR_FLG_PRESS_SELECT)
+             && !menu_driver_state.dialog_st.confirm_cmd
+             && !menu_driver_state.dialog_st.button_count);
    unsigned ok_trigger                             = ok_current & ~ok_old;
    unsigned ok_trigger_release                     = !ok_current && ok_old;
    static unsigned navigation_initial              = 0;
@@ -5869,13 +6169,16 @@ unsigned menu_event(
 #endif
    else
    {
+      static unsigned last_window                        = 0;
+      unsigned window                                    =
+         video_driver_get_ui_layer_window(VIDEO_WINDOW_UI_MENU);
       menu_input_pointer_hw_state_t mouse_hw_state       = {0};
       menu_input_pointer_hw_state_t touchscreen_hw_state = {0};
+      bool was_pressed                                   =
+         (pointer_hw_state->flags & MENU_INP_PTR_FLG_PRESS_SELECT) ? true : false;
 #ifdef HAVE_OPENXR
       menu_input_pointer_hw_state_t headset_hw_state     = {0};
       bool headset_on                                    = false;
-      bool was_pressed                                   =
-         (pointer_hw_state->flags & MENU_INP_PTR_FLG_PRESS_SELECT) ? true : false;
 #endif
 
       /* Read mouse */
@@ -5938,6 +6241,29 @@ unsigned menu_event(
          memcpy(pointer_hw_state, &mouse_hw_state, sizeof(menu_input_pointer_hw_state_t));
       else if (menu_input->pointer.type == MENU_POINTER_TOUCHSCREEN)
          memcpy(pointer_hw_state, &touchscreen_hw_state, sizeof(menu_input_pointer_hw_state_t));
+
+      /* A press held as the menu changes window, down where it goes,
+       * down as it opens, or let go while it was closed, is no tap or
+       * cancel there: dropped until it lifts */
+      if (window != last_window || menu_event_opens)
+      {
+         if (     was_pressed
+               || (pointer_hw_state->flags & MENU_INP_PTR_FLG_PRESS_SELECT))
+         {
+            menu_input->select_inhibit          = true;
+            menu_input->pointer.flags          &= ~(MENU_INP_PTR_FLG_PRESSED
+                                                  | MENU_INP_PTR_FLG_DRAGGED);
+            menu_input->pointer.press_duration  = 0;
+            menu_input->pointer.press_direction = MENU_INPUT_PRESS_DIRECTION_NONE;
+            menu_input->pointer.delta           = 0;
+            menu_input->pointer.y_accel         = 0.0f;
+            menu_event_starts_afresh            = true;
+         }
+         if (pointer_hw_state->flags & MENU_INP_PTR_FLG_PRESS_CANCEL)
+            menu_input->cancel_inhibit = true;
+         last_window      = window;
+         menu_event_opens = false;
+      }
 
       if (pointer_hw_state->flags & MENU_INP_PTR_FLG_ACTIVE)
       {
@@ -6304,7 +6630,7 @@ unsigned menu_event(
             ok_enum_idx = entry.enum_idx;
 
          /* Trigger on release during dialog boxes */
-         if (*menu->menu_state_msg)
+         if (*MENU_STATE_TEXT(menu))
          {
             if (ok_trigger)
                ok_enum_idx = MENU_ENUM_LABEL_MESSAGE;
@@ -6540,6 +6866,7 @@ MENU_NOINLINE static int menu_input_post_iterate(
    static uint16_t dy_start_up_max                 = 0;
    static uint16_t dy_start_down_max               = 0;
    static bool last_select_pressed                 = false;
+   static uint8_t press_epoch                      = 0;
    static bool last_cancel_pressed                 = false;
    static bool last_left_pressed                   = false;
    static bool last_right_pressed                  = false;
@@ -6561,7 +6888,8 @@ MENU_NOINLINE static int menu_input_post_iterate(
    menu_file_list_cbs_t *cbs                       = selection_buf && selection_buf->size
       ? (menu_file_list_cbs_t*)selection_buf->list[selection].actiondata
       : NULL;
-   unsigned output_size                            = video_driver_get_ui_dims();
+   unsigned output_size                            =
+      video_driver_get_ui_layer_dims(VIDEO_WINDOW_UI_MENU);
 
    MENU_ENTRY_INITIALIZE(entry);
    entry.flags |= MENU_ENTRY_FLAG_PATH_ENABLED
@@ -6576,7 +6904,7 @@ MENU_NOINLINE static int menu_input_post_iterate(
    if (menu)
       messagebox_active = BIT64_GET(
             menu->state, MENU_STATE_RENDER_MESSAGEBOX)
-            && *menu->menu_state_msg;
+            && *MENU_STATE_TEXT(menu);
 
    /* If onscreen keyboard is shown and we currently have
     * active mouse input, highlight key under mouse cursor */
@@ -6626,6 +6954,7 @@ MENU_NOINLINE static int menu_input_post_iterate(
             accel0                    = 0.0f;
             accel1                    = 0.0f;
             last_press_direction_time = 0;
+            press_epoch               = menu_st->dialog_st.button_epoch;
 
             /* If we are not currently showing the onscreen
              * keyboard or a message box, trigger a 'pointer
@@ -6916,12 +7245,31 @@ MENU_NOINLINE static int menu_input_post_iterate(
           *   outside of Back/OK buttons */
          else if (messagebox_active)
          {
-            menu_input_pointer_close_messagebox(menu_st);
+            /* A confirm dialog is answered by any tap: OK confirms,
+             * anywhere else cancels, so it cannot be left half-closed */
+            unsigned confirm_cmd = menu_st->dialog_st.confirm_cmd;
+            bool hover_ok        = menu_st->dialog_st.confirm_hover_ok;
+            int hover            = menu_st->dialog_st.button_hover;
 
-            if (menu_st->dialog_st.confirm_hover_ok)
-               menu_dialog_confirm(menu_st);
-            else if (menu_st->dialog_st.confirm_hover_back)
-               menu_dialog_confirm_clear(menu_st);
+            /* Named buttons: the one tapped, anywhere else Cancel; a
+             * press that began on a box since replaced chooses nothing */
+            if (menu_st->dialog_st.button_count)
+            {
+               if (press_epoch == menu_st->dialog_st.button_epoch)
+                  menu_dialog_press(menu_st, (hover >= 0) ? hover : 0);
+            }
+            else
+            {
+               menu_input_pointer_close_messagebox(menu_st);
+
+               if (confirm_cmd)
+               {
+                  if (hover_ok)
+                     menu_dialog_confirm(menu_st);
+                  else
+                     menu_dialog_confirm_clear(menu_st);
+               }
+            }
          }
          /* Normal menu input */
          else
@@ -7067,8 +7415,13 @@ MENU_NOINLINE static int menu_input_post_iterate(
       /* If currently showing a message box, close it */
       if (messagebox_active)
       {
-         menu_input_pointer_close_messagebox(menu_st);
-         menu_dialog_confirm_clear(menu_st);
+         if (menu_st->dialog_st.button_count)
+            menu_dialog_press(menu_st, 0);
+         else
+         {
+            menu_input_pointer_close_messagebox(menu_st);
+            menu_dialog_confirm_clear(menu_st);
+         }
       }
       /* If onscreen keyboard is shown, send a 'backspace' */
       else if (osk_active)
@@ -7385,6 +7738,8 @@ void retroarch_menu_running(void)
       if (menu->driver_ctx && menu->driver_ctx->toggle)
          menu->driver_ctx->toggle(menu->userdata, true);
 
+      if (!(menu_st->flags & MENU_ST_FLAG_ALIVE))
+         menu_event_opens = true;
       menu_st->flags |= MENU_ST_FLAG_ALIVE;
       menu_driver_drop_accept(true);
       menu_driver_toggle(
@@ -7714,7 +8069,7 @@ bool menu_driver_ctl(enum rarch_menu_ctl_state state, void *data)
             unsigned dims           = menu_st->driver_ctx
                && menu_st->driver_ctx->set_texture
                ? disp_get_ptr()->framebuf_dims
-               : video_driver_get_ui_dims();
+               : video_driver_get_ui_layer_dims(VIDEO_WINDOW_UI_MENU);
             menu_pointer_outside_press = (unsigned)point->x >= VIDEO_SCALE_W(dims)
                || (unsigned)point->y >= VIDEO_SCALE_H(dims);
             if (menu_pointer_outside_press)
@@ -7739,7 +8094,7 @@ bool menu_driver_ctl(enum rarch_menu_ctl_state state, void *data)
             unsigned dims           = menu_st->driver_ctx
                && menu_st->driver_ctx->set_texture
                ? disp_get_ptr()->framebuf_dims
-               : video_driver_get_ui_dims();
+               : video_driver_get_ui_layer_dims(VIDEO_WINDOW_UI_MENU);
             if (menu_pointer_outside_press)
             {
                menu_pointer_outside_press = false;
@@ -7766,7 +8121,8 @@ bool menu_driver_ctl(enum rarch_menu_ctl_state state, void *data)
          break;
       case RARCH_MENU_CTL_OSK_PTR_AT_POS:
          {
-            unsigned output_size      = video_driver_get_ui_dims();
+            unsigned output_size      =
+               video_driver_get_ui_layer_dims(VIDEO_WINDOW_UI_MENU);
             menu_ctx_pointer_t *point = (menu_ctx_pointer_t*)data;
             if (!menu_st->driver_ctx || !menu_st->driver_ctx->osk_ptr_at_pos)
             {
@@ -8100,6 +8456,36 @@ int action_cycle_thumbnail(unsigned mode)
    return 0;
 }
 
+/* Named buttons: Left/Up and Right/Down move the highlight and stop at
+ * the ends, OK presses it, Back and Info press Cancel (the first) */
+static void menu_dialog_buttons_action(struct menu_state *menu_st,
+      enum menu_action action)
+{
+   menu_dialog_t *d = &menu_st->dialog_st;
+   switch (action)
+   {
+      case MENU_ACTION_LEFT:
+      case MENU_ACTION_UP:
+         if (d->button_highlight > 0)
+            d->button_highlight--;
+         break;
+      case MENU_ACTION_RIGHT:
+      case MENU_ACTION_DOWN:
+         if (d->button_highlight + 1 < (int)d->button_count)
+            d->button_highlight++;
+         break;
+      case MENU_ACTION_OK:
+         menu_dialog_press(menu_st, d->button_highlight);
+         break;
+      case MENU_ACTION_CANCEL:
+      case MENU_ACTION_INFO:
+         menu_dialog_press(menu_st, 0);
+         break;
+      default:
+         break;
+   }
+}
+
 /**
  * menu_iterate:
  * @input                    : input sample for this frame
@@ -8136,6 +8522,7 @@ static int generic_menu_iterate(
       label                        = list->list[list->size - 1].label;
 
    menu->menu_state_msg[0]         = '\0';
+   menu->menu_state_text           = NULL;
 
    /* buttons held on an empty combination row: what it is to do is
     * picked next, from a list opened over this one */
@@ -8188,23 +8575,58 @@ static int generic_menu_iterate(
             BIT64_SET(menu->state, MENU_STATE_POP_STACK);
          break;
       case ITERATE_TYPE_CONFIRM:
-         strlcpy(menu->menu_state_msg,
-               msg_hash_to_str((enum msg_hash_enums)menu_st->dialog_st.confirm_msg),
-               sizeof(menu->menu_state_msg));
+#ifdef HAVE_CORE_SIGNATURES
+         if (menu_st->dialog_st.button_count)
+            menu->menu_state_text = menu_core_warning_text();
+         else
+#endif
+            menu->menu_state_text = menu_st->dialog_st.confirm_text
+                  ? menu_st->dialog_st.confirm_text
+                  : msg_hash_to_str(
+                     (enum msg_hash_enums)menu_st->dialog_st.confirm_msg);
 
 #ifdef HAVE_ACCESSIBILITY
-         if (     (iterate_type != last_iterate_type)
+         /* Also when the warning comes up after a confirm or a newer
+          * request replaces it: the type stays CONFIRM */
+         if (     (   (iterate_type != last_iterate_type)
+                   || menu_st->dialog_st.button_announce)
                && is_accessibility_enabled(
                   accessibility_enable,
                   access_st->enabled))
             accessibility_speak_priority(
                   accessibility_enable,
                   accessibility_narrator_speech_speed,
-                  menu->menu_state_msg, 10);
+                  MENU_STATE_TEXT(menu), 10);
 #endif
+         menu_st->dialog_st.button_announce = false;
 
          BIT64_SET(menu->state, MENU_STATE_RENDER_MESSAGEBOX);
          BIT64_SET(menu->state, MENU_STATE_POST_ITERATE);
+
+         /* Named buttons answer for themselves, and the box is no
+          * screen of the stack's */
+         if (menu_st->dialog_st.button_count)
+         {
+#ifdef HAVE_ACCESSIBILITY
+            int was = menu_st->dialog_st.button_highlight;
+#endif
+            menu_dialog_buttons_action(menu_st, action);
+#ifdef HAVE_ACCESSIBILITY
+            if (     menu_st->dialog_st.button_count
+                  && menu_st->dialog_st.button_highlight != was
+                  && is_accessibility_enabled(
+                     accessibility_enable,
+                     access_st->enabled))
+               accessibility_speak_priority(
+                     accessibility_enable,
+                     accessibility_narrator_speech_speed,
+                     msg_hash_to_str((enum msg_hash_enums)
+                        menu_st->dialog_st.button_label[
+                        menu_st->dialog_st.button_highlight]), 10);
+#endif
+            break;
+         }
+
          if (     action == MENU_ACTION_OK
                || action == MENU_ACTION_SELECT
                || action == MENU_ACTION_CANCEL
@@ -8324,9 +8746,8 @@ static int generic_menu_iterate(
                            strlcpy(menu->menu_state_msg, entry->description,
                                  sizeof(menu->menu_state_msg));
                         else
-                           strlcpy(menu->menu_state_msg,
-                                 msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NO_INFORMATION_AVAILABLE),
-                                 sizeof(menu->menu_state_msg));
+                           menu->menu_state_text = msg_hash_to_str(
+                                 MENU_ENUM_LABEL_VALUE_NO_INFORMATION_AVAILABLE);
 
                         ret = 0;
                      }
@@ -8346,9 +8767,8 @@ static int generic_menu_iterate(
                                  core_info->description,
                                  sizeof(menu->menu_state_msg));
                         else
-                           strlcpy(menu->menu_state_msg,
-                                 msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NO_INFORMATION_AVAILABLE),
-                                 sizeof(menu->menu_state_msg));
+                           menu->menu_state_text = msg_hash_to_str(
+                                 MENU_ENUM_LABEL_VALUE_NO_INFORMATION_AVAILABLE);
 
                         ret = 0;
                      }
@@ -8363,10 +8783,9 @@ static int generic_menu_iterate(
                         menu_driver_get_current_menu_sublabel(
                               menu_st,
                               menu->menu_state_msg, sizeof(menu->menu_state_msg));
-                        if (string_is_equal(menu->menu_state_msg, ""))
-                           strlcpy(menu->menu_state_msg,
-                                 msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NO_INFORMATION_AVAILABLE),
-                                 sizeof(menu->menu_state_msg));
+                        if (!*menu->menu_state_msg)
+                           menu->menu_state_text = msg_hash_to_str(
+                                 MENU_ENUM_LABEL_VALUE_NO_INFORMATION_AVAILABLE);
                      }
                      break;
                }
@@ -8377,7 +8796,7 @@ static int generic_menu_iterate(
                         accessibility_enable,
                         access_st->enabled))
                {
-                  if (string_is_equal(menu->menu_state_msg,
+                  if (string_is_equal(MENU_STATE_TEXT(menu),
                            msg_hash_to_str(
                               MENU_ENUM_LABEL_VALUE_NO_INFORMATION_AVAILABLE)))
                   {
@@ -8389,7 +8808,7 @@ static int generic_menu_iterate(
                         accessibility_speak_priority(
                               accessibility_enable,
                               accessibility_narrator_speech_speed,
-                              menu->menu_state_msg, 10);
+                              MENU_STATE_TEXT(menu), 10);
                      else
                         accessibility_speak_priority(
                               accessibility_enable,
@@ -8400,7 +8819,7 @@ static int generic_menu_iterate(
                      accessibility_speak_priority(
                            accessibility_enable,
                            accessibility_narrator_speech_speed,
-                           menu->menu_state_msg, 10);
+                           MENU_STATE_TEXT(menu), 10);
                }
 #endif
             }
@@ -8481,17 +8900,25 @@ static int generic_menu_iterate(
                      ret = 0;
                   }
                   /* Use detailed help text for 'Analog to Digital', which
-                   * is the first item in global input settings */
+                   * is the fourth item in global input settings, otherwise
+                   * use sublabels as usual. */
                   else if (type == MENU_SETTINGS_INPUT_ANALOG_DPAD_MODE
-                        || type == MENU_SETTINGS_INPUT_BEGIN)
+                        || type == MENU_SETTINGS_INPUT_BEGIN + 3)
                      ret = msg_hash_get_help_enum(MENU_ENUM_LABEL_VALUE_INPUT_ADC_TYPE,
                            menu->menu_state_msg, sizeof(menu->menu_state_msg));
+                  else if (type >= MENU_SETTINGS_INPUT_BEGIN
+                        && type <  MENU_SETTINGS_INPUT_BINDS_BEGIN)
+                  {
+                     menu_driver_get_current_menu_sublabel(
+                           menu_st,
+                           menu->menu_state_msg, sizeof(menu->menu_state_msg));
+
+                     ret = 0;
+                  }
                   else
                   {
-                     strlcpy(menu->menu_state_msg,
-                           msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NO_INFORMATION_AVAILABLE),
-                           sizeof(menu->menu_state_msg));
-
+                     menu->menu_state_text = msg_hash_to_str(
+                           MENU_ENUM_LABEL_VALUE_NO_INFORMATION_AVAILABLE);
                      ret = 0;
                   }
                }
@@ -9568,20 +9995,166 @@ size_t menu_playlists_tab_random_selection(size_t selection)
 }
 
 /* Modal dialog handling */
+/* Wrapped path lines precede the bracketed availability badge. */
+const char *menu_dialog_firmware_path_line(const struct menu_state *menu_st,
+      const char *line, unsigned *state)
+{
+   const char *path = line;
+   if (menu_st->dialog_st.confirm_msg != MSG_CORE_FIRMWARE_MISSING || !line)
+      return NULL;
+
+   if (!*line)
+   {
+      *state = 0;
+      return NULL;
+   }
+
+   if (*state == 0)
+   {
+      while (*path >= '0' && *path <= '9')
+         path++;
+
+      if (path != line && *path == '.' && (path[1] == ' ' || !path[1]))
+      {
+         path++;
+         if (*path == ' ')
+            path++;
+         *state = 1;
+         return *path ? path : NULL;
+      }
+
+      *state = 2;
+   }
+   else if (*state == 1)
+   {
+      if (*line != '[')
+         return line;
+      *state = 2;
+   }
+
+   return NULL;
+}
+
+/* A path's underline as last measured: the line it is under and the
+ * font it was measured in, so the box's frames after the first draw it
+ * without measuring again. Only the thread that draws the menu's frames
+ * reads and writes these. */
+#define MENU_PATH_UNDERLINES 4
+
+typedef struct
+{
+   font_data_t *font;
+   size_t len;
+   float size;
+   uint32_t font_generation;
+   int x;     /* from the line's start */
+   int width;
+   char line[128];
+} menu_path_underline_t;
+
+static menu_path_underline_t menu_path_underlines[MENU_PATH_UNDERLINES];
+static unsigned menu_path_underline_next;
+
+void menu_dialog_draw_path_underline(const struct menu_state *menu_st,
+      unsigned *state, const char *line, font_data_t *font,
+      gfx_display_t *p_disp, void *userdata, unsigned video_dims,
+      float x, float baseline, uint32_t color)
+{
+   unsigned i;
+   float rgba[16];
+   int width;
+   size_t len;
+   uint32_t gen;
+   menu_path_underline_t *u = NULL;
+   const char *path = menu_dialog_firmware_path_line(menu_st, line, state);
+
+   if (!path)
+      return;
+
+   len = strlen(line);
+   gen = font_driver_get_generation();
+   for (i = 0; i < MENU_PATH_UNDERLINES; i++)
+   {
+      menu_path_underline_t *c = &menu_path_underlines[i];
+      if (     c->font == font && c->font_generation == gen
+            && c->size == font->size
+            && c->len  == len  && !memcmp(c->line, line, len))
+      {
+         u = c;
+         break;
+      }
+   }
+   if (!u)
+   {
+      int at;
+      if (     (width = font_driver_get_message_width(font, path,
+                  strlen(path), 1.0f)) <= 0
+            || (at = font_driver_get_message_width(font, line,
+                  path - line, 1.0f)) < 0)
+         return;
+      if (len < sizeof(u->line))
+      {
+         u = &menu_path_underlines[menu_path_underline_next];
+         menu_path_underline_next = (menu_path_underline_next + 1)
+               % MENU_PATH_UNDERLINES;
+         memcpy(u->line, line, len);
+         u->font            = font;
+         u->size            = font->size;
+         u->font_generation = gen;
+         u->len             = len;
+         u->x               = at;
+         u->width           = width;
+      }
+      x += at;
+   }
+   else
+   {
+      width = u->width;
+      x    += u->x;
+   }
+
+   for (i = 0; i < 4; i++)
+   {
+      rgba[i * 4]     = FONT_COLOR_GET_RED(color)   / 255.0f;
+      rgba[i * 4 + 1] = FONT_COLOR_GET_GREEN(color) / 255.0f;
+      rgba[i * 4 + 2] = FONT_COLOR_GET_BLUE(color)  / 255.0f;
+      rgba[i * 4 + 3] = FONT_COLOR_GET_ALPHA(color) / 255.0f;
+   }
+
+   gfx_display_blend_begin(p_disp->dispctx, userdata);
+   gfx_display_draw_quad(p_disp, userdata, video_dims, x, baseline + 1,
+         VIDEO_SCALE_PACK(width, 1), video_dims, rgba, NULL);
+   gfx_display_blend_end(p_disp->dispctx, userdata);
+}
+
 static void menu_dialog_confirm_reset(struct menu_state *menu_st)
 {
+   menu_st->dialog_st.confirm_text = NULL;
    menu_st->dialog_st.confirm_msg = MSG_UNKNOWN;
    menu_st->dialog_st.confirm_cmd = CMD_EVENT_NONE;
 
    menu_st->dialog_st.confirm_hover_ok     = false;
    menu_st->dialog_st.confirm_hover_back   = false;
+   menu_st->dialog_st.button_count         = 0;
+   menu_st->dialog_st.button_highlight     = -1;
+   menu_st->dialog_st.button_hover         = -1;
 
    BIT64_CLEAR(menu_st->driver_data->state, MENU_STATE_RENDER_MESSAGEBOX);
    menu_st->driver_data->menu_state_msg[0] = '\0';
+   menu_st->driver_data->menu_state_text   = NULL;
 }
 
 void menu_dialog_confirm_set(struct menu_state *menu_st, unsigned msg, unsigned cmd)
 {
+   /* A Cancel/OK confirm takes over from named buttons; the warning
+    * waits for it and comes back */
+   menu_st->dialog_st.button_count     = 0;
+   menu_st->dialog_st.button_highlight = -1;
+   menu_st->dialog_st.button_hover     = -1;
+   menu_st->dialog_st.confirm_hover_ok     = false;
+   menu_st->dialog_st.confirm_hover_back   = false;
+   menu_st->dialog_st.confirm_text = NULL;
+   menu_st->dialog_st.button_epoch++;
    menu_st->dialog_st.confirm_msg = msg;
    menu_st->dialog_st.confirm_cmd = cmd;
    menu_st->dialog_st.pending_cmd = CMD_EVENT_NONE;
@@ -9597,4 +10170,309 @@ void menu_dialog_confirm(struct menu_state *menu_st)
 {
    menu_st->dialog_st.pending_cmd = menu_st->dialog_st.confirm_cmd;
    menu_dialog_confirm_reset(menu_st);
+}
+
+void menu_dialog_get_buttons(struct menu_state *menu_st,
+      menu_dialog_buttons_t *b)
+{
+   menu_dialog_t *d = &menu_st->dialog_st;
+   unsigned i;
+   d->button_drawn = d->button_epoch;
+   b->count     = d->button_count;
+   b->highlight = -1;
+   b->hover     = -1;
+   b->classic   = false;
+   if (d->button_count)
+   {
+      /* Cancel (the first) always shows its icon, the others OK's,
+       * dimmed unless highlighted */
+      for (i = 0; i < b->count; i++)
+      {
+         b->label[i] = d->button_label[i];
+         b->icon[i]  = (i == 0) ? MENU_DIALOG_ICON_CANCEL
+               : ((int)i == d->button_highlight) ? MENU_DIALOG_ICON_OK
+               : MENU_DIALOG_ICON_OK_DIM;
+      }
+      b->highlight = d->button_highlight;
+      b->hover     = d->button_hover;
+      return;
+   }
+   if (!d->confirm_cmd)
+      return;
+   b->count    = 2;
+   b->classic  = true;
+   b->label[0] = MENU_ENUM_LABEL_VALUE_BASIC_MENU_CONTROLS_CANCEL;
+   b->label[1] = MENU_ENUM_LABEL_VALUE_BASIC_MENU_CONTROLS_OK;
+   b->icon[0]  = MENU_DIALOG_ICON_CANCEL;
+   b->icon[1]  = MENU_DIALOG_ICON_OK;
+   if (d->confirm_hover_back)
+      b->hover = 0;
+   else if (d->confirm_hover_ok)
+      b->hover = 1;
+}
+
+void menu_dialog_set_hover(struct menu_state *menu_st, int idx)
+{
+   menu_dialog_t *d = &menu_st->dialog_st;
+   /* Measured on a box replaced since (threaded video) */
+   if (d->button_drawn != d->button_epoch)
+      return;
+   if (d->button_count)
+      d->button_hover = (idx >= 0 && idx < (int)d->button_count) ? idx : -1;
+   else
+   {
+      d->confirm_hover_back = (idx == 0);
+      d->confirm_hover_ok   = (idx == 1);
+   }
+}
+
+int menu_dialog_buttons_layout(const int *w, unsigned count, int gap,
+      int box_x, int box_w, int *x)
+{
+   unsigned i;
+   int need  = 0;
+   int extra = 0;
+   int at    = box_x;
+   for (i = 0; i < count; i++)
+      need += w[i] + (i ? gap : 0);
+   if (!x)
+      return need;
+   if (box_w > need)
+   {
+      if (count > 1)
+         extra = (box_w - need) / (int)(count - 1);
+      else
+         at   += (box_w - need) / 2;
+   }
+   for (i = 0; i < count; i++)
+   {
+      x[i] = at;
+      at  += w[i] + gap + extra;
+   }
+   return need;
+}
+
+bool menu_input_dialog_text_is(const char *text, size_t len,
+      const char *label, const char *str)
+{
+   size_t llen = strlen(label);
+   size_t slen;
+   if (!str || !*str)
+      str     = " ";
+   slen       = strlen(str);
+   return     len == llen + 1 + slen
+         && text[llen] == '\n'
+         && !memcmp(text, label, llen)
+         && !memcmp(text + llen + 1, str, slen);
+}
+
+const int *menu_dialog_label_widths(menu_dialog_label_widths_t *c,
+      const menu_dialog_buttons_t *b, font_data_t *font, float size)
+{
+   unsigned i;
+   uint32_t gen = font_driver_get_generation();
+   bool same    = c->font == font && c->size == size
+         && c->font_generation == gen;
+   for (i = 0; i < b->count; i++)
+   {
+      /* A language's strings are its own: a new one is a new pointer */
+      const char *str = msg_hash_to_str((enum msg_hash_enums)b->label[i]);
+      if (!same || i >= c->count || c->str[i] != str)
+      {
+         c->str[i] = str;
+         c->w[i]   = font_driver_get_message_width(font, str,
+               strlen(str), 1.0f);
+      }
+   }
+   c->font            = font;
+   c->size            = size;
+   c->font_generation = gen;
+   if (!same || c->count < b->count)
+      c->count        = b->count;
+   return c->w;
+}
+
+#ifdef HAVE_CORE_SIGNATURES
+/* core_warning_serial() of the request the box went up for, 0 for none */
+static unsigned menu_core_warning_shown = 0;
+
+/* Named buttons, the first highlighted */
+static void menu_dialog_buttons_set(struct menu_state *menu_st,
+      const unsigned *labels, unsigned count)
+{
+   menu_dialog_t *d = &menu_st->dialog_st;
+   unsigned i;
+   if (count > MENU_DIALOG_BUTTONS_MAX)
+      count = MENU_DIALOG_BUTTONS_MAX;
+   for (i = 0; i < count; i++)
+      d->button_label[i] = labels[i];
+   d->confirm_msg        = MSG_UNKNOWN;
+   d->confirm_cmd        = CMD_EVENT_NONE;
+   d->confirm_hover_ok   = false;
+   d->confirm_hover_back = false;
+   d->button_count       = (uint8_t)count;
+   d->button_highlight   = 0;
+   d->button_hover       = -1;
+   d->button_announce    = true;
+   d->button_epoch++;
+}
+
+static unsigned menu_core_warning_label(enum core_warning_choice choice)
+{
+   switch (choice)
+   {
+      case CORE_WARNING_INSTALL_AND_TRUST:
+         return MENU_ENUM_LABEL_VALUE_CORE_WARNING_INSTALL_TRUST;
+      case CORE_WARNING_LOAD_ONCE:
+         return MENU_ENUM_LABEL_VALUE_CORE_WARNING_LOAD_ONCE;
+      case CORE_WARNING_ALWAYS_TRUST:
+         return MENU_ENUM_LABEL_VALUE_CORE_WARNING_ALWAYS_TRUST;
+      default:
+         break;
+   }
+   return MENU_ENUM_LABEL_VALUE_CORE_WARNING_CANCEL;
+}
+
+/* The Security Warning's text, built again only for another reason or
+ * another language (whose strings are other pointers) */
+static const char *menu_core_warning_text(void)
+{
+   static char text[MENU_LABEL_MAX_LENGTH];
+   static const char *built_title = NULL;
+   static int built_result        = -1;
+   enum core_check_result result  = CORE_CHECK_ERROR;
+   const char *title              = msg_hash_to_str(
+         MENU_ENUM_LABEL_VALUE_CORE_WARNING);
+   size_t _len                    = 0;
+   core_warning_pending(NULL, &result);
+   if ((int)result == built_result && title == built_title)
+      return text;
+   built_result = (int)result;
+   built_title  = title;
+   strlcpy_append(text, sizeof(text), &_len, title);
+   strlcpy_append(text, sizeof(text), &_len, "\n");
+   strlcpy_append(text, sizeof(text), &_len,
+         msg_hash_to_str(core_warning_reason(result)));
+   strlcpy_append(text, sizeof(text), &_len, "\n\n");
+   strlcpy_append(text, sizeof(text), &_len,
+         msg_hash_to_str(MSG_CORE_WARNING_FULL_ACCESS));
+   strlcpy_append(text, sizeof(text), &_len, "\n\n");
+   strlcpy_append(text, sizeof(text), &_len,
+         msg_hash_to_str(MSG_CORE_WARNING_TURN_OFF));
+   return text;
+}
+
+static void menu_core_warning_raise(struct menu_state *menu_st)
+{
+   enum core_warning_choice choices[CORE_WARNING_CHOICES_MAX];
+   unsigned labels[CORE_WARNING_CHOICES_MAX];
+   unsigned n = core_warning_choices(choices);
+   unsigned i;
+   for (i = 0; i < n; i++)
+      labels[i] = menu_core_warning_label(choices[i]);
+   menu_dialog_buttons_set(menu_st, labels, n);
+   menu_core_warning_shown = core_warning_serial();
+   /* It can come up mid-hold: what is down now waits to be let go */
+   menu_event_starts_afresh = true;
+   input_driver_hold_held_input();
+}
+
+/* Brings the box in line with the request pending; true when it went up */
+static bool menu_core_warning_sync(struct menu_state *menu_st)
+{
+   menu_dialog_t *d = &menu_st->dialog_st;
+   if (!core_warning_pending(NULL, NULL))
+   {
+      /* Answered away from the box, or at deinit */
+      if (d->button_count)
+      {
+         if (menu_st->driver_data)
+            menu_dialog_confirm_clear(menu_st);
+         else
+            d->button_count = 0;
+      }
+      menu_core_warning_shown = 0;
+      return false;
+   }
+   /* It waits for what the user is already answering: an open Cancel/OK
+    * confirm, the command its OK left for this frame, an entry capture
+    * or the on-screen keyboard. A driver that shows nothing never gets
+    * the box. */
+   if (     !menu_st->driver_data
+         || !menu_core_warning_can_open()
+         || (d->confirm_cmd && !d->button_count)
+         || d->pending_cmd != CMD_EVENT_NONE
+         || input_entry_capture_running()
+         || (menu_st->flags & MENU_ST_FLAG_INP_DLG_KB_DISPLAY))
+      return false;
+   menu_core_warning_raise(menu_st);
+   return true;
+}
+
+static void menu_core_warning_press(struct menu_state *menu_st, int idx)
+{
+   static const char *const names[] = {
+      "Cancel", "Install and Trust", "Load Once", "Always Trust" };
+   enum core_warning_choice choices[CORE_WARNING_CHOICES_MAX];
+   unsigned n;
+   /* The box shows a request a newer push already cancelled: show the
+    * newer one and choose nothing */
+   if (menu_core_warning_shown != core_warning_serial())
+   {
+      menu_core_warning_sync(menu_st);
+      return;
+   }
+   n = core_warning_choices(choices);
+   if (idx < 0 || idx >= (int)n)
+      idx = 0;
+   RARCH_LOG("[Core] Security Warning answered: %s.\n", names[choices[idx]]);
+   /* Down first: the callback may raise another box */
+   menu_dialog_confirm_clear(menu_st);
+   menu_core_warning_shown = 0;
+   core_warning_choose(choices[idx]);
+}
+
+void menu_core_warning_open(void)
+{
+   /* Before the menu driver exists it waits for the first menu frame */
+   if (     !(menu_driver_state.flags & MENU_ST_FLAG_ALIVE)
+         && menu_driver_state.driver_data)
+      retroarch_menu_running();
+}
+
+bool menu_core_warning_can_open(void)
+{
+   const char *ident = menu_driver_ident();
+   /* Before the drivers are chosen: the one the config names */
+   if (!ident)
+      ident = config_get_ptr()->arrays.menu_driver;
+   return !string_is_equal(ident, "null");
+}
+
+bool menu_core_warning_user_only(void)
+{
+   return core_warning_pending(NULL, NULL)
+      || menu_driver_state.dialog_st.confirm_cmd
+         == CMD_EVENT_CORE_SIGNATURE_CHECK_OFF;
+}
+
+bool menu_core_warning_iterate(struct menu_state *menu_st)
+{
+   unsigned serial = core_warning_serial();
+   /* Up for the request pending, or nothing pending and nothing up */
+   if (     menu_core_warning_shown == serial
+         && (!serial || menu_st->dialog_st.button_count))
+      return false;
+   return menu_core_warning_sync(menu_st);
+}
+#endif
+
+static void menu_dialog_press(struct menu_state *menu_st, int idx)
+{
+#ifdef HAVE_CORE_SIGNATURES
+   menu_core_warning_press(menu_st, idx);
+#else
+   (void)idx;
+   menu_dialog_confirm_clear(menu_st);
+#endif
 }

@@ -318,9 +318,24 @@ static void gfx_widgets_task_cmd_free(dispgfx_widget_t *p_dispwidget,
    free(cmd);
 }
 
+/* Bumped by the widgets' owner whenever it loses what a task last
+ * sent it - a task widget freed, an update dropped or discarded - so
+ * the main thread sends the task's title again (see
+ * gfx_widgets_msg_queue_push()). Static, not in dispgfx_widget_t: it
+ * must not return to a value a task recorded when the widgets are
+ * cleared for a reinit. */
+static retro_atomic_int_t gfx_widgets_task_text_epoch;
+
+static void gfx_widgets_task_text_lost(void)
+{
+   retro_atomic_fetch_add_int(&gfx_widgets_task_text_epoch, 1);
+}
+
 static void gfx_widgets_task_cmds_discard(dispgfx_widget_t *p_dispwidget)
 {
    gfx_widgets_task_cmd_t *cmd = gfx_widgets_task_cmds_take(p_dispwidget);
+   if (cmd)
+      gfx_widgets_task_text_lost();
    while (cmd)
    {
       gfx_widgets_task_cmd_t *next = TASK_CMD_NEXT(cmd);
@@ -336,6 +351,8 @@ static void gfx_widgets_task_cmds_discard(dispgfx_widget_t *p_dispwidget)
 static void gfx_widgets_task_pending_discard(dispgfx_widget_t *p_dispwidget)
 {
    unsigned i;
+   if (p_dispwidget->task_pending_size)
+      gfx_widgets_task_text_lost();
    for (i = 0; i < p_dispwidget->task_pending_size; i++)
    {
       disp_widget_msg_t *msg_widget = p_dispwidget->task_pending[i];
@@ -536,15 +553,21 @@ static void gfx_widgets_task_cmd_apply(dispgfx_widget_t *p_dispwidget,
        * its retirement, for a widget it may have had - spawns nothing,
        * and with no room to wait in the next update tries again */
       if (     !cmd->title
-            || (cmd->task_flags & RETRO_TASK_FLG_MUTE)
-            || p_dispwidget->task_pending_size
+            || (cmd->task_flags & RETRO_TASK_FLG_MUTE))
+         return;
+      /* The title is spent unused: the next update carries it again */
+      if (     p_dispwidget->task_pending_size
                >= ARRAY_SIZE(p_dispwidget->task_pending)
             || !(msg_widget = (disp_widget_msg_t*)calloc(1, sizeof(*msg_widget))))
+      {
+         gfx_widgets_task_text_lost();
          return;
+      }
 
       if (!(msg_widget->msg_new = strdup(*text)))
       {
          free(msg_widget);
+         gfx_widgets_task_text_lost();
          return;
       }
       msg_widget->msg              = *text;
@@ -740,10 +763,46 @@ void gfx_widgets_msg_queue_push(
    {
       task_progress_snapshot_t snapshot;
       gfx_widgets_task_cmd_t *cmd;
-      uintptr_t key = (uintptr_t)task->frontend_userdata;
+      uintptr_t key       = (uintptr_t)task->frontend_userdata;
+      /* Read before the snapshot: see task_get_text_gen() */
+      unsigned text_gen   = task_get_text_gen(task);
+      unsigned epoch      = (unsigned)retro_atomic_load_acquire_int(
+            &gfx_widgets_task_text_epoch);
+      /* The owner still has the text this key last carried: nothing
+       * of it was lost since, the task changed none of it, and the key
+       * is the one it went under, not a widget handed on to this task */
+      bool text_shown     = key
+            && task->frontend_shown_key      == key
+            && task->frontend_shown_text_gen == text_gen
+            && task->frontend_shown_epoch    == epoch;
+      bool text_copied    = false;
+      unsigned state;
 
-      /* Terminal flags are published even if copying a string fails. */
-      task_get_progress_snapshot(task, &snapshot);
+      if (text_shown)
+      {
+         /* Progress only, as most frames of a running task are: the
+          * strings are not copied, and an update that changes nothing
+          * is not sent. A finished task is always sent whole. */
+         snapshot.title    = NULL;
+         snapshot.error    = NULL;
+         snapshot.flags    = task_get_flags(task);
+         snapshot.progress = task_get_progress(task);
+         if (snapshot.flags & RETRO_TASK_FLG_FINISHED)
+            text_shown     = false;
+      }
+      /* Terminal flags are published even if copying a string fails;
+       * the text then counts as not sent */
+      if (!text_shown)
+         text_copied = task_get_progress_snapshot(task, &snapshot);
+
+      /* progress, flags, style and category: all a cmd carries besides
+       * the text, packed */
+      state = (unsigned)(uint8_t)snapshot.progress
+            | ((unsigned)snapshot.flags        <<  8)
+            | ((unsigned)(uint8_t)task->style  << 16)
+            | ((unsigned)(uint8_t)category     << 24);
+      if (text_shown && task->frontend_shown_state == state)
+         return;
 
       /* No widget to update and none to spawn; and progress, which is
        * sent again next frame, gives way when the owner is behind */
@@ -779,6 +838,15 @@ void gfx_widgets_msg_queue_push(
       cmd->style      = (uint8_t)task->style;
       cmd->progress   = snapshot.progress;
       gfx_widgets_task_cmd_push(p_dispwidget, cmd);
+
+      /* What the owner now has of the task */
+      task->frontend_shown_state = state;
+      if (!text_shown)
+      {
+         task->frontend_shown_key      = text_copied ? key : 0;
+         task->frontend_shown_text_gen = text_gen;
+         task->frontend_shown_epoch    = epoch;
+      }
    }
 }
 
@@ -854,6 +922,8 @@ static void gfx_widgets_msg_queue_free(
    {
       if (p_dispwidget->msg_queue_tasks_count > 0)
          p_dispwidget->msg_queue_tasks_count--;
+      if (msg->task_key)
+         gfx_widgets_task_text_lost();
    }
 
    /* Kill all animations */
@@ -989,6 +1059,7 @@ void gfx_widgets_draw_icon(
    draw.matrix_data     = &mymat;
    draw.texture         = texture;
    draw.pipeline_id     = 0;
+   draw.effect          = NULL;
 
    if (VIDEO_SCALE_H(draw.dims) > 0 && VIDEO_SCALE_W(draw.dims) > 0)
       gfx_display_draw(dispctx, &draw, userdata,
@@ -1041,7 +1112,8 @@ void gfx_widgets_flush_text(
       return;
 
    if (font_data->font && font_data->font->renderer && font_data->font->renderer->flush)
-      font_data->font->renderer->flush(video_dims,
+      font_data->font->renderer->flush(
+            gfx_display_output_dims(disp_get_ptr(), video_dims),
             font_data->font->renderer_data);
    font_data->raster_block.carr.coords.vertices = 0;
    font_data->usage_count                       = 0;
@@ -1307,6 +1379,20 @@ static void gfx_widgets_layout(
    }
 }
 
+unsigned gfx_widgets_layout_dims(unsigned dims, float display_aspect)
+{
+   unsigned width  = VIDEO_SCALE_W(dims);
+   unsigned height = VIDEO_SCALE_H(dims);
+   unsigned layout_width;
+   if (display_aspect <= 0.0f || !height)
+      return dims;
+   layout_width    = (unsigned)(height * display_aspect + 0.5f);
+   /* Native modes, panels and other windows are left as they are */
+   if (layout_width * 2 > width)
+      return dims;
+   return VIDEO_SCALE_PACK(layout_width, height);
+}
+
 /* The scale the widgets lay out at, from the settings: worked out on
  * the main thread, and carried to the threaded video worker in the
  * frame (video_frame_info_t.widget_scale_factor) */
@@ -1483,6 +1569,7 @@ void gfx_widgets_iterate(
       const char *dir_assets, char *font_path,
       bool is_threaded)
 {
+   dims = gfx_widgets_layout_dims(dims, video_driver_ui_display_aspect());
    /* A relayout resets the frame time counter */
    if (gfx_widgets_update_layout((gfx_display_t*)data_disp,
             gfx_widgets_scale_factor(data_disp, settings_data, dims,
@@ -1803,7 +1890,7 @@ static void gfx_widgets_draw_task_msg(
             &p_dispwidget->gfx_widget_fonts.msg_queue);
       if (dispctx && dispctx->scissor_end)
          dispctx->scissor_end(userdata,
-               video_dims);
+               gfx_display_output_dims(p_disp, video_dims));
    }
 
    /* Progress text */
@@ -2028,7 +2115,10 @@ static void gfx_widgets_frame_state(void *data)
    bool time_show                   = video_info->time_show;
    bool onscreen_panels             = fps_show || framecount_show || memory_show || core_status_msg_show || time_show;
    void *userdata                   = video_info->userdata;
-   unsigned video_width             = VIDEO_SCALE_W(video_info->dims);
+   unsigned output_dims             = video_info->dims;
+   unsigned layout_dims             = gfx_widgets_layout_dims(output_dims,
+         video_info->widget_display_aspect);
+   unsigned video_width             = VIDEO_SCALE_W(layout_dims);
    uint32_t video_flags             = video_info->video_st_flags;
    bool widgets_is_paused           = (video_flags & VIDEO_FLAG_WIDGETS_PAUSED) != 0;
    bool widgets_is_fastmotion       = (video_flags & VIDEO_FLAG_WIDGETS_FASTMOTION) != 0;
@@ -2075,7 +2165,14 @@ static void gfx_widgets_frame_state(void *data)
 
    if (video_st->current_video && video_st->current_video->set_viewport)
       video_st->current_video->set_viewport(
-            video_st->data, video_info->dims, true, false);
+            video_st->data, output_dims, true, false);
+
+   /* Laid out at layout_dims, stretched across the output */
+   if (layout_dims != output_dims)
+   {
+      video_info->dims = layout_dims;
+      gfx_display_set_output_dims(p_disp, output_dims);
+   }
 
    /* Font setup */
    font_driver_bind_block(p_dispwidget->gfx_widget_fonts.regular.font,
@@ -2110,9 +2207,11 @@ static void gfx_widgets_frame_state(void *data)
 
       if (video_driver_get_viewport_info(&content_vp) && VIDEO_SCALE_W(content_vp.dims) && VIDEO_SCALE_H(content_vp.dims))
       {
-         overlay_x      = VIDEO_POS_X(content_vp.pos);
+         overlay_x      = VIDEO_POS_X(content_vp.pos) * (int)video_width
+            / (int)VIDEO_SCALE_W(output_dims);
          overlay_y      = VIDEO_POS_Y(content_vp.pos);
-         overlay_width  = VIDEO_SCALE_W(content_vp.dims);
+         overlay_width  = VIDEO_SCALE_W(content_vp.dims) * video_width
+            / VIDEO_SCALE_W(output_dims);
          overlay_height = VIDEO_SCALE_H(content_vp.dims);
       }
       gfx_display_set_alpha(p_dispwidget->pure_white, 1.0f);
@@ -2358,9 +2457,12 @@ static void gfx_widgets_frame_state(void *data)
    font_driver_bind_block(p_dispwidget->gfx_widget_fonts.bold.font, NULL);
    font_driver_bind_block(p_dispwidget->gfx_widget_fonts.msg_queue.font, NULL);
 
+   video_info->dims = output_dims;
+   gfx_display_set_output_dims(p_disp, 0);
+
    if (video_st->current_video && video_st->current_video->set_viewport)
       video_st->current_video->set_viewport(
-            video_st->data, video_info->dims, false, true);
+            video_st->data, output_dims, false, true);
 }
 
 void gfx_widgets_frame(void *data)
@@ -2388,6 +2490,33 @@ void gfx_widgets_frame(void *data)
 
    /* Nothing gathered may still be waiting when the frame is over */
    gfx_display_flush_batch(disp_get_ptr());
+}
+
+void gfx_widgets_draw_idle_logo(void *data, uintptr_t texture)
+{
+   unsigned i, side;
+   float white[16];
+   video_frame_info_t *video_info = (video_frame_info_t*)data;
+   gfx_display_t *p_disp          = (gfx_display_t*)video_info->disp_userdata;
+   void *userdata                 = video_info->userdata;
+   unsigned width                 = VIDEO_SCALE_W(video_info->dims);
+   unsigned height                = VIDEO_SCALE_H(video_info->dims);
+
+   if (!texture || !p_disp || !p_disp->dispctx)
+      return;
+   side = ((width < height) ? width : height) / 4;
+   if (!side)
+      return;
+   for (i = 0; i < 16; i++)
+      white[i] = 1.0f;
+   gfx_display_blend_begin(p_disp->dispctx, userdata);
+   gfx_widgets_draw_icon(userdata, p_disp, video_info->dims,
+         VIDEO_SCALE_PACK(side, side), texture,
+         (float)(width - side) / 2.0f, (float)(height - side) / 2.0f,
+         0.0f, 1.0f, 0.0f, white);
+   gfx_display_blend_end(p_disp->dispctx, userdata);
+   /* Nothing gathered may still be waiting when the logo is done */
+   gfx_display_flush_batch(p_disp);
 }
 
 static void gfx_widgets_free(dispgfx_widget_t *p_dispwidget)
@@ -2784,18 +2913,9 @@ static void gfx_widgets_detach_tasks(dispgfx_widget_t *p_dispwidget)
 {
    size_t i;
 
-   /* Not displayed yet: discarded outright, with the updates nobody
-    * will apply. */
-   for (;;)
-   {
-      disp_widget_msg_t *msg_widget = gfx_widgets_pending_pop(p_dispwidget);
-
-      if (!msg_widget)
-         break;
-
-      gfx_widgets_msg_queue_free(p_dispwidget, msg_widget);
-      free(msg_widget);
-   }
+   /* Task updates not applied yet are discarded: nobody will apply
+    * them. The pending ring holds only plain messages, which wait for
+    * the next owner or for gfx_widgets_free(). */
    gfx_widgets_task_cmds_discard(p_dispwidget);
    gfx_widgets_task_pending_discard(p_dispwidget);
 
@@ -2810,6 +2930,7 @@ static void gfx_widgets_detach_tasks(dispgfx_widget_t *p_dispwidget)
          msg->flags |= DISPWIDG_FLAG_EXPIRED;
 
       msg->task_key = 0;
+      gfx_widgets_task_text_lost();
    }
 }
 
@@ -2994,9 +3115,11 @@ void gfx_widgets_worker_step(void *data,
    if (!retro_atomic_load_acquire_int(&p_dispwidget->worker))
       return;
 
-   /* Per-eye UI lays out at one eye's size. */
-   widget_dims = video_views_ui_dims(&video_info->views_layout,
-         video_info->dims);
+   /* At the notifications' window's size: one eye's for per-eye UI */
+   widget_dims = gfx_widgets_layout_dims(
+         video_frame_ui_layer_dims(video_info,
+            VIDEO_WINDOW_UI_NOTIFICATIONS),
+         video_info->widget_display_aspect);
 
    if (gfx_widgets_update_layout(disp_get_ptr(),
             video_info->widget_scale_factor, widget_dims,

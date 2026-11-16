@@ -62,7 +62,7 @@ TARGETS += dxva_av1_test$(EXE)
 TARGETS += rh265_slice_snapshot_test$(EXE)
 TARGETS += rh265_hw_state_test$(EXE)
 TARGETS += rh265_hw_session_test$(EXE)
-TARGETS += rh265_hw_stream_test$(EXE)
+TARGETS += rh265_hw_stream_test$(EXE) rmp4_video_timing_test$(EXE)
 TARGETS += video_hw_format_test$(EXE) hevc_device_fixture_test$(EXE) hevc_color_stream_test$(EXE)
 ifeq ($(EXE),.exe)
 TARGETS += d3d11_video_decode_mock_test$(EXE) d3d11_video_decode_test$(EXE)
@@ -92,7 +92,7 @@ AV1_CORE_DEPS := $(RA)/libretro-common/compat/compat_strl.c \
       $(RA)/libretro-common/encodings/encoding_crc32.c \
       $(RA)/libretro-common/file/file_path.c \
       $(RA)/libretro-common/file/file_path_io.c \
-      $(RA)/libretro-common/formats/data_transfer.c \
+      $(RA)/libretro-common/formats/data_transfer.c $(RA)/libretro-common/streams/data_transfer_file.c \
       $(RA)/libretro-common/formats/webm/rwebm.c \
       $(RA)/libretro-common/formats/webm/rwebm_video.c \
       $(RA)/libretro-common/lists/string_list.c \
@@ -201,6 +201,13 @@ rh265_hw_stream_test$(EXE): rh265_hw_stream_test.c dxva_hevc_access_unit_data.h 
 	   $(filter-out $(RA)/libretro-common/formats/h265/rh265.c,$(PLAYER_SOURCES)) \
 	   $(LDFLAGS) -Wl,--gc-sections -lm
 
+rmp4_video_timing_test$(EXE): rmp4_video_timing_test.c $(DEC_OBJS) $(PLAYER_SOURCES) \
+      $(RA)/libretro-common/include/formats/rmp4_video.h
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o $@ \
+	   rmp4_video_timing_test.c $(DEC_OBJS) \
+	   $(filter-out $(RA)/libretro-common/formats/mp4/rmp4_video.c,$(PLAYER_SOURCES)) \
+	   $(LDFLAGS) -Wl,--gc-sections -lm
+
 hevc_color_stream_test$(EXE): hevc_color_stream_test.c hevc_color_data.h \
       rh265_hw_stream_test.c $(DEC_OBJS) $(PLAYER_SOURCES)
 	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o $@ \
@@ -226,6 +233,7 @@ check: all
 	$(RUNNER) ./rh265_hw_state_test$(EXE)
 	$(RUNNER) ./rh265_hw_session_test$(EXE)
 	$(RUNNER) ./rh265_hw_stream_test$(EXE)
+	$(RUNNER) ./rmp4_video_timing_test$(EXE)
 	$(RUNNER) ./video_hw_format_test$(EXE)
 	$(RUNNER) ./hevc_device_fixture_test$(EXE)
 	$(RUNNER) ./hevc_color_stream_test$(EXE)
@@ -253,6 +261,7 @@ clean:
 	rm -f rh265_hw_state_test rh265_hw_state_test.exe
 	rm -f rh265_hw_session_test rh265_hw_session_test.exe
 	rm -f rh265_hw_stream_test rh265_hw_stream_test.exe
+	rm -f rmp4_video_timing_test rmp4_video_timing_test.exe
 	rm -f rh265_slice_snapshot_test rh265_slice_snapshot_test.exe
 	rm -f hevc_device_fixture_test hevc_device_fixture_test.exe
 	rm -f hevc_color_stream_test hevc_color_stream_test.exe

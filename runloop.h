@@ -184,6 +184,7 @@ struct runloop
    rarch_timer_t shader_delay_timer;            /* int64_t alignment */
 #endif
    retro_time_t core_runtime_last;
+   retro_time_t core_runtime_credit;
    retro_time_t core_runtime_usec;
    retro_time_t core_run_time;
    /* GPU device-loss recovery: when the driver may next be rebuilt,
@@ -336,7 +337,6 @@ struct runloop
    unsigned pending_windowed_scale;
    unsigned max_frames;
    unsigned audio_latency;
-   unsigned fastforward_after_frames;
    unsigned perf_ptr_libretro;
    unsigned subsystem_current_count;
    unsigned video_swap_interval_auto;
@@ -378,6 +378,9 @@ struct runloop
    bool auto_state_load_attempted;
    bool auto_state_load_ready;
    bool auto_state_load_core_ran;
+   /* The auto state was asked for by name (Load State > Auto), so it
+    * loads whatever Auto Load State says. */
+   bool auto_state_load_asked;
 
    bool perfcnt_enable;
    bool paused_hotkey;
@@ -640,6 +643,24 @@ static INLINE bool runloop_pace_sample_usable(retro_time_t delta_us)
    return delta_us > 0 && delta_us < 250000;
 }
 
+/* A core running faster than real time must count only real time.
+ * Up to four frames of wall time bank in @credit, so frames that come
+ * unevenly but keep up - two at a time under audio sync - count in full. */
+static INLINE retro_time_t runloop_core_runtime_step(retro_time_t frame,
+      retro_time_t since, retro_time_t *credit)
+{
+   retro_time_t cap = 4 * frame;
+   retro_time_t tick;
+   if (since < 0)
+      since = 0;
+   *credit += since;
+   if (*credit > cap)
+      *credit = cap;
+   tick     = (frame < *credit) ? frame : *credit;
+   *credit -= tick;
+   return tick;
+}
+
 /* The swap interval 'Auto' derives for a display/content pair: the
  * number of display frames one content frame is held for. Meaningful
  * only as the whole multiple the display rate actually is of the
@@ -764,7 +785,13 @@ enum runloop_pace_fact
    PACE_FACT_FRAME_LIMIT     = (1 << 17), /* frame_limit_minimum_time != 0 */
    PACE_FACT_DRIVER_PACING   = (1 << 18), /* the driver's low-latency backend
                                              is up and took the mode */
-   PACE_FACT_CORE_RAN        = (1 << 19)  /* this iteration ran the core */
+   PACE_FACT_CORE_RAN        = (1 << 19), /* this iteration ran the core */
+   PACE_FACT_DRIVER_PACING_MISSING = (1 << 20),/* Driver Pacing is on, but
+                                             the driver has no backend
+                                             that took it */
+   PACE_FACT_DUPE_SKIP       = (1 << 21)  /* Skip Duplicate Frames is
+                                             leaving the core's repeats
+                                             unpresented */
 };
 
 typedef unsigned runloop_pace_facts_t;
@@ -798,6 +825,7 @@ static INLINE bool runloop_pace_driver_owns(runloop_pace_facts_t f,
 {
    return    (f & PACE_FACT_DRIVER_PACING)
           && (f & PACE_FACT_CORE_RAN)
+          && !(f & PACE_FACT_DUPE_SKIP)
           && (f & PACE_FACT_FOCUSED)
           && !(f & PACE_FACT_NONBLOCKING)
           && !(f & PACE_FACT_FASTMOTION)
@@ -821,6 +849,35 @@ static INLINE unsigned runloop_pace_driver_interval(unsigned pace,
                     | RUNLOOP_PACE_SCANLINE)))
       return 0;
    return (unsigned)content_period;
+}
+
+/* Driver Pacing on a driver with no backend for it (gl, glcore, a GPU
+ * without the extension): where the backend would have owned the
+ * release with nothing else holding the loop, the timer holds it to
+ * the content's period, the interval the backend would have kept. */
+static INLINE bool runloop_pace_driver_fallback(runloop_pace_facts_t f,
+      unsigned pace)
+{
+   return    (f & PACE_FACT_DRIVER_PACING_MISSING)
+          && pace == RUNLOOP_PACE_NONE
+          && runloop_pace_driver_owns(f | PACE_FACT_DRIVER_PACING, pace);
+}
+
+/* A repeat left unpresented by Skip Duplicate Frames reaches no present,
+ * so neither VSync nor the threaded hold can keep the loop on it, and the
+ * presents between repeats come at the content's rate, which a swapchain
+ * queues without blocking. Where audio, a scanline or the timer do not
+ * already hold the loop, the timer holds it to the content's period for
+ * as long as repeats are being skipped. The driver's release waits on a
+ * present, so it stands aside for that time (runloop_pace_driver_owns). */
+static INLINE bool runloop_pace_dupe_skip_engages(runloop_pace_facts_t f,
+      unsigned pace)
+{
+   return    (f & PACE_FACT_DUPE_SKIP)
+          && !(f & PACE_FACT_NONBLOCKING)
+          && !(f & PACE_FACT_FASTMOTION)
+          && !(pace & (RUNLOOP_PACE_AUDIO | RUNLOOP_PACE_SCANLINE
+                     | RUNLOOP_PACE_TIMER | RUNLOOP_PACE_NOWINDOW));
 }
 
 static INLINE unsigned runloop_pace_sources(runloop_pace_facts_t f)
@@ -894,6 +951,10 @@ static INLINE unsigned runloop_pace_decide(runloop_pace_facts_t f)
             (f & PACE_FACT_SCANLINE_SYNC) != 0,
             (f & PACE_FACT_RATE_CONTROL)  != 0))
       pace |= RUNLOOP_PACE_TIMER;
+   else if (runloop_pace_driver_fallback(f, pace))
+      pace |= RUNLOOP_PACE_TIMER;
+   else if (runloop_pace_dupe_skip_engages(f, pace))
+      pace |= RUNLOOP_PACE_TIMER;
    return pace;
 }
 
@@ -910,7 +971,8 @@ enum runloop_frame_work
    RUNLOOP_WORK_CHEEVOS  = (1 << 4),  /* achievements attached to content */
    RUNLOOP_WORK_RUN_FRAMES = (1 << 5), /* RUN_FRAMES is advancing frames */
    RUNLOOP_WORK_PAUSE_LOADED = (1 << 6), /* pause once the content has run */
-   RUNLOOP_WORK_FREE_FRAME = (1 << 7) /* a frame with no job to tell of */
+   RUNLOOP_WORK_FREE_FRAME = (1 << 7), /* a frame with no job to tell of */
+   RUNLOOP_WORK_CORE_PARK  = (1 << 8)  /* a core load the check parked */
 };
 
 /* Raise or drop one frame_work bit from the product that owns it.
@@ -987,12 +1049,20 @@ bool libretro_get_system_info(
  * previous core is closed; the core stage then takes the handle.
  * begin returns false when there is no worker to open it on (the core
  * stage opens it itself), ready is true once no open is in flight,
- * cancel drops an untaken handle. */
+ * cancel drops an untaken handle. With a trust store the stage is the
+ * core's check, worker or not (core_load_check_stage_begin). */
 bool runloop_core_preload_begin(void);
 bool runloop_core_preload_ready(void);
 void runloop_core_preload_cancel(void);
 
 #ifdef HAVE_DYNAMIC
+/* dylib_load() for a core; on Android only from the app's own folders.
+ * Main thread only: the load check comes first. */
+dylib_t runloop_core_dylib_load(const char *path, bool quiet);
+/* As above, unchecked, on any thread.
+ * @quiet: a worker's open, whose refusal the main thread's open logs */
+dylib_t runloop_core_dylib_open(const char *path, bool quiet);
+
 /* Frees the records libretro_get_system_info() keeps of the cores it
  * has asked; the next question reads them back from disk. */
 void runloop_core_probe_cache_free(void);
@@ -1003,6 +1073,10 @@ void runloop_core_probe_cache_free(void);
  * been asked this session, or its overrides are not known. */
 bool runloop_core_probe_need_fullpath(const char *core_path,
       const char *ext, bool *need_fullpath);
+
+/* Whether the last libretro_get_system_info() asked the running core:
+ * its load_no_content is read back from the running state */
+bool runloop_core_probe_live(void);
 #endif
 
 void runloop_performance_counter_register(

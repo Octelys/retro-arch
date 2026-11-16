@@ -32,6 +32,7 @@
 
 #include "../cloud_sync_driver.h"
 #include "../../configuration.h"
+#include "../../libretro-common/vfs/vfs_implementation_smb.h"
 #include "../../verbosity.h"
 #include <compat/strl.h>
 
@@ -194,7 +195,7 @@ static bool smb_sync_begin(cloud_sync_complete_handler_t cb, void *user_data)
       return true;
    }
 
-   ctx = smb2_init_context();
+   ctx = smb_ctx_new();
    if (!ctx)
    {
       RARCH_ERR(SMBPFX "Failed to create SMB context\n");
@@ -221,7 +222,7 @@ static bool smb_sync_begin(cloud_sync_complete_handler_t cb, void *user_data)
    if (rc < 0)
    {
       RARCH_ERR(SMBPFX "Connect failed: %s\n", smb2_get_error(ctx));
-      smb2_destroy_context(ctx);
+      smb_ctx_free(ctx);
       cb(user_data, NULL, false, NULL);
       return true;
    }
@@ -249,7 +250,7 @@ static bool smb_sync_begin(cloud_sync_complete_handler_t cb, void *user_data)
       {
          RARCH_ERR(SMBPFX "Failed to create subdir '%s'\n", smb_st.subdir);
          smb2_disconnect_share(ctx);
-         smb2_destroy_context(ctx);
+         smb_ctx_free(ctx);
          smb_st.ctx = NULL;
          cb(user_data, NULL, false, NULL);
          return true;
@@ -266,7 +267,7 @@ static bool smb_sync_end(cloud_sync_complete_handler_t cb, void *user_data)
    if (smb_st.ctx)
    {
       smb2_disconnect_share(smb_st.ctx);
-      smb2_destroy_context(smb_st.ctx);
+      smb_ctx_free(smb_st.ctx);
       smb_st.ctx = NULL;
    }
    smb_st.subdir[0] = '\0';
@@ -286,6 +287,7 @@ static bool smb_read(const char *path, const char *file,
    uint64_t offset    = 0;
    uint32_t chunk;
    RFILE *rfile       = NULL;
+   bool failed        = false;
    int rc;
 
    smb_sync_build_path(smb_path, sizeof(smb_path), smb_st.subdir, path);
@@ -318,49 +320,63 @@ static bool smb_read(const char *path, const char *file,
       return true;
    }
 
-   buf = (uint8_t *)malloc((size_t)file_size);
-   if (!buf)
+   /* Each read goes to the local file as it arrives, through one
+    * buffer the size of a read, rather than the whole file gathered
+    * in memory first -- at whatever size the server reported. */
+   rfile = filestream_open(file, RETRO_VFS_FILE_ACCESS_READ_WRITE,
+         RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK);
+   if (!rfile)
    {
+      RARCH_ERR(SMBPFX "Failed to open local file '%s'\n", file);
       smb2_close(smb_st.ctx, fh);
       cb(user_data, path, false, NULL);
       return true;
    }
 
    chunk = smb2_get_max_read_size(smb_st.ctx);
-   while (offset < file_size)
+   if ((uint64_t)chunk > file_size)
+      chunk = (uint32_t)file_size;
+   if (chunk && !(buf = (uint8_t *)malloc(chunk)))
    {
-      uint32_t to_read = (uint32_t)((file_size - offset) < chunk
-            ? (file_size - offset) : chunk);
-      int n = smb2_read(smb_st.ctx, fh, buf + offset, to_read);
-      if (n < 0)
-      {
-         RARCH_ERR(SMBPFX "Read error on '%s': %s\n",
-               smb_path, smb2_get_error(smb_st.ctx));
-         free(buf);
-         smb2_close(smb_st.ctx, fh);
-         cb(user_data, path, false, NULL);
-         return true;
-      }
-      if (n == 0)
-         break; /* EOF */
-      offset += (uint32_t)n;
-   }
-
-   smb2_close(smb_st.ctx, fh);
-
-   /* Write to local file */
-   rfile = filestream_open(file, RETRO_VFS_FILE_ACCESS_READ_WRITE, 0);
-   if (!rfile)
-   {
-      RARCH_ERR(SMBPFX "Failed to open local file '%s'\n", file);
-      free(buf);
+      filestream_close(rfile);
+      smb2_close(smb_st.ctx, fh);
       cb(user_data, path, false, NULL);
       return true;
    }
 
-   filestream_write(rfile, buf, (int64_t)offset);
-   filestream_seek(rfile, 0, SEEK_SET);
+   while (offset < file_size)
+   {
+      uint32_t to_read = (uint32_t)((file_size - offset) < chunk
+            ? (file_size - offset) : chunk);
+      int n = smb2_read(smb_st.ctx, fh, buf, to_read);
+      if (n < 0)
+      {
+         RARCH_ERR(SMBPFX "Read error on '%s': %s\n",
+               smb_path, smb2_get_error(smb_st.ctx));
+         failed = true;
+         break;
+      }
+      if (n == 0)
+         break; /* EOF */
+      if (filestream_write(rfile, buf, n) != n)
+      {
+         RARCH_ERR(SMBPFX "Failed to write local file '%s'\n", file);
+         failed = true;
+         break;
+      }
+      offset += (uint32_t)n;
+   }
+
    free(buf);
+   smb2_close(smb_st.ctx, fh);
+
+   if (failed)
+   {
+      filestream_close(rfile);
+      cb(user_data, path, false, NULL);
+      return true;
+   }
+   filestream_seek(rfile, 0, SEEK_SET);
 
    RARCH_DBG(SMBPFX "Read %s (%u bytes)\n", smb_path, (unsigned)offset);
    cb(user_data, path, true, rfile);

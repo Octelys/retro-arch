@@ -25,8 +25,9 @@
  * that lends the whole file in place: the member comes out exact every
  * way, and where the VFS lends the frame it is decoded there rather
  * than read. A frame with a window smaller than itself is extracted a
- * block at a time, and with its stated size wrong leaves no file. The
- * member's CRC, which a frame does not hold, is had by decoding it. */
+ * block at a time; with its stated size or its checksum wrong it is
+ * neither read nor extracted. The member's CRC, which a frame does not
+ * hold, is had by decoding it. */
 
 /* the lending VFS installs the implementation's own functions as a
  * frontend's */
@@ -57,6 +58,8 @@ static uint8_t       *data;
 static uint8_t       *frame;
 static size_t         frame_len;
 static uint64_t       read_octets;
+static unsigned       read_at_calls;
+static bool           positional; /* the VFS offers v6 reads at offsets */
 
 static void fail(const char *what, const char *detail)
 {
@@ -80,6 +83,17 @@ static int64_t count_read(struct retro_vfs_file_handle *h, void *s,
    return r;
 }
 
+static int64_t count_read_at(struct retro_vfs_file_handle *h, void *s,
+      uint64_t len, int64_t offset)
+{
+   int64_t r = retro_vfs_file_read_at_impl(
+         (libretro_vfs_implementation_file*)h, s, len, offset);
+   read_at_calls++;
+   if (r > 0)
+      read_octets += (uint64_t)r;
+   return r;
+}
+
 static void install_vfs(bool lend)
 {
    static struct retro_vfs_interface iface;
@@ -98,10 +112,16 @@ static void install_vfs(bool lend)
    iface.remove   = retro_vfs_file_remove_impl;
    iface.rename   = retro_vfs_file_rename_impl;
    info.required_interface_version = FILESTREAM_REQUIRED_VFS_VERSION;
+   if (positional)
+   {
+      iface.read_at                   = count_read_at;
+      info.required_interface_version = 6;
+   }
    info.iface                      = &iface;
    filestream_vfs_init(&info);
    filestream_set_mapped_ptr_cb(lend ? lend_mapped_ptr : NULL);
-   read_octets = 0;
+   read_octets   = 0;
+   read_at_calls = 0;
 }
 
 static int extract_cb(const char *name, const char *valid_exts,
@@ -179,7 +199,8 @@ static void gen(uint8_t *d, size_t n, uint32_t x, unsigned alpha)
    }
 }
 
-/* fx_win_zst extracted, and with its stated size one out */
+/* fx_win_zst extracted and read, and refused with its stated size one
+ * out or its checksum wrong */
 static void check_window(void)
 {
    uint8_t *want = (uint8_t*)malloc(WIN_LEN);
@@ -197,7 +218,7 @@ static void check_window(void)
    gen(want + 655000, 300, 9, 26);
 
    install_vfs(false);
-   for (k = 0; k < 2; k++)
+   for (k = 0; k < 3; k++)
    {
       struct archive_extract_userdata userdata;
       file_archive_transfer_t state;
@@ -206,13 +227,17 @@ static void check_window(void)
       void    *got       = NULL;
       int64_t  got_len   = 0;
       FILE    *f;
-      const char *what = k ? "window, size wrong" : "window";
+      const char *what = k == 2 ? "window, checksum wrong"
+         : k ? "window, size wrong" : "window";
 
       memcpy(fx, fx_win_zst, sizeof(fx));
       /* the low octet of the content size, after the magic, the frame
        * header descriptor and the window descriptor */
-      if (k)
+      if (k == 1)
          fx[6] ^= 1;
+      /* the frame's last octet: its checksum's highest */
+      if (k == 2)
+         fx[sizeof(fx) - 1] ^= 1;
       if (     !(f = fopen(WIN_PATH, "wb"))
             || fwrite(fx, 1, sizeof(fx), f) != sizeof(fx))
       {
@@ -232,6 +257,11 @@ static void check_window(void)
       {
          if (extracted || filestream_read_file(OUT_PATH, &got, &got_len))
             fail(what, "extracted");
+         free(got);
+         got = NULL;
+         if (file_archive_compressed_read(WIN_PATH "#archive_zst_win.bin",
+                  &got, NULL, &got_len))
+            fail(what, "read");
       }
       else if (extracted != 1)
          fail(what, "not extracted");
@@ -269,11 +299,20 @@ int main(void)
       return 2;
    fclose(f);
 
+   /* without v6 an extract's blocks are sought and read; with it, read
+    * at their offsets */
    check_read("read, plain file", false);
    check_read("read, lent", true);
    check_extract("extract, plain file", false);
    check_extract("extract, lent", true);
    check_window();
+   positional = true;
+   check_read("read at offsets, plain file", false);
+   check_extract("extract at offsets, plain file", false);
+   if (!read_at_calls)
+      fail("extract at offsets, plain file", "no read at an offset");
+   check_window();
+   positional = false;
    install_vfs(false);
    if (     file_archive_get_file_crc32(ZST_PATH "#archive_zst_test.bin")
          != encoding_crc32(0, data, DATA_LEN))

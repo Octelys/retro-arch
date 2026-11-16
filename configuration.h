@@ -35,7 +35,7 @@
 #include "led/led_defines.h"
 
 #ifdef HAVE_LAKKA
-#include "lakka.h"
+#include "os/lakka/lakka.h"
 #endif
 
 #include "msg_hash.h"
@@ -308,14 +308,21 @@ typedef struct settings
       unsigned video_stereo_mode;
       unsigned video_screen_layout;
 #ifdef HAVE_VIDEO_WINDOWS
-      unsigned video_screen_window_mode[RETRO_VIDEO_VIEWS_MAX];
       unsigned video_screen_window_pos[RETRO_VIDEO_VIEWS_MAX];
       unsigned video_screen_window_dims[RETRO_VIDEO_VIEWS_MAX];
       unsigned video_screen_window_monitor[RETRO_VIDEO_VIEWS_MAX];
+      unsigned video_menu_follows;
+      unsigned video_notifications_window;
 #endif
       unsigned video_openxr_refresh_rate;
       unsigned video_openxr_controllers;
       unsigned video_openxr_laser;
+      unsigned video_openxr_laser_beam;
+      unsigned video_openxr_edit_snap_angles;
+      unsigned video_openxr_edit_hinge_gap;
+      unsigned video_openxr_edit_smoothing;
+      unsigned video_openxr_touch_hands;
+      unsigned video_openxr_touch_button;
       unsigned video_openxr_placement;
       unsigned video_fse_negotiation;
       unsigned video_hw_decode;
@@ -582,9 +589,30 @@ typedef struct settings
    struct
    {
       float placeholder;
+      float video_screen_xr_x[RETRO_VIDEO_VIEWS_MAX];
+      float video_screen_xr_y[RETRO_VIDEO_VIEWS_MAX];
+      float video_screen_xr_z[RETRO_VIDEO_VIEWS_MAX];
+      float video_screen_xr_yaw[RETRO_VIDEO_VIEWS_MAX];
+      float video_screen_xr_pitch[RETRO_VIDEO_VIEWS_MAX];
+      float video_screen_xr_roll[RETRO_VIDEO_VIEWS_MAX];
+      float video_screen_xr_scale[RETRO_VIDEO_VIEWS_MAX];
+      float video_openxr_menu_xr_x;
+      float video_openxr_menu_xr_y;
+      float video_openxr_menu_xr_z;
+      float video_openxr_menu_xr_yaw;
+      float video_openxr_menu_xr_pitch;
+      float video_openxr_menu_xr_roll;
+      float video_openxr_menu_xr_scale;
+
       float video_aspect_ratio;
       float video_vp_bias_x;
       float video_vp_bias_y;
+#ifdef HAVE_COCOATOUCH
+      float video_ios_margin_left;
+      float video_ios_margin_right;
+      float video_ios_margin_top;
+      float video_ios_margin_bottom;
+#endif
 #if defined(RARCH_MOBILE)
       float video_vp_bias_portrait_x;
       float video_vp_bias_portrait_y;
@@ -677,6 +705,8 @@ typedef struct settings
    struct
    {
       bool placeholder;
+      bool video_screen_xr_visible[RETRO_VIDEO_VIEWS_MAX];
+      bool video_openxr_menu_placed;
 #ifdef HAVE_VIDEO_WINDOWS
       bool video_windows_enable;
       bool video_screen_window_fullscreen[RETRO_VIDEO_VIEWS_MAX];
@@ -698,7 +728,11 @@ typedef struct settings
       bool video_smooth;
       bool video_stereo_swap_eyes;
       bool video_openxr_enable;
+      bool video_openxr_menu_follow;
       bool video_openxr_perf_boost;
+      bool video_openxr_edit_pause;
+      bool video_openxr_edit_snap;
+      bool video_openxr_touch_passthrough;
       bool video_ctx_scaling;
       bool video_force_aspect;
       bool video_frame_delay_auto;
@@ -718,8 +752,10 @@ typedef struct settings
       bool video_threaded;
       bool video_threaded_present_repeat;
       bool video_threaded_display_pacing;
+      bool video_threaded_pacing_vblank;
       bool video_d3d9ex_present;
       bool video_present_timing_from_display;
+      bool video_skip_dupe_frames;
       bool video_font_enable;
       bool video_disable_composition;
       bool video_post_filter_record;
@@ -856,6 +892,9 @@ typedef struct settings
       bool notification_show_autoconfig_fails;
       bool notification_show_cheats_applied;
       bool notification_show_patch_applied;
+#ifdef HAVE_CORE_SIGNING_TEST_KEY
+      bool notification_show_core_signing_test_key;
+#endif
       bool notification_show_remap_load;
       bool notification_show_config_override_load;
       bool notification_show_set_initial_disk;
@@ -890,6 +929,7 @@ typedef struct settings
       bool menu_linear_filter;
       bool menu_texture_mipmapping;
       bool menu_horizontal_animation;
+      bool menu_scroll_quick;
       bool menu_scroll_fast;
       bool menu_show_online_updater;
       bool menu_show_full_paths;
@@ -939,6 +979,9 @@ typedef struct settings
       bool menu_rgui_switch_icons;
       bool menu_rgui_particle_effect_screensaver;
       bool menu_xmb_shadows_enable;
+      bool menu_xmb_plastic_effect_enable;
+      bool menu_xmb_ribbon_bloom_enable;
+      bool menu_xmb_ribbon_particles_enable;
       bool menu_xmb_show_horizontal_list;
       bool menu_xmb_show_title_header;
       bool menu_xmb_entry_icons;
@@ -981,6 +1024,7 @@ typedef struct settings
       bool settings_show_accessibility;
       bool settings_show_power_management;
       bool settings_show_achievements;
+      bool settings_show_bluetooth;
       bool settings_show_network;
       bool settings_show_playlists;
       bool settings_show_user;
@@ -1163,6 +1207,7 @@ typedef struct settings
       bool load_dummy_on_core_shutdown;
       bool core_option_category_enable;
       bool core_info_cache_enable;
+      bool core_firmware_notification_enable;
       bool core_info_savestate_bypass;
 #ifndef HAVE_DYNAMIC
       bool always_reload_core_on_run_content;
@@ -1392,6 +1437,13 @@ typedef struct settings
       char input_keyboard_device[MAX_USERS][64];
       /* and the mouse */
       char input_mouse_device[MAX_USERS][64];
+#ifdef HAVE_VIDEO_WINDOWS
+      /* Each screen's display, by video_windows_display_key(); empty
+       * for Auto, VIDEO_WINDOW_DISPLAY_OFF for none */
+      char video_screen_display[RETRO_VIDEO_VIEWS_MAX][64];
+      /* The menu's display when it follows no screen; empty for Auto */
+      char video_menu_display[64];
+#endif
 
       char youtube_stream_key[PATH_MAX_LENGTH];
       char twitch_stream_key[PATH_MAX_LENGTH];
@@ -1510,6 +1562,9 @@ typedef struct settings
       char path_cheat_settings[PATH_MAX_LENGTH];
       char path_font[PATH_MAX_LENGTH];
       char path_rgui_theme_preset[PATH_MAX_LENGTH];
+#ifdef HAVE_VULKAN_CUSTOM_DRIVER
+      char path_vulkan_driver[PATH_MAX_LENGTH];
+#endif
       char app_icon[PATH_MAX_LENGTH];
 
       char browse_url[4096];      /* TODO/FIXME - check size */
@@ -1731,7 +1786,32 @@ bool config_overlay_enable_default(void);
 bool config_metal_arg_buffers_default(void);
 #endif
 
+void config_reset_video_screen_xr(settings_t *settings, unsigned first, unsigned count);
+
+/* The headset's menu back in front of screen 1. */
+void config_reset_video_menu_xr(settings_t *settings);
+
+struct video_screen_xr;
+/* Edit Screens' reads and writes of a screen's place, or the menu's,
+ * as the Stereo 3D & Screens rows keep them. A write normalises, marks
+ * the settings modified and leaves Visible alone; NULL resets a screen
+ * as Reset Screen does, or puts the menu back in front of screen 1. The
+ * menu's read is false while it follows screen 1. */
+void config_get_video_screen_xr(unsigned screen, struct video_screen_xr *out);
+bool config_get_video_menu_xr(struct video_screen_xr *out);
+void config_set_video_screen_xr(unsigned screen,
+      const struct video_screen_xr *values);
+void config_set_video_menu_xr(const struct video_screen_xr *values);
+
 void config_set_defaults(settings_t *target);
+
+#ifdef ANDROID
+/* Defined in frontend/drivers/platform_unix.c.  Sets the drivers and
+ * audio latency the device is best served by, as the settings' own
+ * values over the built-in defaults: on a fresh install's first start,
+ * and on "Reset to Default Configuration". */
+void android_apply_device_defaults(settings_t *settings);
+#endif
 
 void config_load(void);
 

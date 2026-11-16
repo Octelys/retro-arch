@@ -40,6 +40,7 @@ SOURCES := \
 	$(LIBRETRO_COMM_DIR)/encodings/encoding_deflate.c \
 	$(LIBRETRO_COMM_DIR)/encodings/encoding_rbzip2.c \
 	$(LIBRETRO_COMM_DIR)/encodings/encoding_rzstd.c \
+	$(LIBRETRO_COMM_DIR)/encodings/encoding_xxh64.c \
 	$(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c \
 	$(LIBRETRO_COMM_DIR)/time/rtime.c
 
@@ -47,6 +48,10 @@ OBJS := $(call sample_objs,$(SOURCES:.c=.o))
 
 override CPPFLAGS += -DHAVE_COMPRESSION -DHAVE_7ZIP -DHAVE_RBZIP2 -DHAVE_RZSTD -I$(LIBRETRO_COMM_DIR)/include
 CFLAGS            += -Wall -pedantic -std=gnu99 -g1
+
+# A bzip2 member read with MMAP=0 goes through a ring that wraps round
+# within it
+override CPPFLAGS += -DZIP_BZIP2_AHEAD=1500
 
 MMAP ?= 1
 ifeq ($(MMAP),1)

@@ -11,7 +11,7 @@ SRC     := $(RA)/gfx/font_driver.c \
            $(RA)/libretro-common/encodings/encoding_utf.c \
            $(RA)/libretro-common/lists/string_list.c \
            $(RA)/libretro-common/time/rtime.c
-all: lifecycle lifecycle-threaded owner create fallback chain frame vg sdl2
+all: lifecycle lifecycle-threaded owner create fallback chain frame vg sdl2 omap
 lifecycle: font_lifecycle_test.c stubs_retroarch.c $(SRC)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 # Same tests with the marshalling branch compiled in, so a rebuild
@@ -24,24 +24,28 @@ owner: font_owner_test.c stubs_retroarch.c $(SRC)
 	$(CC) $(CFLAGS) -DHAVE_THREADS -o $@ font_owner_test.c stubs_retroarch.c \
 	   $(filter-out $(RA)/gfx/font_driver.c,$(SRC)) -lm
 create: font_create_test.c stubs_retroarch.c $(SRC) \
-        $(RA)/gfx/drivers_font_renderer/stb.c $(RA)/gfx/bitmapfont.c
+        $(RA)/gfx/drivers_font_renderer/stb.c $(RA)/gfx/bitmapfont.c \
+        $(RA)/libretro-common/gfx/font/rtt.c
 	$(CC) $(CFLAGS) -DFONT_TEST_REAL_STB -o $@ $^ -lm
 # The fallback font read on its own thread, against two fonts asking
 # at once: real stb, real rthreads.
 fallback: font_fallback_test.c stubs_retroarch.c $(SRC) \
         $(RA)/gfx/drivers_font_renderer/stb.c $(RA)/gfx/bitmapfont.c \
+        $(RA)/libretro-common/gfx/font/rtt.c \
         $(RA)/libretro-common/rthreads/rthreads.c
 	$(CC) $(CFLAGS) -DHAVE_THREADS -DFONT_TEST_REAL_STB \
 	   -DFONT_TEST_REAL_THREADS -o $@ $^ -lm
 # A second fallback face for a range the first lacks
 chain: font_fallback_chain_test.c stubs_retroarch.c $(SRC) \
         $(RA)/gfx/drivers_font_renderer/stb.c $(RA)/gfx/bitmapfont.c \
+        $(RA)/libretro-common/gfx/font/rtt.c \
         $(RA)/libretro-common/rthreads/rthreads.c
 	$(CC) $(CFLAGS) -DHAVE_THREADS -DFONT_TEST_REAL_STB \
 	   -DFONT_TEST_REAL_THREADS -o $@ $^ -lm
 # Cells drawn from in a frame are kept for that frame
 frame: font_frame_test.c stubs_retroarch.c $(SRC) \
-        $(RA)/gfx/drivers_font_renderer/stb.c $(RA)/gfx/bitmapfont.c
+        $(RA)/gfx/drivers_font_renderer/stb.c $(RA)/gfx/bitmapfont.c \
+        $(RA)/libretro-common/gfx/font/rtt.c
 	$(CC) $(CFLAGS) -DFONT_TEST_REAL_STB -o $@ $^ -lm
 # OpenVG's text path, from the shipping gfx/drivers/vg.c, drawn onto
 # the software OpenVG in font_vg_test.c.
@@ -49,6 +53,7 @@ frame: font_frame_test.c stubs_retroarch.c $(SRC) \
 # its own.
 vg: font_vg_test.c stubs_retroarch.c $(SRC) \
         $(RA)/gfx/drivers_font_renderer/stb.c $(RA)/gfx/bitmapfont.c \
+        $(RA)/libretro-common/gfx/font/rtt.c \
         $(RA)/gfx/drivers/vg.c $(RA)/gfx/font_layout.h
 	$(CC) $(CFLAGS) -DFONT_TEST_REAL_STB -DHAVE_VG -DHAVE_EGL \
 	   -I$(RA)/tools/platform_stubs/openvg -Ivg_mock \
@@ -62,6 +67,7 @@ SDL2_CFLAGS := $(shell pkg-config --cflags sdl2 2>/dev/null)
 SDL2_LIBS   := $(shell pkg-config --libs sdl2 2>/dev/null)
 sdl2: font_sdl2_test.c stubs_retroarch.c $(SRC) \
         $(RA)/gfx/drivers_font_renderer/stb.c $(RA)/gfx/bitmapfont.c \
+        $(RA)/libretro-common/gfx/font/rtt.c \
         $(RA)/gfx/drivers/sdl2_gfx.c $(RA)/gfx/font_layout.h
 ifneq ($(SDL2_LIBS),)
 	$(CC) $(CFLAGS) -DFONT_TEST_REAL_STB -DHAVE_SDL2 -DHAVE_MENU $(SDL2_CFLAGS) -no-pie \
@@ -69,6 +75,28 @@ ifneq ($(SDL2_LIBS),)
 	   -Wl,--unresolved-symbols=ignore-all $(SDL2_LIBS) -lm
 else
 	printf '#!/bin/sh\necho "  skip: no SDL2 development files"\n' > $@
+	chmod +x $@
+endif
+# The OMAP framebuffer driver's on-screen message path, from the
+# shipping gfx/drivers/omap_gfx.c, blended into a page in memory, with
+# FreeType's glyphs, whose boxes are their ink rather than a whole
+# cell. The test includes the driver and calls only that path, so the
+# frontend the rest of it names is left unresolved (GNU ld, non-PIE).
+# Linux only: the driver includes the kernel's omapfb header. Skipped
+# without FreeType's development files.
+FT_CFLAGS := $(shell pkg-config --cflags freetype2 2>/dev/null)
+FT_LIBS   := $(shell pkg-config --libs freetype2 2>/dev/null)
+omap: font_omap_test.c stubs_retroarch.c $(SRC) \
+        $(RA)/gfx/drivers_font_renderer/stb.c $(RA)/gfx/bitmapfont.c \
+        $(RA)/libretro-common/gfx/font/rtt.c \
+        $(RA)/gfx/drivers_font_renderer/freetype.c \
+        $(RA)/gfx/drivers/omap_gfx.c $(RA)/gfx/font_layout.h
+ifneq ($(FT_LIBS),)
+	$(CC) $(CFLAGS) -DFONT_TEST_REAL_STB -DHAVE_FREETYPE $(FT_CFLAGS) -no-pie \
+	   -o $@ $(filter %.c,$(filter-out $(RA)/gfx/drivers/omap_gfx.c,$^)) \
+	   -Wl,--unresolved-symbols=ignore-all $(FT_LIBS) -lm
+else
+	printf '#!/bin/sh\necho "  skip: no FreeType development files"\n' > $@
 	chmod +x $@
 endif
 check: all
@@ -81,6 +109,7 @@ check: all
 	ASAN_OPTIONS=detect_leaks=1 ./frame
 	ASAN_OPTIONS=detect_leaks=1 ./vg
 	ASAN_OPTIONS=detect_leaks=1 ./sdl2
+	ASAN_OPTIONS=detect_leaks=1 ./omap
 clean:
-	rm -f lifecycle lifecycle-threaded owner create fallback chain frame vg sdl2
+	rm -f lifecycle lifecycle-threaded owner create fallback chain frame vg sdl2 omap
 .PHONY: all check clean

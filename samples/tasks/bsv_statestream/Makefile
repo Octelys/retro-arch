@@ -15,11 +15,13 @@ SOURCES := bsv_statestream_test.c \
            $(REPO_ROOT)/tasks/task_movie.c \
            $(REPO_ROOT)/input/bsv/bsvmovie.c \
            $(REPO_ROOT)/input/bsv/uint32s_index.c \
+           $(LIBRETRO_COMM_DIR)/encodings/encoding_xxh3.c \
            $(REPO_ROOT)/libretro-db/rmsgpack.c \
            $(REPO_ROOT)/libretro-db/rmsgpack_dom.c \
            $(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
            $(LIBRETRO_COMM_DIR)/compat/fopen_utf8.c \
            $(LIBRETRO_COMM_DIR)/encodings/encoding_rzstd.c \
+           $(LIBRETRO_COMM_DIR)/encodings/encoding_xxh64.c \
            $(LIBRETRO_COMM_DIR)/encodings/encoding_utf.c \
            $(LIBRETRO_COMM_DIR)/encodings/encoding_crc32.c \
            $(LIBRETRO_COMM_DIR)/features/features_cpu.c \
@@ -29,6 +31,7 @@ SOURCES := bsv_statestream_test.c \
            $(LIBRETRO_COMM_DIR)/lists/string_list.c \
            $(LIBRETRO_COMM_DIR)/queues/task_queue.c \
            $(LIBRETRO_COMM_DIR)/rthreads/rthreads.c \
+           $(LIBRETRO_COMM_DIR)/rthreads/retro_eventcount.c \
            $(LIBRETRO_COMM_DIR)/streams/file_stream.c \
            $(LIBRETRO_COMM_DIR)/streams/interface_stream.c \
            $(LIBRETRO_COMM_DIR)/streams/memory_stream.c \
@@ -38,7 +41,7 @@ SOURCES := bsv_statestream_test.c \
 
 CFLAGS  += -Wall -std=gnu99 -g1 -O1 \
            -DHAVE_BSV_MOVIE -DHAVE_RZSTD -DHAVE_STATESTREAM -DHAVE_THREADS \
-           -I$(REPO_ROOT) -I$(REPO_ROOT)/deps \
+           -I$(REPO_ROOT) \
            -I$(LIBRETRO_COMM_DIR)/include
 
 LDFLAGS += -lpthread -lm

@@ -136,6 +136,16 @@ void *task_push_http_transfer_with_content(const char *url, const char *method,
    bool headers_accept_err, const char *headers,
    retro_task_callback_t cb, void *user_data);
 
+/* The same with a body of @len bytes pulled from @source as the socket
+ * takes them, so the body is never held whole in memory. @rewind
+ * restarts it for a replay on a fresh connection; NULL means the
+ * request is never replayed. */
+void *task_push_http_transfer_with_source(const char *url, const char *method,
+   net_http_source_t source, net_http_source_rewind_t rewind,
+   void *source_data, size_t len, const char *content_type, bool mute,
+   bool headers_accept_err, const char *headers,
+   retro_task_callback_t cb, void *user_data);
+
 void *task_push_webdav_stat(const char *url, bool mute, const char *headers,
       retro_task_callback_t cb, void *userdata);
 void *task_push_webdav_mkdir(const char *url, bool mute, const char *headers,
@@ -251,11 +261,17 @@ void *task_push_core_backup_install(
       const char *dir_core_assets, bool mute,
       retro_task_callback_t cb, void *user_data);
 
+struct core_check;
+
 /* NOTE: If 'core_loaded' is true, menu stack should be
- * flushed if task_push_core_restore() returns true */
+ * flushed if task_push_core_restore() returns true.
+ * own_backup: from RetroArch's own backup list, so it may be an older
+ * build. warned: Install and Trust's check, which the core installed
+ * must still match; NULL otherwise. */
 bool task_push_core_restore(const char *backup_path,
       const char *dir_libretro,
-      bool *core_loaded);
+      bool *core_loaded, bool own_backup,
+      const struct core_check *warned);
 
 bool task_push_pl_manager_reset_cores(const playlist_config_t *playlist_config);
 bool task_push_pl_manager_clean_playlist(const playlist_config_t *playlist_config);
@@ -336,16 +352,109 @@ bool task_push_image_load_set(const char *const *paths,
  * task. Safe from a task_queue_find predicate. */
 bool task_image_set_tag(retro_task_t *task, uint64_t *tag);
 
+/* A content scan's outcome, handed to its callback as task_data and
+ * valid only during the call.  Counts cover every playlist the scan
+ * writes; errors are files it could not read. */
+typedef struct
+{
+   unsigned added;
+   unsigned duplicates;
+   unsigned unmatched;
+   unsigned errors;
+   bool     failed;
+} task_dbscan_result_t;
+
 #ifdef HAVE_LIBRETRODB
 /* Scans @fullpath, a directory or a single file, against the content
  * databases; the database and playlist directories come from the
- * settings. */
-bool task_push_dbscan(const char *fullpath, retro_task_callback_t cb);
+ * settings.  @cb gets @user_data.  False while a chain runs. */
+bool task_push_dbscan(const char *fullpath, retro_task_callback_t cb,
+      void *user_data);
+
+/* As task_push_dbscan(), for a @fullpath known to be a folder
+ * (@is_dir) or a file. */
+bool task_push_dbscan_known(const char *fullpath, bool is_dir,
+      retro_task_callback_t cb, void *user_data);
 #endif
+
+struct manual_content_scan_overrides;
+
+enum task_dbscan_item_kind
+{
+   TASK_DBSCAN_ITEM_PATH = 0,     /* --scan */
+   TASK_DBSCAN_ITEM_REFRESH,      /* --scan-refresh */
+   TASK_DBSCAN_ITEM_REFRESH_ALL   /* --scan-refresh-all, Refresh All */
+};
+
+typedef struct
+{
+   char *arg;  /* as typed; NULL for REFRESH_ALL */
+   struct manual_content_scan_overrides *overrides; /* NULL: none */
+   enum task_dbscan_item_kind kind;
+} task_dbscan_item_t;
+
+enum task_dbscan_outcome
+{
+   TASK_DBSCAN_RAN = 0,   /* res holds the counts */
+   TASK_DBSCAN_FAILED,
+   TASK_DBSCAN_SKIPPED
+};
+
+typedef struct
+{
+   /* Each --scan and each playlist; a group counts all its members. */
+   unsigned ran;     /* ran and did not fail */
+   unsigned added;   /* of those, the ones that added an entry */
+   unsigned failed;
+   unsigned skipped;
+   bool     cancelled;
+} task_dbscan_chain_result_t;
+
+typedef void (*task_dbscan_item_cb_t)(const char *name,
+      enum task_dbscan_outcome outcome,
+      const task_dbscan_result_t *res, void *user_data);
+typedef void (*task_dbscan_chain_cb_t)(
+      const task_dbscan_chain_result_t *res, void *user_data);
+
+/* Runs @items in order, one task at a time: each step is pushed from
+ * the last one's callback, and a cancelled task ends the run.  The
+ * chain owns @items from the call, whatever it returns.  @item_cb: once
+ * per scan, failed item or skipped playlist; @done_cb: once at the end,
+ * from a task callback.  @res is valid during the call only.  False,
+ * calling neither, if out of memory or while a chain or a manual scan
+ * runs.  Main thread only. */
+bool task_push_dbscan_chain(task_dbscan_item_t *items, size_t count,
+      task_dbscan_item_cb_t item_cb, task_dbscan_chain_cb_t done_cb,
+      void *user_data);
+
+/* Main thread only. */
+bool task_dbscan_chain_is_running(void);
+
+/* False while task_push_dbscan_chain() would refuse: a chain or a
+ * manual scan runs.  Main thread only. */
+bool task_dbscan_chain_can_start(void);
+/* A scan asked for while a chain runs would use the settings the chain
+ * last loaded: true, with the message shown, when it must be refused. */
+bool task_dbscan_chain_refuse(void);
+/* The same for a new chain, which also waits for a running scan. */
+bool task_dbscan_chain_refuse_start(void);
 
 bool task_push_manual_content_scan(
       bool do_menu_refresh,
-      retro_task_callback_t user_cb);
+      retro_task_callback_t user_cb, void *user_data);
+
+#ifdef HAVE_LIBRETRODB
+/* One scan of the manual scan settings' folder for the playlists named
+ * in @group, each named after an installed database: only those
+ * databases are matched, each match goes to its database's playlist,
+ * and every member is cleared when overwriting, validated and given
+ * the settings, new entries or not.  False unless the settings are a
+ * strict database scan.  @group is copied; @cli_name labels the --scan
+ * lines, NULL for the folder.  @user_cb gets the whole group's counts.
+ * Main thread only. */
+bool task_push_manual_content_scan_group(const struct string_list *group,
+      const char *cli_name, retro_task_callback_t user_cb, void *user_data);
+#endif
 
 #ifdef HAVE_OVERLAY
 bool task_push_overlay_load_default(
@@ -413,6 +522,9 @@ struct screenshot_result
     * task */
    const char *png_base64;
    size_t      png_base64_len;
+   /* the picture's size */
+   unsigned    width;
+   unsigned    height;
 };
 
 /* The largest PNG handed back to the callback */
@@ -426,6 +538,13 @@ bool take_screenshot_notify(
       const char *screenshot_dir,
       const char *path, bool silence,
       bool has_valid_framebuffer, bool fullpath, bool use_thread,
+      retro_task_callback_t cb, void *user_data);
+
+/* The frame on screen, scaled to fit @max_width by @max_height and never
+ * up, as a PNG for @cb alone: struct screenshot_result's png_base64,
+ * with an empty path. Nothing is written and nothing shown; always a
+ * task, so @cb runs on a later frame. */
+bool take_frame_notify(unsigned max_width, unsigned max_height,
       retro_task_callback_t cb, void *user_data);
 
 bool event_load_save_files(bool is_sram_load_disabled);
@@ -458,7 +577,14 @@ enum autoconfig_handle_flags
     *
     * This is used in the SDL3 driver, for instance, where mappings are provided directly.
     */
-   AUTOCONF_FLAG_HAS_STANDARD_MAPPING = (1 << 3)
+   AUTOCONF_FLAG_HAS_STANDARD_MAPPING = (1 << 3),
+   /**
+    * Device reported again while it stays connected: it keeps the Plays As
+    * entry it holds, or none, and takes no other.
+    *
+    * @see input_autoconfigure_reconnect()
+    */
+   AUTOCONF_FLAG_RECONNECT = (1 << 4)
 };
 
 void input_autoconfigure_blissbox_override_handler(
@@ -486,6 +612,14 @@ bool input_autoconfigure_connect_ex(
 bool input_autoconfigure_disconnect(
       unsigned port, const char *name);
 bool input_autoconfigure_reconnect(unsigned port);
+/* The controller in @slot placed again as its connect placed it, with
+ * any it pushes off a port; @slot MAX_USERS: those a change of Max
+ * Users moves. No driver restarted. Main thread. */
+void input_autoconfigure_reallocate_ports(unsigned slot);
+/* An override was loaded or unloaded from the menu: the controllers
+ * the reload moved are placed again at once, @before from
+ * input_config_plays_as_players() taken before it. Main thread. */
+void input_autoconfigure_plays_as_reread(const uint8_t *before);
 #if defined(HAVE_TEST_DRIVERS) || defined(HAVE_OPENXR)
 bool input_autoconfigure_pending(void);
 #endif

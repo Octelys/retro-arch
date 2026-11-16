@@ -65,6 +65,12 @@
 
 #ifdef HAVE_RBZIP2
 #include <encodings/rbzip2.h>
+
+/* How far a streaming bzip2 member is read ahead of its decoder, in a
+ * ring of twice it */
+#ifndef ZIP_BZIP2_AHEAD
+#define ZIP_BZIP2_AHEAD RBZIP2_AHEAD
+#endif
 #endif
 
 /* LZMA members decode through the 7z backend's LZMA decoder. */
@@ -179,6 +185,18 @@ static INLINE uint64_t read_le64(const uint8_t *data)
    return (uint64_t)read_le(data, 4) | ((uint64_t)read_le(data + 4, 4) << 32);
 }
 
+/* @len octets at @off: one read at the offset, or a seek and a read
+ * where the file has none */
+static int64_t zip_read_at(RFILE *f, void *buf, int64_t len, int64_t off)
+{
+   int64_t got = filestream_read_at(f, buf, len, off);
+   if (got >= 0)
+      return got;
+   if (filestream_seek(f, off, RETRO_VFS_SEEK_POSITION_START) < 0)
+      return -1;
+   return filestream_read(f, buf, len);
+}
+
 static void zip_context_free_stream(
       zip_context_t *zip_context, bool keep_decompressed)
 {
@@ -259,6 +277,32 @@ static bool zip_context_reserve_tmpbuf(zip_context_t *zip_context,
    return true;
 }
 
+#ifdef HAVE_RBZIP2
+/* The bzip2 member read on into the ring of @cap at tmpbuf, up to
+ * where the decoder has @taken it to, a whole ring ahead, or its end */
+static bool zip_bzip2_fill(struct file_archive_transfer *state,
+      zip_context_t *zip_context, uint64_t taken, size_t cap)
+{
+   uint64_t to = taken + cap;
+   if (to > zip_context->csize)
+      to = zip_context->csize;
+   while (zip_context->boffset < to)
+   {
+      size_t at = (size_t)(zip_context->boffset % cap);
+      size_t n  = cap - at;
+      if (n > to - zip_context->boffset)
+         n = (size_t)(to - zip_context->boffset);
+      if (zip_read_at(state->archive_file, zip_context->tmpbuf + at,
+               (int64_t)n,
+               (int64_t)(zip_context->fdoffset + zip_context->boffset))
+            != (int64_t)n)
+         return false;
+      zip_context->boffset += n;
+   }
+   return true;
+}
+#endif
+
 /* Up to @len octets of member data at @off: lent from the stream
  * where it can, otherwise read into @buf. A lent pointer holds until
  * the next call on @f. Callers keep @len to a slice whose output is
@@ -273,6 +317,27 @@ static int64_t zip_member_input(RFILE *f, int64_t off, int64_t len,
    *ptr = buf;
    return filestream_read(f, buf, len);
 }
+
+#if defined(ZIP_HAVE_ZSTD) || defined(HAVE_RBZIP2)
+/* All @csize octets of a member at @off where they lie: in the mapping,
+ * or what the stream lends when it holds all of them; NULL when they
+ * would have to be read */
+static const uint8_t *zip_member_lent(struct file_archive_transfer *state,
+      int64_t off, uint64_t csize)
+{
+   const uint8_t *src = NULL;
+   if (csize > (uint64_t)((size_t)-1))
+      return NULL;
+#ifdef VFS_HAVE_FILE_MAPPING
+   if (state->archive_mmap_data)
+      return state->archive_mmap_data + (size_t)off;
+#endif
+   filestream_seek(state->archive_file, off, RETRO_VFS_SEEK_POSITION_START);
+   if (filestream_view(state->archive_file, csize, &src) == (int64_t)csize)
+      return src;
+   return NULL;
+}
+#endif
 
 /* All @csize octets of a member at @off that is decoded whole: from
  * the mapping, from what the stream lends when it holds all of it, or
@@ -298,8 +363,8 @@ static const uint8_t *zip_member_whole(struct file_archive_transfer *state,
       *buf = p;
       *cap = (size_t)csize;
    }
-   filestream_seek(state->archive_file, off, RETRO_VFS_SEEK_POSITION_START);
-   if (filestream_read(state->archive_file, *buf, csize) != (int64_t)csize)
+   if (zip_read_at(state->archive_file, *buf, (int64_t)csize, off)
+         != (int64_t)csize)
       return NULL;
    return *buf;
 }
@@ -390,8 +455,8 @@ static bool zlib_stream_decompress_data_to_file_init(
    else
 #endif
    {
-      filestream_seek(state->archive_file, (int64_t)local + 26, RETRO_VFS_SEEK_POSITION_START);
-      if (filestream_read(state->archive_file, local_header_buf, 4) != 4)
+      if (zip_read_at(state->archive_file, local_header_buf, 4,
+               (int64_t)local + 26) != 4)
          return false;
       local_header = local_header_buf;
    }
@@ -432,10 +497,11 @@ static bool zlib_stream_decompress_data_to_file_init(
    zip_context->out_off               = 0;
    zip_context->cmode                 = cmode;
 
-   /* A member bound for a file is written out as it goes; anything
-    * else is decoded whole into memory that has to hold it */
+   /* A member bound for a file is written out as it goes, a stored one
+    * however small, from where it lies; anything else is decoded whole
+    * into memory that has to hold it */
    zip_context->streaming = state->pending_sink
-         && (size > ZIP_STREAM_WINDOW);
+         && (size > ZIP_STREAM_WINDOW || cmode == ZIP_MODE_STORED);
    if (!zip_context->streaming && size > (uint64_t)((size_t)-1))
       return false;
 #ifdef ARCHIVE_HAVE_ZLIB
@@ -445,7 +511,8 @@ static bool zlib_stream_decompress_data_to_file_init(
       return false;
 #endif
    zip_context->win_len   = zip_context->streaming
-         ? ZIP_STREAM_WINDOW : (size_t)size;
+         ? (size < ZIP_STREAM_WINDOW ? (size_t)size : ZIP_STREAM_WINDOW)
+         : (size_t)size;
    zip_context->win_pos   = 0;
 
 #ifdef ZIP_HAVE_LZMA
@@ -462,11 +529,9 @@ static bool zlib_stream_decompress_data_to_file_init(
       else
 #endif
       {
-         filestream_seek(state->archive_file, offsetData,
-               RETRO_VFS_SEEK_POSITION_START);
          if (     csize < sizeof(hdr)
-               || filestream_read(state->archive_file, hdr, sizeof(hdr))
-               != (int64_t)sizeof(hdr))
+               || zip_read_at(state->archive_file, hdr, sizeof(hdr),
+                  offsetData) != (int64_t)sizeof(hdr))
             return false;
       }
       if (     csize < sizeof(hdr)
@@ -505,7 +570,7 @@ static bool zlib_stream_decompress_data_to_file_init(
    /* NULL-check the decompressed_data malloc: the iterate step and
     * the inflate output binding below dereference it. */
    if (!(zip_context->decompressed_data = (uint8_t*)malloc(
-               zip_context->win_len)))
+               zip_context->win_len ? zip_context->win_len : 1)))
       return false;
 
    if (cmode == ZIP_MODE_DEFLATE64 && zip_context->streaming)
@@ -612,7 +677,8 @@ static int zlib_stream_decompress_data_to_file_iterate(
    if (zip_context->cmode == ZIP_MODE_STORED && zip_context->streaming)
    {
       /* A window's worth to the sink per call: straight from the
-       * mapping where there is one, through the window otherwise */
+       * mapping where there is one, or what the stream lends, through
+       * the window otherwise */
       const uint8_t *src;
       uint64_t left = zip_context->usize - zip_context->out_off;
       size_t   n    = left < zip_context->win_len
@@ -623,15 +689,11 @@ static int zlib_stream_decompress_data_to_file_iterate(
             + (size_t)(zip_context->fdoffset + zip_context->out_off);
       else
 #endif
-      {
-         filestream_seek(state->archive_file,
+      if (zip_member_input(state->archive_file,
                (int64_t)(zip_context->fdoffset + zip_context->out_off),
-               RETRO_VFS_SEEK_POSITION_START);
-         if (filestream_read(state->archive_file,
-                  zip_context->decompressed_data, n) != (int64_t)n)
-            return -1;
-         src = zip_context->decompressed_data;
-      }
+               (int64_t)n, zip_context->decompressed_data, &src)
+            != (int64_t)n)
+         return -1;
       zip_context->crc      = encoding_crc32(zip_context->crc, src, n);
       if (filestream_write(state->pending_sink, src, n) != (int64_t)n)
          return -1;
@@ -655,10 +717,10 @@ static int zlib_stream_decompress_data_to_file_iterate(
 #endif
       {
          /* Read the entire file to memory */
-         filestream_seek(state->archive_file, zip_context->fdoffset, RETRO_VFS_SEEK_POSITION_START);
-         if (filestream_read(state->archive_file,
-                             zip_context->decompressed_data,
-                             zip_context->usize) != (int64_t)zip_context->usize)
+         if (zip_read_at(state->archive_file,
+                  zip_context->decompressed_data,
+                  (int64_t)zip_context->usize, zip_context->fdoffset)
+               != (int64_t)zip_context->usize)
             return -1;
       }
 
@@ -724,6 +786,10 @@ static int zlib_stream_decompress_data_to_file_iterate(
          zip_context->crc      = encoding_crc32(zip_context->crc, out,
                (size_t)(zip_context->zstream->next_out - out));
          zip_context->out_off += (uint64_t)(zip_context->zstream->next_out - out);
+         /* No more than the member's size reaches the sink, whatever
+          * the stream holds */
+         if (zip_context->out_off > zip_context->usize)
+            return -1;
 
          /* With the whole member as output, one call takes all the
           * input */
@@ -778,6 +844,10 @@ static int zlib_stream_decompress_data_to_file_iterate(
                got_out);
          zip_context->win_pos += got_out;
          zip_context->out_off += got_out;
+         /* No more than the member's size reaches the sink, whatever
+          * the stream holds */
+         if (zip_context->out_off > zip_context->usize)
+            return -1;
          /* END: stream finished.  NEXT with no further progress means this
           * input chunk is drained; fetch the next one on the outer loop. */
          if (st == RDEFLATE_PROCESS_END)
@@ -836,11 +906,9 @@ static int zlib_stream_decompress_data_to_file_iterate(
          size_t   k    = left < room ? (size_t)left : room;
          if (k)
          {
-            filestream_seek(state->archive_file,
-                  (int64_t)(zip_context->fdoffset + zip_context->boffset),
-                  RETRO_VFS_SEEK_POSITION_START);
-            if (filestream_read(state->archive_file,
-                     zip_context->tmpbuf + zip_context->in_have, (int64_t)k)
+            if (zip_read_at(state->archive_file,
+                     zip_context->tmpbuf + zip_context->in_have, (int64_t)k,
+                     (int64_t)(zip_context->fdoffset + zip_context->boffset))
                   != (int64_t)k)
                return -1;
             zip_context->boffset += k;
@@ -910,11 +978,9 @@ static int zlib_stream_decompress_data_to_file_iterate(
          size_t   k    = left < room ? (size_t)left : room;
          if (k)
          {
-            filestream_seek(state->archive_file,
-                  (int64_t)(zip_context->fdoffset + zip_context->boffset),
-                  RETRO_VFS_SEEK_POSITION_START);
-            if (filestream_read(state->archive_file,
-                     zip_context->tmpbuf + zip_context->in_have, (int64_t)k)
+            if (zip_read_at(state->archive_file,
+                     zip_context->tmpbuf + zip_context->in_have, (int64_t)k,
+                     (int64_t)(zip_context->fdoffset + zip_context->boffset))
                   != (int64_t)k)
                return -1;
             zip_context->boffset += k;
@@ -975,21 +1041,50 @@ static int zlib_stream_decompress_data_to_file_iterate(
    else if (zip_context->cmode == ZIP_MODE_ZSTD && zip_context->streaming)
    {
       /* A block to the sink per call, from where the decoder leaves
-       * it; the frame is in hand whole */
-      const uint8_t *blk;
-      size_t         len;
+       * it: the frame decoded where it lies whole, in the mapping or
+       * what the stream lends, or else read a block at a time */
+      const uint8_t *blk = NULL;
+      size_t         len = 0;
       int            e;
       if (!zip_context->zs)
       {
-         const uint8_t *src = zip_member_whole(state, zip_context->fdoffset,
-               zip_context->csize, &zip_context->tmpbuf,
-               &zip_context->tmpbuf_len);
-         if (     !src
-               || !(zip_context->zs = rzstd_blocks_begin(src,
-                     (size_t)zip_context->csize)))
+         const uint8_t *src = zip_member_lent(state, zip_context->fdoffset,
+               zip_context->csize);
+         zip_context->boffset = 0;
+         if (src)
+            zip_context->zs = rzstd_blocks_begin(src,
+                  (size_t)zip_context->csize);
+         else if (zip_context_reserve_tmpbuf(zip_context, RZSTD_WANT_MAX))
+         {
+            zip_context->zs    = rzstd_blocks_open();
+            zip_context->begun = true;
+         }
+         if (!zip_context->zs)
             return -1;
       }
-      e = rzstd_blocks_step((rzstd_blocks_t*)zip_context->zs, &blk, &len);
+      if (!zip_context->begun)
+         e = rzstd_blocks_step((rzstd_blocks_t*)zip_context->zs, &blk, &len);
+      else
+      {
+         size_t want = rzstd_blocks_want((rzstd_blocks_t*)zip_context->zs);
+         e = RZSTD_PROCESS_NEXT;
+         if (!want)
+            e = zip_context->boffset == zip_context->csize
+               ? RZSTD_PROCESS_END : RZSTD_PROCESS_ERROR;
+         else
+         {
+            if (     want > zip_context->csize - zip_context->boffset
+                  || zip_read_at(state->archive_file, zip_context->tmpbuf,
+                     (int64_t)want,
+                     (int64_t)(zip_context->fdoffset + zip_context->boffset))
+                  != (int64_t)want
+                  || rzstd_blocks_give((rzstd_blocks_t*)zip_context->zs,
+                     zip_context->tmpbuf, want, &blk, &len)
+                  != RZSTD_PROCESS_NEXT)
+               e = RZSTD_PROCESS_ERROR;
+         }
+         zip_context->boffset += want;
+      }
       if (e == RZSTD_PROCESS_ERROR)
          return -1;
       if (len)
@@ -1007,7 +1102,8 @@ static int zlib_stream_decompress_data_to_file_iterate(
             || zip_context->crc     != zip_context->expect_crc)
          return -1;
       rzstd_blocks_free((rzstd_blocks_t*)zip_context->zs);
-      zip_context->zs = NULL;
+      zip_context->zs    = NULL;
+      zip_context->begun = false;
       /* A whole-member buffer is not kept past its member. */
       if (zip_context->tmpbuf_len > _READ_CHUNK_SIZE)
       {
@@ -1023,41 +1119,60 @@ static int zlib_stream_decompress_data_to_file_iterate(
    else if (zip_context->cmode == ZIP_MODE_BZIP2 && zip_context->streaming)
    {
       /* A block to the sink per call, from where the decoder leaves
-       * it; the stream is in hand whole, the mapping's or read */
+       * it: the stream decoded where it lies whole, in the mapping or
+       * what the stream lends, or else read through a ring that holds
+       * at least a block's most ahead of the decoder */
+      rbzip2_t      *bz;
       const uint8_t *blk;
       size_t         len;
       int            e;
       if (!zip_context->begun)
       {
-         const uint8_t *src;
-#ifdef VFS_HAVE_FILE_MAPPING
-         if (state->archive_mmap_data)
-            src = state->archive_mmap_data + (size_t)zip_context->fdoffset;
-         else
-#endif
-         {
-            if (     zip_context->csize > (uint64_t)((size_t)-1)
-                  || !zip_context_reserve_tmpbuf(zip_context,
-                     zip_context->csize ? (size_t)zip_context->csize : 1))
-               return -1;
-            filestream_seek(state->archive_file,
-                  (int64_t)zip_context->fdoffset,
-                  RETRO_VFS_SEEK_POSITION_START);
-            if (filestream_read(state->archive_file, zip_context->tmpbuf,
-                     (int64_t)zip_context->csize)
-                  != (int64_t)zip_context->csize)
-               return -1;
-            src = zip_context->tmpbuf;
-         }
+         const uint8_t *src = zip_member_lent(state, zip_context->fdoffset,
+               zip_context->csize);
+         size_t         cap = 2 * (size_t)ZIP_BZIP2_AHEAD;
+         zip_context->boffset = 0;
          if (     !zip_context->bz
                && !(zip_context->bz = rbzip2_new()))
             return -1;
-         if (rbzip2_begin_blocks((rbzip2_t*)zip_context->bz, src,
-                  (size_t)zip_context->csize) != RBZIP2_OK)
+         if (!src)
+         {
+            if (zip_context->csize < cap)
+               cap = zip_context->csize ? (size_t)zip_context->csize : 1;
+            if (!zip_context_reserve_tmpbuf(zip_context, cap))
+               return -1;
+            if (!zip_bzip2_fill(state, zip_context, 0, cap))
+               return -1;
+            src = zip_context->tmpbuf;
+         }
+         if (rbzip2_begin_ring((rbzip2_t*)zip_context->bz, src,
+                  src == zip_context->tmpbuf
+                  ? (size_t)zip_context->boffset
+                  : (size_t)zip_context->csize, NULL, 0) != RBZIP2_OK)
             return -1;
          zip_context->begun = true;
       }
-      e = rbzip2_step_block((rbzip2_t*)zip_context->bz, &blk, &len);
+      bz = (rbzip2_t*)zip_context->bz;
+      if (     zip_context->boffset
+            && zip_context->boffset < zip_context->csize
+            && zip_context->boffset - rbzip2_taken(bz) < ZIP_BZIP2_AHEAD)
+      {
+         /* the ring filled again up to what the decoder still needs,
+          * and that handed over again, in two where it wraps */
+         size_t   cap  = 2 * (size_t)ZIP_BZIP2_AHEAD;
+         uint64_t t    = rbzip2_taken(bz);
+         size_t   from = (size_t)(t % cap);
+         size_t   have;
+         if (!zip_bzip2_fill(state, zip_context, t, cap))
+            return -1;
+         have = (size_t)(zip_context->boffset - t);
+         if (have > cap - from)
+            rbzip2_input(bz, zip_context->tmpbuf + from, cap - from,
+                  zip_context->tmpbuf, have - (cap - from));
+         else
+            rbzip2_input(bz, zip_context->tmpbuf + from, have, NULL, 0);
+      }
+      e = rbzip2_step_block(bz, &blk, &len);
       if (e == RBZIP2_PENDING)
       {
          zip_context->crc      = encoding_crc32(zip_context->crc, blk, len);
@@ -1175,37 +1290,30 @@ static int zip_file_decompressed(
    {
       file_archive_file_handle_t handle = {0};
 
+      /* Called in case core has need_fullpath enabled: written out as
+       * it is decoded, a stored member from where it lies */
+      if (decomp_state->opt_file)
+      {
+         if (file_archive_perform_mode(decomp_state->opt_file, valid_exts,
+                  cdata, cmode, csize, size, crc32, userdata))
+            decomp_state->size = 0;
+         else
+            decomp_state->failed = true;
+         decomp_state->found = true;
+         return 1;
+      }
+
+      /* Called in case core has need_fullpath disabled: the decoded
+       * member is handed over as RetroArch's ROM buffer */
       if (zip_file_decompressed_handle(userdata->transfer,
                &handle, cdata, cmode, csize, size, crc32))
       {
-         if (decomp_state->opt_file != 0)
-         {
-            /* Called in case core has need_fullpath enabled. */
-            bool success = filestream_write_file(decomp_state->opt_file, handle.data, size);
-
-            /* Note: Do not free handle.data here - this
-             * will be done when stream is deinitialised */
-            handle.data = NULL;
-
-            decomp_state->size = 0;
-
-            if (!success)
-               return -1;
-         }
-         else
-         {
-            /* Called in case core has need_fullpath disabled.
-             * Will move decompressed content directly into
-             * RetroArch's ROM buffer. */
-            zip_context_t *zip_context = (zip_context_t *)userdata->transfer->context;
-
-            decomp_state->size = 0;
-            *decomp_state->buf             = handle.data;
-            decomp_state->size             = size;
-            /* We keep the data, prevent its deallocation during free */
-            zip_context->decompressed_data = NULL;
-            handle.data = NULL;
-         }
+         zip_context_t *zip_context = (zip_context_t *)userdata->transfer->context;
+         *decomp_state->buf             = handle.data;
+         decomp_state->size             = size;
+         /* We keep the data, prevent its deallocation during free */
+         zip_context->decompressed_data = NULL;
+         handle.data = NULL;
       }
       else
          decomp_state->failed = true;
@@ -1270,16 +1378,34 @@ static int64_t zip_file_read(
    return (int64_t)decomp.size;
 }
 
+/* TorrentZip names itself in the end record's comment: TORRENTZIPPED-
+ * and eight hex digits. */
+static bool zip_comment_torrentzip(const uint8_t *comment, unsigned len)
+{
+   return len == 22 && !memcmp(comment, "TORRENTZIPPED-", 14);
+}
+
 static int zip_parse_file_init(file_archive_transfer_t *state,
       const char *file)
 {
    uint8_t footer_buf[1024];
-   uint8_t *footer = footer_buf;
+   uint8_t loc_buf[20], rec_buf[56];
+   /* A mapped archive is read where it lies: the end record, the ZIP64
+    * records and the central directory alike. */
+#ifdef VFS_HAVE_FILE_MAPPING
+   uint8_t *map = state->archive_mmap_data;
+#else
+   uint8_t *map = NULL;
+#endif
+   const uint8_t *footer = footer_buf;
    int64_t read_pos = state->archive_size;
    int64_t read_block = MIN(read_pos, (ssize_t)sizeof(footer_buf));
+   int64_t eocd_at = 0;
    int64_t directory_size, directory_offset;
    uint64_t entries;
    zip_context_t *zip_context = NULL;
+
+   state->torrentzip = false;
 
    /* Minimal ZIP file size is 22 bytes */
    if (read_block < 22)
@@ -1288,31 +1414,61 @@ static int zip_parse_file_init(file_archive_transfer_t *state,
    /* Find the end of central directory record by scanning
     * the file from the end towards the beginning.
     */
-   for (;;)
+   if (map)
    {
-      if (--footer < footer_buf)
+      for (footer = map + (size_t)state->archive_size - 22; ; footer--)
       {
-         if (read_pos <= 0)
-            return -1; /* reached beginning of file */
-
-         /* Read 21 bytes of overlaps except on the first block. */
-         if (read_pos == state->archive_size)
-            read_pos = read_pos - read_block;
-         else
-            read_pos = MAX(read_pos - read_block + 21, 0);
-
-         /* Seek to read_pos and read read_block bytes. */
-         filestream_seek(state->archive_file, read_pos, RETRO_VFS_SEEK_POSITION_START);
-         if (filestream_read(state->archive_file, footer_buf, read_block) != read_block)
+         if (read_le(footer, 4) == END_OF_CENTRAL_DIR_SIGNATURE)
+         {
+            unsigned comment_len = read_le(footer + 20, 2);
+            if ((int64_t)(footer - map) + 22 + comment_len
+                  == state->archive_size)
+            {
+               state->torrentzip = zip_comment_torrentzip(footer + 22,
+                     comment_len);
+               break;
+            }
+         }
+         if (footer == map)
             return -1;
-
-         footer = footer_buf + read_block - 22;
       }
-      if (read_le(footer, 4) == END_OF_CENTRAL_DIR_SIGNATURE)
+      eocd_at = (int64_t)(footer - map);
+   }
+   else
+   {
+      for (;;)
       {
-         unsigned comment_len = read_le(footer + 20, 2);
-         if (read_pos + (footer - footer_buf) + 22 + comment_len == state->archive_size)
-            break; /* found it! */
+         if (--footer < footer_buf)
+         {
+            if (read_pos <= 0)
+               return -1; /* reached beginning of file */
+
+            /* Read 21 bytes of overlaps except on the first block. */
+            if (read_pos == state->archive_size)
+               read_pos = read_pos - read_block;
+            else
+               read_pos = MAX(read_pos - read_block + 21, 0);
+
+            if (zip_read_at(state->archive_file, footer_buf, read_block,
+                     read_pos) != read_block)
+               return -1;
+
+            footer = footer_buf + read_block - 22;
+         }
+         if (read_le(footer, 4) == END_OF_CENTRAL_DIR_SIGNATURE)
+         {
+            unsigned comment_len = read_le(footer + 20, 2);
+            if (read_pos + (footer - footer_buf) + 22 + comment_len == state->archive_size)
+            {
+               eocd_at = read_pos + (footer - footer_buf);
+               /* Only a comment inside this block is looked at. */
+               state->torrentzip =
+                     (int64_t)(footer - footer_buf) + 22 + comment_len
+                        <= read_block
+                  && zip_comment_torrentzip(footer + 22, comment_len);
+               break; /* found it! */
+            }
+         }
       }
    }
 
@@ -1327,23 +1483,32 @@ static int zip_parse_file_init(file_archive_transfer_t *state,
          || directory_size   == 0xFFFFFFFFu
          || directory_offset == 0xFFFFFFFFu)
    {
-      uint8_t loc[20], rec[56];
-      int64_t at = read_pos + (footer - footer_buf);
+      const uint8_t *loc = loc_buf, *rec = rec_buf;
+      int64_t at = eocd_at;
       uint64_t rec_off;
       if (at < 20)
          return -1;
-      filestream_seek(state->archive_file, at - 20,
-            RETRO_VFS_SEEK_POSITION_START);
-      if (     filestream_read(state->archive_file, loc, 20) != 20
-            || read_le(loc, 4) != ZIP64_END_OF_CENTRAL_DIR_LOCATOR_SIGNATURE)
+      if (map)
+         loc = map + (size_t)(at - 20);
+      else
+      {
+         if (zip_read_at(state->archive_file, loc_buf, 20, at - 20) != 20)
+            return -1;
+      }
+      if (read_le(loc, 4) != ZIP64_END_OF_CENTRAL_DIR_LOCATOR_SIGNATURE)
          return -1;
       rec_off = read_le64(loc + 8);
       if (rec_off > (uint64_t)(at - 20) || (uint64_t)(at - 20) - rec_off < 56)
          return -1;
-      filestream_seek(state->archive_file, (int64_t)rec_off,
-            RETRO_VFS_SEEK_POSITION_START);
-      if (     filestream_read(state->archive_file, rec, 56) != 56
-            || read_le(rec, 4) != ZIP64_END_OF_CENTRAL_DIR_SIGNATURE)
+      if (map)
+         rec = map + (size_t)rec_off;
+      else
+      {
+         if (zip_read_at(state->archive_file, rec_buf, 56, (int64_t)rec_off)
+               != 56)
+            return -1;
+      }
+      if (read_le(rec, 4) != ZIP64_END_OF_CENTRAL_DIR_SIGNATURE)
          return -1;
       entries = read_le64(rec + 32);
       if (     read_le64(rec + 40) > (uint64_t)state->archive_size
@@ -1373,13 +1538,16 @@ static int zip_parse_file_init(file_archive_transfer_t *state,
       return -1;
 
    /* This is a ZIP file, allocate one block of memory for both the
-    * context and the entire directory, then read the directory.
+    * context and the entire directory, then read the directory; a
+    * mapped one is walked in place.
     */
-   zip_context = (zip_context_t*)malloc(sizeof(zip_context_t) + (size_t)directory_size);
+   zip_context = (zip_context_t*)malloc(sizeof(zip_context_t)
+         + (map ? 0 : (size_t)directory_size));
    if (!zip_context)
       return -1;
    zip_context->state             = state;
-   zip_context->directory         = (uint8_t*)(zip_context + 1);
+   zip_context->directory         = map ? map + (size_t)directory_offset
+                                        : (uint8_t*)(zip_context + 1);
    zip_context->directory_entry   = zip_context->directory;
    zip_context->directory_end     = zip_context->directory + (size_t)directory_size;
    zip_context->zstream           = NULL;
@@ -1406,11 +1574,14 @@ static int zip_parse_file_init(file_archive_transfer_t *state,
    zip_context->csize             = 0;
    zip_context->usize             = 0;
 
-   filestream_seek(state->archive_file, directory_offset, RETRO_VFS_SEEK_POSITION_START);
-   if (filestream_read(state->archive_file, zip_context->directory, directory_size) != directory_size)
+   if (!map)
    {
-      free(zip_context);
-      return -1;
+      if (zip_read_at(state->archive_file, zip_context->directory,
+               directory_size, directory_offset) != directory_size)
+      {
+         free(zip_context);
+         return -1;
+      }
    }
 
    state->context = zip_context;
@@ -1666,9 +1837,8 @@ static int file_archive_entry_source_capture(
       else
 #endif
       {
-         filestream_seek(state->archive_file, (int64_t)local + 26,
-               RETRO_VFS_SEEK_POSITION_START);
-         if (filestream_read(state->archive_file, local_header_buf, 4) != 4)
+         if (zip_read_at(state->archive_file, local_header_buf, 4,
+                  (int64_t)local + 26) != 4)
             return -1;
          local_header = local_header_buf;
       }
@@ -1793,10 +1963,8 @@ int64_t file_archive_entry_source_read(file_archive_entry_source_t *s,
       else
 #endif
       {
-         filestream_seek(s->state.archive_file,
-               (int64_t)(s->fdoffset + s->out_off),
-               RETRO_VFS_SEEK_POSITION_START);
-         if (filestream_read(s->state.archive_file, dst, n) != n)
+         if (zip_read_at(s->state.archive_file, dst, n,
+                  (int64_t)(s->fdoffset + s->out_off)) != n)
             return -1;
       }
       s->out_off += (uint64_t)n;

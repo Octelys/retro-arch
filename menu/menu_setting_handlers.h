@@ -57,9 +57,13 @@ SDX(LEFT, setting_uint_action_left_crt_switch_resolution_super)
 SDX(LEFT, setting_uint_action_left_custom_vp_width)
 SDX(LEFT, setting_uint_action_left_custom_vp_height)
 SDX(LEFT, setting_uint_action_left_video_openxr_refresh_rate)
+SDX(LEFT, setting_uint_action_left_video_openxr_touch_button)
 SDX(LEFT, setting_bool_action_ok_video_openxr_enable)
 #ifdef HAVE_OZONE
 SDX(LEFT, setting_string_action_left_ozone_menu_color_theme)
+#endif
+#ifdef HAVE_VIDEO_WINDOWS
+SDX(LEFT, setting_uint_action_left_video_menu_follows)
 #endif
 #ifndef RARCH_CONSOLE
 SDX(LEFT, setting_string_action_left_audio_device)
@@ -78,9 +82,13 @@ SDX(RIGHT, setting_uint_action_right_crt_switch_resolution_super)
 SDX(RIGHT, setting_uint_action_right_custom_vp_width)
 SDX(RIGHT, setting_uint_action_right_custom_vp_height)
 SDX(RIGHT, setting_uint_action_right_video_openxr_refresh_rate)
+SDX(RIGHT, setting_uint_action_right_video_openxr_touch_button)
 SDX(RIGHT, setting_bool_action_ok_video_openxr_enable)
 #ifdef HAVE_OZONE
 SDX(RIGHT, setting_string_action_right_ozone_menu_color_theme)
+#endif
+#ifdef HAVE_VIDEO_WINDOWS
+SDX(RIGHT, setting_uint_action_right_video_menu_follows)
 #endif
 #ifndef RARCH_CONSOLE
 SDX(RIGHT, setting_string_action_right_audio_device)

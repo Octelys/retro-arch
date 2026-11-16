@@ -3182,13 +3182,13 @@ struct retro_vr_frame_state {
 #define RETRO_ENVIRONMENT_GET_VR_HEAD_POSE (98 | RETRO_ENVIRONMENT_EXPERIMENTAL)
 
 /* Frontend H.264 decoding to CPU-readable 8-bit YUV 4:2:0 planes.
- * Versions 1, 2 and 3 are supported. Initialize the version before querying.
+ * Versions 1 to 4 are supported. Initialize the version before querying.
  * Version 1 writes only the original prefix through close. Calls for each decoder
  * are serialized by the core; close all decoders before context teardown.
  * Unsupported frontends return false. Input is one Annex-B access unit.
  * Planes remain valid until decode, drain or close. */
 #define RETRO_ENVIRONMENT_GET_VIDEO_DECODE_INTERFACE (99 | RETRO_ENVIRONMENT_EXPERIMENTAL)
-#define RETRO_VIDEO_DECODE_INTERFACE_VERSION 3
+#define RETRO_VIDEO_DECODE_INTERFACE_VERSION 4
 #define RETRO_VIDEO_DECODE_DEFER_PLANES (1u << 0)
 
 struct retro_video_decode_frame
@@ -3249,6 +3249,11 @@ struct retro_video_decode_interface
     * 2 busy (retry later), -1 unavailable/error. CPU get_frame remains
     * valid until decode/drain. Failed calls acquire no lease. */
    int (*get_gpu_frame)(void *decoder, struct retro_video_decode_gpu_frame *frame);
+   /* Version 4: set_tag gives the picture the next decode/decode_ex opens
+    * a value, which get_tag returns once decode or drain hands that
+    * picture out: output is in display order, not the input's. */
+   void (*set_tag)(void *decoder, uint64_t tag);
+   uint64_t (*get_tag)(void *decoder);
 };
 
 
@@ -3611,6 +3616,65 @@ struct retro_hw_render_upscaler_interface
     * no inputs and is shown without upscaling.
     */
    void (*set_inputs)(void *handle, const struct retro_hw_upscaler_inputs *inputs);
+};
+
+/**
+ * Gets an interface with which an OpenGL or OpenGL ES hardware core makes
+ * contexts for threads of its own: each is in the share group of the
+ * core's context (RETRO_ENVIRONMENT_SET_HW_RENDER), of the same API,
+ * version and profile, so textures, buffers, shaders, programs and syncs
+ * made on one are seen on the others; framebuffers and vertex arrays are
+ * not shared, as in OpenGL. A core renders on another thread this way -
+ * into a texture of its own, with a fence the core's context waits on
+ * before using it in retro_run - and compiles shaders on threads of its
+ * own, with nothing of the window system in the core.
+ *
+ * Call it from context_reset or later; the interface is valid until
+ * context_destroy, before which the core destroys every context it
+ * made. Returns false when the frontend cannot make such contexts for
+ * the video driver it runs; a core then keeps its OpenGL work on the
+ * thread that calls retro_run, as it always could.
+ *
+ * @param[out] data <tt>const struct retro_hw_shared_context_interface **</tt>.
+ * @see retro_hw_shared_context_interface
+ */
+#define RETRO_ENVIRONMENT_GET_HW_SHARED_CONTEXT_INTERFACE (104 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+
+#define RETRO_HW_SHARED_CONTEXT_INTERFACE_VERSION 1
+
+/** A context made with retro_hw_shared_context_interface; opaque. */
+struct retro_hw_shared_context;
+
+struct retro_hw_shared_context_interface
+{
+   /** RETRO_HW_SHARED_CONTEXT_INTERFACE_VERSION. */
+   unsigned interface_version;
+
+   /**
+    * A new context, current on no thread; NULL when one cannot be made.
+    * Call it on the thread that calls retro_run, in context_reset or
+    * retro_run. Each costs the driver a context: make them up front,
+    * one for each thread, not one per piece of work.
+    */
+   struct retro_hw_shared_context *(RETRO_CALLCONV *create)(void);
+
+   /**
+    * Makes @ctx current on the calling thread (@current true), or no
+    * context of these at all (false), and returns whether it could. A
+    * context is current on one thread at a time. It has no framebuffer
+    * of the window's: framebuffer 0 is not to be drawn to or read, and
+    * it draws into framebuffers of its own. Functions are looked up with
+    * the hardware render callback's get_proc_address, with this context
+    * current or the core's.
+    */
+   bool (RETRO_CALLCONV *make_current)(struct retro_hw_shared_context *ctx,
+         bool current);
+
+   /**
+    * Destroys @ctx, which is current on no thread. Call it on the thread
+    * that calls retro_run, in retro_run or context_destroy.
+    */
+   void (RETRO_CALLCONV *destroy)(struct retro_hw_shared_context *ctx);
 };
 
 /* Speaker positions, as bits of a layout mask; a frame's channels are
@@ -4282,6 +4346,50 @@ typedef int (RETRO_CALLCONV *retro_vfs_dirent_stat_t)(struct retro_vfs_dir_handl
 typedef int (RETRO_CALLCONV *retro_vfs_closedir_t)(struct retro_vfs_dir_handle *dirstream);
 
 /**
+ * Reads from a file at a given offset, without moving the position that
+ * \c retro_vfs_read_t, \c retro_vfs_seek_t and \c retro_vfs_tell_t share.
+ * Any number of threads may call it on one handle at once, with no lock
+ * of the core's: the frontend reads at the offset itself. Introduced in
+ * VFS API v6.
+ *
+ * It reads the file as it is on disk: bytes written with
+ * \c retro_vfs_write_t and not flushed yet may not be seen.
+ *
+ * @param stream The file to read from.
+ * @param s Where the bytes go.
+ * @param len How many to read.
+ * @param offset Where in the file, from its start; not negative.
+ * @return The number of bytes read, 0 at or past the end of the file, or
+ * -1 on an error or when the frontend has no positional I/O for this
+ * file (a cdrom:// or network path, a platform without it): the core
+ * then seeks and reads, under a lock of its own if it shares the handle.
+ */
+typedef int64_t (RETRO_CALLCONV *retro_vfs_read_at_t)(struct retro_vfs_file_handle *stream, void *s, uint64_t len, int64_t offset);
+
+/** \c offset of \c retro_vfs_write_at_t for an append. */
+#define RETRO_VFS_WRITE_AT_APPEND (-1)
+
+/**
+ * Writes to a file at a given offset, without moving the handle's
+ * position; callable from several threads at once as
+ * \c retro_vfs_read_at_t is. Introduced in VFS API v6.
+ *
+ * With \c RETRO_VFS_WRITE_AT_APPEND the bytes are appended: each append
+ * goes in whole, after the one before it, whichever thread it came from
+ * - a log or a cache several threads add records to needs no lock. The
+ * appends start at the end of the file as it was opened, so a handle
+ * that is appended to is written with this call only.
+ *
+ * @param stream The file to write to.
+ * @param s The bytes to write.
+ * @param len How many.
+ * @param offset Where in the file, or \c RETRO_VFS_WRITE_AT_APPEND.
+ * @return The number of bytes written, or -1 on an error or when the
+ * frontend has no positional I/O for this file.
+ */
+typedef int64_t (RETRO_CALLCONV *retro_vfs_write_at_t)(struct retro_vfs_file_handle *stream, const void *s, uint64_t len, int64_t offset);
+
+/**
  * File system interface exposed by the frontend.
  *
  * @see dirent_vfs_init
@@ -4376,6 +4484,13 @@ struct retro_vfs_interface
 
    /** @copydoc retro_vfs_dirent_stat_t */
    retro_vfs_dirent_stat_t dirent_stat;
+
+   /* VFS API v6 */
+   /** @copydoc retro_vfs_read_at_t */
+   retro_vfs_read_at_t read_at;
+
+   /** @copydoc retro_vfs_write_at_t */
+   retro_vfs_write_at_t write_at;
 };
 
 /**
@@ -5968,6 +6083,55 @@ enum retro_sensor_action
  * @see https://en.wikipedia.org/wiki/Lux for a table of common lux values.
  */
 #define RETRO_SENSOR_ILLUMINANCE 6
+/** @} */
+
+/** @defgroup RETRO_SENSOR_SUBDEVICE Sensor Sub-Device Index
+ * @{
+ */
+
+/**
+ * The number of bits that a sub-device index is shifted by within a sensor ID
+ * or a \c retro_sensor_action.
+ *
+ * Addresses more than one sensor of the same kind on a single port.
+ * Index 0 denotes the controller itself and encodes to the values already in
+ * use (<tt>RETRO_SENSOR_SUBDEVICE(0, id) == id</tt>). Index 1 denotes the part
+ * of the controller held in the left hand: a Wii Remote's Nunchuk, or the
+ * left Joy-Con of a pair held as one controller (whose index 0 is the right
+ * one). Higher indices are left for controllers with more parts.
+ *
+ * A core learns whether the frontend has a sub-device's sensor from the
+ * enable action, \c retro_set_sensor_state_t returning \c true for it; a
+ * reading of 0 says nothing, as a frontend without it returns 0 for every
+ * read. For instance:
+ * @code
+ * bool nunchuk = sensor.set_sensor_state(port, (enum retro_sensor_action)
+ *       RETRO_SENSOR_SUBDEVICE(1, RETRO_SENSOR_ACCELEROMETER_ENABLE), 100);
+ * float x      = sensor.get_sensor_input(port,
+ *       RETRO_SENSOR_SUBDEVICE(1, RETRO_SENSOR_ACCELEROMETER_X));
+ * @endcode
+ *
+ * @note \c retro_sensor_action is an enum, so an encoded action must be cast at
+ * the call site. \c RETRO_SENSOR_DUMMY pins the underlying type to \c int, so
+ * the encoded value is in range.
+ *
+ * @see RETRO_SENSOR_ID
+ * @see retro_sensor_action
+ */
+#define RETRO_SENSOR_INDEX_SHIFT 8
+
+/** Mask of the bits below the sub-device index. */
+#define RETRO_SENSOR_INDEX_MASK ((1u << RETRO_SENSOR_INDEX_SHIFT) - 1u)
+
+/** Returns the sub-device index encoded in \c id; 0 is the controller itself. */
+#define RETRO_SENSOR_INDEX(id) ((unsigned)(id) >> RETRO_SENSOR_INDEX_SHIFT)
+
+/** Returns the sensor ID or action in \c id, without its sub-device index. */
+#define RETRO_SENSOR_BASE(id) ((unsigned)(id) & RETRO_SENSOR_INDEX_MASK)
+
+/** Addresses sensor \c id on sub-device \c index of a port. */
+#define RETRO_SENSOR_SUBDEVICE(index, id) \
+   ((unsigned)((((unsigned)(index)) << RETRO_SENSOR_INDEX_SHIFT) | ((unsigned)(id))))
 /** @} */
 
 /**

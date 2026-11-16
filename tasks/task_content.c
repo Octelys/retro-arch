@@ -41,7 +41,7 @@
 
 #ifdef __WINRT__
 #include <Fileapifromapp.h>
-#include <uwp/uwp_func.h>
+#include "../os/uwp/uwp_func.h"
 #endif
 
 #ifdef HAVE_CONFIG_H
@@ -107,12 +107,18 @@ void win32_window_release_kept(void);
 #include "patch_stream.h"
 #include "tasks_internal.h"
 #include "task_content_prefetch.h"
+#include "task_file_transfer.h"
 
 #include "../command.h"
 #include "../core_info.h"
+#ifdef HAVE_CORE_LOAD_CHECK
+#include "../core_load_check.h"
+#include "../core_trust_runtime.h"
+#endif
 #include "../content.h"
 #include "../core.h"
 #include "../configuration.h"
+#include "../config.def.h"
 #include "../defaults.h"
 #include "../dynamic.h"
 #include "../file_path_special.h"
@@ -911,7 +917,13 @@ static uint8_t *content_file_pump_source(data_transfer_t *dt,
    size_t          total  = 0;
 
    if (ps)
+   {
+      /* The transfer's buffer is one allocation that never moves, and
+       * stays alive, detached as the content, until the patch is
+       * finished: the patch reads the source there, not from a copy */
       base = data_transfer_ptr(dt, &total);
+      patch_stream_set_source(ps, base);
+   }
 #else
    (void)patch_stream;
 #endif
@@ -1153,16 +1165,14 @@ static size_t content_file_load_into_memory(
     * when an applier rejects a patch. */
    if (patch_ps)
    {
-      uint8_t *patched = NULL;
-      size_t   patched_len = 0;
+      size_t patched_len = (size_t)content_size;
 
+      /* The source was fed from content_data itself: an IPS patch goes
+       * on it where it lies, any other replaces it */
       if (      content_data
-            &&  patch_stream_finish((patch_stream_t*)patch_ps,
-                     &patched, &patched_len)
-            &&  patched)
+            &&  patch_stream_finish_into((patch_stream_t*)patch_ps,
+                     &content_data, &patched_len))
       {
-         free(content_data);
-         content_data = patched;
          content_size = (int64_t)patched_len;
          streamed     = true;
 
@@ -1692,10 +1702,8 @@ static bool content_file_load(
                   fill_pathname_join_special(new_path, new_basedir,
                      path_basename(content_path), sizeof(new_path));
 
-                  /* filestream_copy() reaches CopyFileFromAppW through
-                   * the UWP VFS backend, so this is the same kernel
-                   * copy without the local UTF-16 conversion, and the
-                   * destination directory is created for us. */
+                  /* filestream_copy() goes through the VFS copy, and
+                   * the destination directory is created for us. */
                   if (filestream_copy(content_path, new_path) != 0)
                   {
                      char msg[PATH_MAX_LENGTH];
@@ -2036,7 +2044,8 @@ enum content_load_stage
    CONTENT_LOAD_STAGE_CORE,
    /* One driver reinit against the new core, then the session tail
     * and whatever the entry point asked for after the load. */
-   CONTENT_LOAD_STAGE_DRIVERS
+   CONTENT_LOAD_STAGE_DRIVERS,
+   CONTENT_LOAD_STAGE_FIRMWARE
 };
 
 /* What an entry point wants done once the load is through. */
@@ -2049,11 +2058,112 @@ enum content_load_after
    CONTENT_LOAD_AFTER_QUICK_MENU       = 1 << 4,
    CONTENT_LOAD_AFTER_QUICK_MENU_KEEP  = 1 << 5, /* without a menu flush */
    CONTENT_LOAD_AFTER_MENU_ON_FAIL     = 1 << 6, /* retroarch_menu_running */
-   CONTENT_LOAD_AFTER_DUMMY_IS_FAIL    = 1 << 7  /* the dummy core counts as failure */
+   CONTENT_LOAD_AFTER_DUMMY_IS_FAIL    = 1 << 7, /* the dummy core counts as failure */
+   CONTENT_LOAD_AFTER_QUIT_ON_FAIL     = 1 << 8  /* retroarch_main_quit_failure */
 };
+
+#ifdef HAVE_CORE_LOAD_CHECK
+struct content_load_parked;
+#endif
+
+#ifdef HAVE_MENU
+struct content_firmware
+{
+   size_t index;
+   unsigned missing_count;
+   char system_dir[DIR_MAX_LENGTH];
+   char target[PATH_MAX_LENGTH];
+   char download[PATH_MAX_LENGTH];
+#ifdef HAVE_NETWORKING
+   char url[PATH_MAX_LENGTH];
+#endif
+   char message[1024];
+   bool shown;
+   bool downloading;
+   bool failed;
+   bool archive;
+   bool confirmed;
+   bool cancelled;
+   bool has_download;
+   bool download_requested;
+};
+
+#if defined(HAVE_NETWORKING)
+static bool content_firmware_path_valid(const char *path)
+{
+   const char *part = path;
+   const char *end;
+   if (string_is_empty(path) || *path == '/' || *path == '\\')
+      return false;
+
+   do
+   {
+      end = part + strcspn(part, "/\\");
+      if (end == part || (end - part == 2 && !memcmp(part, "..", 2))
+            || memchr(part, ':', end - part))
+         return false;
+      part = end + 1;
+   } while (*end);
+
+   return true;
+}
+
+static void content_firmware_download_finish(struct content_firmware *firmware,
+      bool success)
+{
+   filestream_delete(firmware->download);
+   firmware->downloading = false;
+
+   if (!success || !path_is_valid(firmware->target))
+      firmware->failed = true;
+}
+
+#ifdef HAVE_COMPRESSION
+static void content_firmware_extracted(retro_task_t *task,
+      void *task_data, void *user_data, const char *err)
+{
+   decompress_task_data_t *data = (decompress_task_data_t*)task_data;
+   struct content_firmware *firmware = (struct content_firmware*)user_data;
+   content_firmware_download_finish(firmware, !err);
+   if (data)
+   {
+      free(data->source_file);
+      free(data);
+   }
+}
+#endif
+
+static void content_firmware_downloaded(retro_task_t *task,
+      void *task_data, void *user_data, const char *err)
+{
+   http_transfer_data_t *data = (http_transfer_data_t*)task_data;
+   struct content_firmware *firmware = (struct content_firmware*)user_data;
+   bool success = !err && data && data->status >= 200 && data->status < 300;
+#ifdef HAVE_COMPRESSION
+   if (success && firmware->archive)
+   {
+      if (task_push_decompress(firmware->download, firmware->system_dir,
+               NULL, NULL, NULL, content_firmware_extracted, firmware,
+               NULL, false))
+         return;
+
+      success = false;
+   }
+   else
+#endif
+   if (success)
+      success = filestream_rename(firmware->download, firmware->target) == 0;
+
+   content_firmware_download_finish(firmware, success);
+}
+#endif
+#endif
 
 struct content_load_job
 {
+#ifdef HAVE_MENU
+   struct content_firmware *firmware;
+#endif
    struct rarch_main_wrap *wrap_args;
    char **argv_ptr;
    int   *argc_ptr;
@@ -2067,6 +2177,10 @@ struct content_load_job
    bool verbosity;
    bool ok;
    bool fell_back;  /* the core failed; the dummy core took its place */
+#ifdef HAVE_CORE_LOAD_CHECK
+   struct content_load_parked *parked;   /* to re-run if the core is refused */
+   bool (*refused)(const char *core_path); /* or takes the refusal */
+#endif
 };
 
 /* One load at a time: an entry point called while a job is in flight
@@ -2074,6 +2188,241 @@ struct content_load_job
 static struct content_load_job content_load_job;
 /* How the last job ended, for the unstaged caller's return value. */
 static bool content_load_job_result;
+
+#ifdef HAVE_CORE_LOAD_CHECK
+static void content_load_parked_free(void *ud);
+#endif
+
+#ifdef HAVE_MENU
+void task_content_firmware_download(void)
+{
+   struct content_firmware *firmware = content_load_job.firmware;
+   if (firmware)
+   {
+      firmware->confirmed = true;
+      firmware->download_requested = firmware->has_download;
+   }
+}
+
+#if defined(HAVE_NETWORKING)
+static void content_firmware_download_start(struct content_firmware *firmware,
+      const char *url)
+{
+   char parent[PATH_MAX_LENGTH];
+   char title[NAME_MAX_LENGTH];
+   size_t _len;
+   strlcpy(parent, firmware->download, sizeof(parent));
+   path_basedir_wrapper(parent);
+
+   if (!path_mkdir(parent))
+   {
+      firmware->failed = true;
+      return;
+   }
+   /* Left by a download that was cut off: the name is ours */
+   filestream_delete(firmware->download);
+
+   firmware->downloading = true;
+
+   /* Named as every other download is: "Downloading: <file>" */
+   _len = 0;
+   strlcpy_append(title, sizeof(title), &_len,
+         msg_hash_to_str(MSG_DOWNLOADING));
+   strlcpy_append(title, sizeof(title), &_len, ": ");
+   strlcpy_append(title, sizeof(title), &_len,
+         path_basename(firmware->target));
+
+   /* The HTTP task copies the borrowed URL and title on submission. */
+   if (!task_push_http_download_file(url, firmware->download,
+            false, title, content_firmware_downloaded, firmware))
+      content_firmware_download_finish(firmware, false);
+}
+#endif
+
+static bool content_load_firmware(struct content_load_job *job)
+{
+   struct menu_state *menu_st = menu_state_get_ptr();
+   settings_t *settings      = config_get_ptr();
+   struct content_firmware *firmware = job->firmware;
+   core_info_t *core          = NULL;
+   core_info_firmware_t *entry;
+   bool download_available   = false;
+   const char *content       = path_get(RARCH_PATH_CONTENT);
+#if defined(HAVE_NETWORKING)
+   const char *url           = NULL;
+   const char *download_url;
+#endif
+
+   if (firmware && firmware->downloading)
+      return false;
+
+   if (!settings->bools.core_firmware_notification_enable
+         || !menu_st->driver_data
+         || (string_is_empty(content)
+            && !runloop_state_get_ptr()->system.load_no_content)
+         || !core_info_find(path_get(RARCH_PATH_CORE), &core)
+         || !core || !core->firmware_count)
+      return true;
+
+   if (menu_st->dialog_st.confirm_cmd || menu_st->dialog_st.pending_cmd)
+      return false;
+
+   if (!firmware)
+   {
+      firmware = (struct content_firmware*)calloc(1, sizeof(*firmware));
+      if (!firmware)
+         return true;
+
+      job->firmware = firmware;
+
+      if ((settings->bools.systemfiles_in_content_dir
+               || string_is_empty(settings->paths.directory_system))
+            && !string_is_empty(content))
+         fill_pathname_basedir(firmware->system_dir, content,
+               sizeof(firmware->system_dir));
+      else
+         strlcpy(firmware->system_dir, settings->paths.directory_system,
+               sizeof(firmware->system_dir));
+   }
+
+   if (firmware->shown && !firmware->download_requested)
+   {
+      firmware->cancelled = !firmware->has_download && !firmware->confirmed;
+      return true;
+   }
+
+   if (firmware->index >= core->firmware_count)
+   {
+      if (firmware->shown)
+      {
+         if (firmware->failed)
+         {
+            const char *msg = msg_hash_to_str(MSG_CORE_FIRMWARE_DOWNLOAD_FAILED);
+            runloop_msg_queue_push(msg, strlen(msg), 1, 180, true, NULL,
+                  MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_ERROR);
+         }
+
+         return true;
+      }
+
+      if (!firmware->missing_count)
+         return true;
+
+      strlcat(firmware->message, "\n\n", sizeof(firmware->message));
+      strlcat(firmware->message, msg_hash_to_str(firmware->has_download
+               ? MSG_CORE_FIRMWARE_DOWNLOAD_PROMPT
+               : MSG_CORE_FIRMWARE_CONTINUE_PROMPT), sizeof(firmware->message));
+      firmware->shown = true;
+      firmware->index = 0;
+
+      menu_dialog_confirm_set(menu_st, MSG_CORE_FIRMWARE_MISSING,
+            CMD_EVENT_CORE_FIRMWARE_DOWNLOAD);
+      menu_st->dialog_st.confirm_text = firmware->message;
+      retroarch_menu_running();
+
+      return false;
+   }
+
+   entry = &core->firmware[firmware->index++];
+   if (entry->optional || string_is_empty(entry->path))
+      return false;
+
+   fill_pathname_join(firmware->target, firmware->system_dir,
+         entry->path, sizeof(firmware->target));
+
+   if (path_is_valid(firmware->target))
+      return false;
+
+#if defined(HAVE_NETWORKING)
+   download_url = entry->url;
+   if (!string_is_empty(download_url)
+         && !strchr(download_url, ':')
+         && content_firmware_path_valid(download_url))
+   {
+      int written     = snprintf(firmware->url, sizeof(firmware->url),
+            "%ssystem/%s", DEFAULT_BUILDBOT_ASSETS_SERVER_URL, download_url);
+      download_url    = written >= 0
+            && (size_t)written < sizeof(firmware->url)
+            ? firmware->url : NULL;
+   }
+
+   if (!string_is_empty(firmware->system_dir)
+         && content_firmware_path_valid(entry->path)
+         && !string_is_empty(download_url)
+         && (string_starts_with_size(download_url, "https://", 8)
+            || string_starts_with_size(download_url, "http://", 7)))
+   {
+      char url_path[PATH_MAX_LENGTH];
+      strlcpy(url_path, download_url, sizeof(url_path));
+      url_path[strcspn(url_path, "?#")] = '\0';
+      firmware->archive = path_is_compressed_file(url_path);
+#ifndef HAVE_COMPRESSION
+      if (!firmware->archive)
+#endif
+      {
+         if (firmware->archive)
+         {
+            char name[64];
+            snprintf(name, sizeof(name), ".retroarch-firmware.%s",
+                  path_get_extension(url_path));
+            fill_pathname_join(firmware->download, firmware->system_dir,
+                  name, sizeof(firmware->download));
+         }
+         else
+         {
+            size_t len = strlcpy(firmware->download, firmware->target,
+                  sizeof(firmware->download));
+            if (len + sizeof(".download") > sizeof(firmware->download))
+               return false;
+            strlcpy_lit(firmware->download + len, ".download",
+                  sizeof(firmware->download) - len);
+         }
+
+         download_available = true;
+
+         if (firmware->shown)
+            url = download_url;
+         else
+            firmware->has_download = true;
+      }
+   }
+#endif
+   if (firmware->shown)
+   {
+#if defined(HAVE_NETWORKING)
+      if (url)
+         content_firmware_download_start(firmware, url);
+#endif
+      return false;
+   }
+
+   if (!firmware->missing_count)
+      strlcpy(firmware->message, msg_hash_to_str(MSG_CORE_FIRMWARE_MISSING),
+            sizeof(firmware->message));
+
+   strlcat(firmware->message, "\n\n", sizeof(firmware->message));
+   {
+      char number[32];
+      snprintf(number, sizeof(number), "%u. ", ++firmware->missing_count);
+      strlcat(firmware->message, number, sizeof(firmware->message));
+   }
+
+   strlcat(firmware->message, entry->path, sizeof(firmware->message));
+   strlcat(firmware->message, "\n[", sizeof(firmware->message));
+   strlcat(firmware->message, msg_hash_to_str(download_available
+            ? MSG_CORE_FIRMWARE_DOWNLOAD_AVAILABLE
+            : MSG_CORE_FIRMWARE_SUPPLY_MANUALLY), sizeof(firmware->message));
+   strlcat(firmware->message, "]", sizeof(firmware->message));
+
+   if (!string_is_empty(entry->desc))
+   {
+      strlcat(firmware->message, "\n", sizeof(firmware->message));
+      strlcat(firmware->message, entry->desc, sizeof(firmware->message));
+   }
+
+   return false;
+}
+#endif
 
 static void content_load_job_free(struct content_load_job *job)
 {
@@ -2083,8 +2432,23 @@ static void content_load_job_free(struct content_load_job *job)
       free(job->argv_copy[i]);
       job->argv_copy[i] = NULL;
    }
+#ifdef HAVE_MENU
+   if (job->firmware)
+   {
+      struct menu_state *menu_st = menu_state_get_ptr();
+      /* The dialog borrows the message: it goes with it */
+      if (menu_st->dialog_st.confirm_text == job->firmware->message)
+         menu_dialog_confirm_clear(menu_st);
+      free(job->firmware);
+      job->firmware = NULL;
+   }
+#endif
    free(job->wrap_args);
    job->wrap_args = NULL;
+#ifdef HAVE_CORE_LOAD_CHECK
+   content_load_parked_free(job->parked);
+   job->parked    = NULL;
+#endif
    job->stage     = CONTENT_LOAD_STAGE_NONE;
 }
 
@@ -2273,6 +2637,15 @@ static void content_load_finish(struct content_load_job *job,
    runloop_st->content_switching = false;
    /* A library opened for a core stage that never took it */
    runloop_core_preload_cancel();
+#ifdef HAVE_MENU
+   /* A Load State slot asked for with this load, left over when the
+    * load failed before the content came up */
+   {
+      menu_handle_t *menu = menu_state_get_ptr()->driver_data;
+      if (menu)
+         menu->state_slot_run_pending = false;
+   }
+#endif
 
    if (ok)
       content_load_tail(job, p_content);
@@ -2296,6 +2669,9 @@ static void content_load_finish(struct content_load_job *job,
          && (after & CONTENT_LOAD_AFTER_DUMMY_IS_FAIL)
          && runloop_st->current_core_type == CORE_TYPE_DUMMY)
       ok = false;
+
+   if (!ok && (after & CONTENT_LOAD_AFTER_QUIT_ON_FAIL))
+      retroarch_main_quit_failure();
 
    if (ok)
    {
@@ -2327,12 +2703,370 @@ static void content_load_finish(struct content_load_job *job,
          : msg_hash_to_str(MSG_FAILED_TO_LOAD_CONTENT));
 }
 
+#ifdef HAVE_CORE_LOAD_CHECK
+static bool content_load(content_ctx_info_t *info,
+      content_state_t *p_content, unsigned after, bool staged);
+
+/* A staged load the check refused, kept to run again as it was asked */
+struct content_load_parked
+{
+   content_ctx_info_t info;
+   char *core_path;
+   char *content_path;
+   char *label;
+   char *db_name;
+   char *crc32;
+   char *subsystem_ident;
+   char *subsystem_roms[RARCH_MAX_SUBSYSTEM_ROMS];
+   unsigned after;
+   unsigned subsystem_rom_id;
+   int subsystem_id;
+   int subsystem_rom_num;
+   bool subsystem_init;
+};
+
+static void content_load_parked_free(void *ud)
+{
+   struct content_load_parked *d = (struct content_load_parked*)ud;
+   int i;
+   if (!d)
+      return;
+   free(d->core_path);
+   free(d->content_path);
+   free(d->label);
+   free(d->db_name);
+   free(d->crc32);
+   free(d->subsystem_ident);
+   for (i = 0; i < RARCH_MAX_SUBSYSTEM_ROMS; i++)
+      free(d->subsystem_roms[i]);
+   free(d);
+}
+
+static void content_load_parked_run(void *ud)
+{
+   struct content_load_parked *d = (struct content_load_parked*)ud;
+   runloop_state_t *runloop_st   = runloop_state_get_ptr();
+   content_state_t *p_content    = content_state_get_ptr();
+   int i;
+   path_set(RARCH_PATH_CORE, d->core_path);
+   if (d->content_path)
+      path_set(RARCH_PATH_CONTENT, d->content_path);
+   else
+      path_clear(RARCH_PATH_CONTENT);
+   strlcpy(runloop_st->name.label, d->label ? d->label : "",
+         sizeof(runloop_st->name.label));
+   strlcpy(p_content->companion_ui_db_name, d->db_name ? d->db_name : "",
+         sizeof(p_content->companion_ui_db_name));
+   strlcpy(p_content->companion_ui_crc32, d->crc32 ? d->crc32 : "",
+         sizeof(p_content->companion_ui_crc32));
+   content_clear_subsystem();
+   /* As it was: content_set_subsystem() would read the current core's
+    * subsystems, the dummy core's by now */
+   if (d->subsystem_init)
+   {
+      strlcpy(p_content->pending_subsystem_ident,
+            d->subsystem_ident ? d->subsystem_ident : "",
+            sizeof(p_content->pending_subsystem_ident));
+      p_content->pending_subsystem_id      = d->subsystem_id;
+      p_content->pending_subsystem_rom_num = d->subsystem_rom_num;
+      p_content->pending_subsystem_rom_id  = d->subsystem_rom_id;
+      for (i = 0; i < RARCH_MAX_SUBSYSTEM_ROMS; i++)
+      {
+         p_content->pending_subsystem_roms[i] = d->subsystem_roms[i];
+         d->subsystem_roms[i]                 = NULL;
+      }
+      p_content->flags |= CONTENT_ST_FLAG_PENDING_SUBSYSTEM_INIT;
+   }
+   runloop_set_current_core_type(CORE_TYPE_PLAIN, true);
+   if (!content_load(&d->info, p_content, d->after, true))
+   {
+      if (d->after & CONTENT_LOAD_AFTER_QUIT_ON_FAIL)
+         retroarch_main_quit_failure();
+#ifdef HAVE_MENU
+      else
+         retroarch_menu_running();
+#endif
+   }
+}
+
+/* What the re-run needs, taken before the core stage's dummy fallback
+ * changes it */
+static struct content_load_parked *content_load_parked_new(
+      struct content_load_job *job)
+{
+   struct content_load_parked *d = NULL;
+   runloop_state_t *runloop_st   = runloop_state_get_ptr();
+   content_state_t *p_content    = content_state_get_ptr();
+   const char *core_path         = path_get(RARCH_PATH_CORE);
+   const char *content_path      = path_get(RARCH_PATH_CONTENT);
+   int i;
+   if (!(d = (struct content_load_parked*)calloc(1, sizeof(*d))))
+      return NULL;
+   /* A menu load again: no startup argv */
+   d->info.environ_get   = job->info.environ_get;
+   d->after              = job->after;
+   d->core_path          = strdup(core_path ? core_path : "");
+   d->content_path       = (content_path && *content_path)
+      ? strdup(content_path) : NULL;
+   /* Else the re-run would start the core without its content */
+   if (content_path && *content_path && !d->content_path)
+   {
+      content_load_parked_free(d);
+      return NULL;
+   }
+   d->label              = strdup(runloop_st->name.label);
+   d->db_name            = strdup(p_content->companion_ui_db_name);
+   d->crc32              = strdup(p_content->companion_ui_crc32);
+   d->subsystem_init     = (p_content->flags
+         & CONTENT_ST_FLAG_PENDING_SUBSYSTEM_INIT) ? true : false;
+   d->subsystem_ident    = strdup(p_content->pending_subsystem_ident);
+   d->subsystem_id       = p_content->pending_subsystem_id;
+   d->subsystem_rom_num  = p_content->pending_subsystem_rom_num;
+   d->subsystem_rom_id   = p_content->pending_subsystem_rom_id;
+   for (i = 0; i < RARCH_MAX_SUBSYSTEM_ROMS; i++)
+      if (p_content->pending_subsystem_roms[i])
+         d->subsystem_roms[i] = strdup(p_content->pending_subsystem_roms[i]);
+   return d;
+}
+
+/* After the core stage: parks the snapshot if that stage's open of the
+ * core was refused, else drops it */
+static void content_load_park(struct content_load_job *job)
+{
+   struct content_load_parked *d = job->parked;
+   job->parked                   = NULL;
+   if (!d)
+      return;
+   if (     !core_load_check_refused(d->core_path)
+         || !core_load_check_park(d->core_path, content_load_parked_run,
+            content_load_parked_free, d))
+      content_load_parked_free(d);
+}
+
+static bool content_load_park_core(const char *core_path,
+      core_load_rerun_t rerun);
+
+/* A parked Load Core run again: refused again (its core changed since
+ * the check), it parks again with the same rerun; else a failed open
+ * the check did not refuse is said, as the runloop's is */
+static void content_load_core_open(const char *core_path,
+      core_load_rerun_t rerun)
+{
+   content_ctx_info_t content_info = {0};
+   if (     !task_push_load_new_core(core_path, NULL, &content_info,
+               CORE_TYPE_PLAIN, NULL, NULL)
+         && !content_load_park_core(core_path, rerun)
+         && !core_load_check_refused(core_path))
+   {
+      const char *_msg = msg_hash_to_str(MSG_FAILED_TO_OPEN_LIBRETRO_CORE);
+      runloop_msg_queue_push(_msg, strlen(_msg), 1, 180, true, NULL,
+            MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+   }
+#ifdef HAVE_MENU
+   menu_state_get_ptr()->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH
+                               |  MENU_ST_FLAG_PREVENT_POPULATE;
+#endif
+}
+
+static void content_load_core_rerun(void *ud)
+{
+   content_load_core_open((const char*)ud, content_load_core_rerun);
+}
+
+/* The companion UI's Load Core starts a core that runs without content */
+static void content_load_core_start_no_content(void)
+{
+   content_ctx_info_t content_info = {0};
+   if (     runloop_state_get_ptr()->system.load_no_content
+         && config_get_ptr()->bools.set_supports_no_game_enable)
+   {
+      path_clear(RARCH_PATH_CONTENT);
+      task_push_load_content_with_current_core_from_companion_ui(NULL,
+            &content_info, CORE_TYPE_PLAIN, NULL, NULL);
+   }
+}
+
+/* As content_load_core_rerun(), then started if it runs without
+ * content, as the companion UI's Load Core starts it after a probe */
+static void content_load_core_start_rerun(void *ud)
+{
+   /* Set by the probe only when it succeeds */
+   runloop_state_get_ptr()->system.load_no_content = false;
+   content_load_core_open((const char*)ud, content_load_core_start_rerun);
+   content_load_core_start_no_content();
+}
+
+static bool content_load_park_core(const char *core_path,
+      core_load_rerun_t rerun)
+{
+   char *d = NULL;
+   if (     !core_path
+         || !core_load_check_refused(core_path)
+         || !(d = strdup(core_path)))
+      return false;
+   if (core_load_check_park(d, rerun, free, d))
+      return true;
+   free(d);
+   return false;
+}
+
+bool task_content_park_core_load(const char *core_path)
+{
+   return content_load_park_core(core_path, content_load_core_rerun);
+}
+
+bool task_content_park_core_start(const char *core_path)
+{
+   return content_load_park_core(core_path, content_load_core_start_rerun);
+}
+
+void task_content_load_core_start(const char *core_path)
+{
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   bool no_content             = runloop_st->system.load_no_content;
+   path_set(RARCH_PATH_CORE, core_path);
+   /* Set by the open only when it succeeds */
+   runloop_st->system.load_no_content = false;
+   /* Before the park: only the open's refusal parks */
+   command_event(CMD_EVENT_LOAD_CORE, NULL);
+   /* The running core's open read back the flag just cleared */
+   if (runloop_core_probe_live())
+      runloop_st->system.load_no_content = no_content;
+   if (!task_content_park_core_start(core_path))
+      content_load_core_start_no_content();
+}
+
+bool task_content_core_refused_notify(const char *core_path)
+{
+   char msg[NAME_MAX_LENGTH + 128];
+   if (!core_path || !core_load_check_refused(core_path))
+      return false;
+   if (core_load_check_refused_seed(core_path))
+      strlcpy(msg, msg_hash_to_str(MSG_CORE_LOAD_REFUSED_SEED_PENDING),
+            sizeof(msg));
+   else
+   {
+      RARCH_WARN("[Core] Not loading \"%s\": not trusted. Load it from Load Core and choose Always Trust to approve it.\n",
+            core_path);
+      snprintf(msg, sizeof(msg),
+            msg_hash_to_str(MSG_CORE_LOAD_REFUSED_LOAD_CORE),
+            path_basename_nocompression(core_path));
+   }
+   runloop_msg_queue_push(msg, strlen(msg), 2, 360, false, NULL,
+         MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+   return true;
+}
+
+void task_content_load_no_park(bool (*refused)(const char *core_path))
+{
+   struct content_load_job *job = &content_load_job;
+   if (job->stage == CONTENT_LOAD_STAGE_NONE)
+      return;
+   job->refused = refused;
+   /* Past its preload stage, a load has kept its snapshot already */
+   content_load_parked_free(job->parked);
+   job->parked  = NULL;
+}
+
+void task_content_load_refused(const char *core_path)
+{
+   struct content_load_job *job = &content_load_job;
+   if (job->stage != CONTENT_LOAD_STAGE_NONE && job->refused)
+      job->refused(core_path);
+}
+
+#ifdef HAVE_MENU
+/* The startup load again, as a menu load: its startup-only options
+ * (-H, --record, --entryslot, subsystems) aren't replayed */
+static void content_load_startup_rerun(void *ud)
+{
+   struct content_load_parked *d   = (struct content_load_parked*)ud;
+   content_ctx_info_t content_info = {0};
+   rarch_system_info_t *sys_info   = &runloop_state_get_ptr()->system;
+   if (d->content_path)
+      task_push_load_content_with_new_core_from_menu(d->core_path,
+            d->content_path, &content_info, CORE_TYPE_PLAIN, NULL, NULL);
+   /* With no content, started only by a core that runs without it, as
+    * at startup; else loaded, waiting for content. On the probe's word
+    * alone (it sets the flag only when it succeeds): a core outside
+    * the core info list starts at startup too. */
+   else
+   {
+      sys_info->load_no_content = false;
+      /* Refused again (its core changed since the check): asks again */
+      if (     !task_push_load_new_core(d->core_path, NULL, &content_info,
+                  CORE_TYPE_PLAIN, NULL, NULL)
+            && task_content_park_startup(d->core_path, NULL))
+         return;
+      if (     sys_info->load_no_content
+            && config_get_ptr()->bools.set_supports_no_game_enable)
+         task_push_load_contentless_core_from_menu(d->core_path);
+      else
+         menu_state_get_ptr()->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH
+                                     |  MENU_ST_FLAG_PREVENT_POPULATE;
+   }
+}
+#endif
+
+bool task_content_park_startup(const char *core_path,
+      const char *content_path)
+{
+   struct content_load_parked *d = NULL;
+   core_load_rerun_t rerun       = content_load_parked_run;
+   if (     !core_path || !*core_path
+         || !core_load_check_refused(core_path)
+         || !(d = (struct content_load_parked*)calloc(1, sizeof(*d))))
+      return false;
+   d->core_path    = strdup(core_path);
+   d->content_path = (content_path && *content_path)
+      ? strdup(content_path) : NULL;
+   if (content_path && *content_path && !d->content_path)
+   {
+      content_load_parked_free(d);
+      return false;
+   }
+#ifdef HAVE_MENU
+   if (menu_core_warning_can_open())
+      rerun = content_load_startup_rerun;
+   else
+#endif
+   {
+      /* No menu: a staged load, as the menu's are; failing, it ends
+       * RetroArch, as the startup load would have */
+      d->info.environ_get = menu_content_environment_get;
+      d->after            = CONTENT_LOAD_AFTER_HISTORY
+                          | CONTENT_LOAD_AFTER_HISTORY_MENU
+                          | CONTENT_LOAD_AFTER_HISTORY_CLI
+                          | CONTENT_LOAD_AFTER_DUMMY_IS_FAIL
+                          | CONTENT_LOAD_AFTER_QUIT_ON_FAIL;
+   }
+   if (core_load_check_park(d->core_path, rerun,
+            content_load_parked_free, d))
+      return true;
+   content_load_parked_free(d);
+   return false;
+}
+#endif
+
 /* Runs the job's current stage and moves it on. */
 static void content_load_step(struct content_load_job *job,
       content_state_t *p_content)
 {
    switch (job->stage)
    {
+      case CONTENT_LOAD_STAGE_FIRMWARE:
+#ifdef HAVE_MENU
+         if (!content_load_firmware(job))
+            break;
+         if (job->firmware && job->firmware->cancelled)
+         {
+            job->after |= CONTENT_LOAD_AFTER_MENU_ON_FAIL;
+            content_load_finish(job, p_content);
+            break;
+         }
+#endif
+         job->stage = CONTENT_LOAD_STAGE_DEINIT;
+         break;
       case CONTENT_LOAD_STAGE_DEINIT:
          if (!content_load_stage_deinit(job))
          {
@@ -2355,10 +3089,23 @@ static void content_load_step(struct content_load_job *job,
       case CONTENT_LOAD_STAGE_CORE_PRELOAD:
          if (!runloop_core_preload_ready())
             break;
+#ifdef HAVE_CORE_LOAD_CHECK
+         /* Kept for a re-run if the core stage's open is refused, even
+          * after a pass here: the core may move before that open */
+         if (!job->refused)
+            job->parked = content_load_parked_new(job);
+#endif
          job->stage = CONTENT_LOAD_STAGE_CORE;
          break;
       case CONTENT_LOAD_STAGE_CORE:
          job->ok = content_load_stage_core(job);
+#ifdef HAVE_CORE_LOAD_CHECK
+         /* Refused: this load ends as a failed one does, and runs again
+          * once the user answers the Security Warning. Whatever job->ok
+          * says: a menu load's init falls back to the dummy core itself
+          * and succeeds. */
+         content_load_park(job);
+#endif
          if (!job->ok)
          {
             if (     !job->fell_back
@@ -2446,7 +3193,9 @@ bool task_content_is_load_stage(const retro_task_t *task)
 {
    return task && task->handler == content_load_task_handler
        && (enum content_load_stage)(uintptr_t)task->state
-          != CONTENT_LOAD_STAGE_CLOSE_WAIT;
+          != CONTENT_LOAD_STAGE_CLOSE_WAIT
+       && (enum content_load_stage)(uintptr_t)task->state
+          != CONTENT_LOAD_STAGE_FIRMWARE;
 }
 
 static bool content_load_push_stage(struct content_load_job *job)
@@ -2513,6 +3262,15 @@ static bool content_load(content_ctx_info_t *info,
    job->after     = after;
    job->staged    = staged;
    job->stage     = CONTENT_LOAD_STAGE_DEINIT;
+#ifdef HAVE_MENU
+   if (staged && config_get_ptr()->bools.core_firmware_notification_enable)
+   {
+      core_info_t *core = NULL;
+      if (core_info_find(path_get(RARCH_PATH_CORE), &core)
+            && core && core->firmware_count)
+         job->stage = CONTENT_LOAD_STAGE_FIRMWARE;
+   }
+#endif
 
    if (staged)
    {
@@ -2521,12 +3279,26 @@ static bool content_load(content_ctx_info_t *info,
          content_load_job_free(job);
          return false;
       }
+#ifdef HAVE_MENU
+      /* The core title the menu holds while the load runs: the one
+       * this load is for, when its library is already open. */
+      {
+         char title[NAME_MAX_LENGTH + 64];
+         menu_entries_get_core_title(title, sizeof(title));
+      }
+#endif
       runloop_state_get_ptr()->content_switching = true;
       return true;
    }
 
+#ifdef HAVE_CORE_LOAD_CHECK
+   core_load_check_set_startup(true);
+#endif
    while (job->stage != CONTENT_LOAD_STAGE_NONE)
       content_load_step(job, p_content);
+#ifdef HAVE_CORE_LOAD_CHECK
+   core_load_check_set_startup(false);
+#endif
    return content_load_job_result;
 }
 

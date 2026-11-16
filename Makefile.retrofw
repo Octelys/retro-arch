@@ -58,6 +58,8 @@ HAVE_FILTERS_BUILTIN	= 1
 # library no backend used)
 HAVE_CRYPTO = 1
 HAVE_KEYCHAIN = 1
+HAVE_CORE_SIGNATURES = 1
+HAVE_CORE_LOAD_CHECK = 1
 HAVE_RETROSSL = 1
 HAVE_C99 = 1
 HAVE_CC = 1
@@ -114,7 +116,6 @@ HAVE_PATCH = 1
 HAVE_XDELTA = 0 # disabled because <lzma.h> isn't available (or we haven't figured out how to install it)
 HAVE_CHEATS = 1
 HAVE_CHEEVOS = 0
-HAVE_LIBSHAKE = 0
 HAVE_CORE_INFO_CACHE = 1
 HAVE_OSS =1
 
