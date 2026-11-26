@@ -663,10 +663,12 @@ static void rcheevos_progress_updated(rcheevos_locals_t* locals,
          && settings->bools.cheevos_visibility_progress_tracker)
       gfx_widget_set_achievement_progress(cheevo->badge_name, cheevo->measured_progress);
 
+#ifdef HAVE_WEBSOCKET_SERVER
    /* Broadcast the progress update via WebSocket. */
    if (cheevo)
       ws_server_notify_achievement_progress(cheevo->id,
             cheevo->measured_progress);
+#endif
 }
 
 static void rcheevos_progress_hide(rcheevos_locals_t* locals)
@@ -2167,8 +2169,10 @@ bool rcheevos_load(const void *data)
 
    rcheevos_locals.has_unsupported_achievements = false;
    rcheevos_locals.hash_error = NULL;
-   if (settings->bools.cheevos_debug_enable)
+#ifdef HAVE_WEBSOCKET_SERVER
+   if (settings->bools.websocket_ram_stream_enable)
       settings->bools.cheevos_hardcore_mode_enable = false;
+#endif
    rc_client_set_hardcore_enabled(rcheevos_locals.client, settings->bools.cheevos_hardcore_mode_enable);
    rc_client_set_unofficial_enabled(rcheevos_locals.client, settings->bools.cheevos_test_unofficial);
    rc_client_set_encore_mode_enabled(rcheevos_locals.client, settings->bools.cheevos_start_active);

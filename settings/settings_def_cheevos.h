@@ -66,7 +66,7 @@ S_BOOL_EX(cheevos_debug_enable, CHEEVOS_DEBUG_ENABLE,
       "cheevos_debug_enable",
       false, SD_FLAG_ADVANCED, 0, 0, setting_bool_action_left_with_refresh, NULL, NULL, NULL, setting_bool_action_left_with_refresh, setting_bool_action_right_with_refresh, 0,
       "Debug Mode",
-      "Send achievement requests to the Debug Server instead of RetroAchievements. Turns Hardcore Mode off. The server takes effect when content is next loaded.")
+      "Send achievement requests to the Debug Server instead of RetroAchievements. The server takes effect when content is next loaded.")
 #ifndef SETTINGS_DEF_CONFIG_PASS
 S_STRING(cheevos_debug_host, CHEEVOS_DEBUG_HOST,
       "cheevos_debug_host",
