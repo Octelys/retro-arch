@@ -372,7 +372,9 @@ static int callback_retroarch(struct lws *wsi,
  *      those the core saw held during the frame
  *   54 the RAM: each region of rom_info's "regions", in order, back to back
  *
- * all little-endian. A region's "start" is its RetroAchievements address
+ * all little-endian. rom_info's "console_id" is the RetroAchievements
+ * console of the game, 0 until achievements have identified it. A region's
+ * "start" is its RetroAchievements address
  * when the game's achievements memory map is known, as with NES
  * cartridge RAM at $6000; otherwise the regions are system RAM, then
  * save RAM, numbered on from 0.
@@ -449,6 +451,7 @@ static uint32_t           g_mem_frame      = 0;
 static bool               g_mem_streaming  = false;
 static bool               g_mem_hardcore   = false;
 static size_t             g_mem_ram_size   = 0;
+static uint32_t           g_mem_console_id = 0;
 static unsigned           g_mem_region_count = 0;
 static ws_mem_region_t    g_mem_regions[WS_MEM_REGIONS_MAX];
 static bool               g_mem_info_full  = false;
@@ -563,6 +566,8 @@ static bool ws_mem_push_info(bool streaming)
    rjsonwriter_add_string(writer, runloop_st->system.info.library_version);
    ws_mem_add_key(writer, "system");
    rjsonwriter_add_string(writer, core_info ? core_info->system_id : NULL);
+   ws_mem_add_key(writer, "console_id");
+   rjsonwriter_add_unsigned(writer, (unsigned)g_mem_console_id);
    ws_mem_add_key(writer, "ra_hash");
    rjsonwriter_add_string(writer, ra_hash);
    ws_mem_add_key(writer, "hardcore");
@@ -687,6 +692,21 @@ static unsigned ws_mem_layout(ws_mem_region_t *regions, size_t *total)
    return count;
 }
 
+/* Main thread: the RetroAchievements console of the game, 0 until
+ * achievements have identified it. */
+static uint32_t ws_mem_console_id(void)
+{
+#ifdef HAVE_CHEEVOS
+   const rcheevos_locals_t *locals = get_rcheevos_locals();
+   const rc_client_game_t  *game   = locals
+         ? rc_client_get_game_info(locals->client) : NULL;
+
+   if (game)
+      return game->console_id;
+#endif
+   return 0;
+}
+
 static bool ws_mem_layout_changed(const ws_mem_region_t *regions,
       unsigned count)
 {
@@ -768,6 +788,7 @@ void ws_server_memory_frame(void)
    ws_mem_region_t regions[WS_MEM_REGIONS_MAX];
    size_t        ram_size;
    unsigned      region_count;
+   uint32_t      console_id;
    unsigned      i;
    unsigned      port;
    bool          hardcore = false;
@@ -804,6 +825,7 @@ void ws_server_memory_frame(void)
    }
 
    region_count = ws_mem_layout(regions, &ram_size);
+   console_id   = ws_mem_console_id();
 
 #ifdef HAVE_CHEEVOS
    hardcore = rcheevos_hardcore_active();
@@ -818,10 +840,12 @@ void ws_server_memory_frame(void)
          || !g_mem_streaming
          || hardcore    != g_mem_hardcore
          || ram_size    != g_mem_ram_size
+         || console_id  != g_mem_console_id
          || ws_mem_layout_changed(regions, region_count))
    {
       g_mem_hardcore     = hardcore;
       g_mem_ram_size     = ram_size;
+      g_mem_console_id   = console_id;
       g_mem_region_count = region_count;
       memcpy(g_mem_regions, regions, region_count * sizeof(regions[0]));
       /* Frames go out only behind their session's rom_info. */

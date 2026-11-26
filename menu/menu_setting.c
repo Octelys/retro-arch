@@ -12052,8 +12052,9 @@ static void general_write_handler(rarch_setting_t *setting)
          /* When changing the password, clear out the token */
          settings->arrays.cheevos_token[0] = '\0';
          break;
-      case MENU_ENUM_LABEL_CHEEVOS_DEBUG_ENABLE:
-         if (settings->bools.cheevos_debug_enable)
+#ifdef HAVE_WEBSOCKET_SERVER
+      case MENU_ENUM_LABEL_WEBSOCKET_RAM_STREAM_ENABLE:
+         if (settings->bools.websocket_ram_stream_enable)
          {
             settings->bools.cheevos_hardcore_mode_enable = false;
 #ifdef HAVE_CHEEVOS
@@ -12061,6 +12062,7 @@ static void general_write_handler(rarch_setting_t *setting)
 #endif
          }
          break;
+#endif
       case MENU_ENUM_LABEL_CHEEVOS_UNLOCK_SOUND_ENABLE:
 #ifdef HAVE_AUDIOMIXER
          if (settings->bools.cheevos_unlock_sound_enable)

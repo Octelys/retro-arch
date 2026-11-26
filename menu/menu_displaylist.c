@@ -12428,6 +12428,11 @@ unsigned menu_displaylist_build_list(
       case DISPLAYLIST_RETRO_ACHIEVEMENTS_SETTINGS_LIST:
          {
             bool cheevos_enable       = settings->bools.cheevos_enable;
+#ifdef HAVE_WEBSOCKET_SERVER
+            bool ram_stream_enable    = settings->bools.websocket_ram_stream_enable;
+#else
+            bool ram_stream_enable    = false;
+#endif
             bool cheevos_debug_enable = settings->bools.cheevos_debug_enable;
             static menu_displaylist_build_info_selective_t build_list[] = {
                {MENU_ENUM_LABEL_CHEEVOS_ENABLE,                                        PARSE_ONLY_BOOL,   true   },
@@ -12460,7 +12465,7 @@ unsigned menu_displaylist_build_list(
                if (build_list[i].enum_idx == MENU_ENUM_LABEL_CHEEVOS_ENABLE)
                   build_list[i].checked = true;
                else if (build_list[i].enum_idx == MENU_ENUM_LABEL_CHEEVOS_HARDCORE_MODE_ENABLE)
-                  build_list[i].checked = cheevos_enable && !cheevos_debug_enable;
+                  build_list[i].checked = cheevos_enable && !ram_stream_enable;
                else if (build_list[i].enum_idx == MENU_ENUM_LABEL_CHEEVOS_DEBUG_HOST)
                   build_list[i].checked = cheevos_enable && cheevos_debug_enable;
                else
